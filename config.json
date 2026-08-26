@@ -7,5 +7,15 @@
     "dodge":     { "enabled": true, "factor": 2.0 },
     "door":      { "enabled": true, "factor": 2.0 },
     "runin":     { "enabled": true, "factor": 2.0 }
+  },
+  "hud": {
+    "enabled": true,
+    "_comment": "Always-on street-view overlay: current tasks, gag inventory, and street name. Shown only while on a street (hidden in playgrounds/interiors) unless always_show is set.",
+    "show_tasks": true,
+    "show_inventory": true,
+    "show_street_name": true,
+    "always_show": false,
+    "refresh_hz": 4,
+    "scale": 0.05
   }
 }

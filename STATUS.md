@@ -7,6 +7,16 @@ animation, combat run-in — no movement/turn/aim/damage. Adds a read-only
 `probe` mode for the live smoke test (reports current target values, changes
 nothing).
 
+**Read-only street HUD (`inproc/hud.py`): complete, pending live confirm.**
+Concatenated ahead of payload.py into the one code object. Draws street name +
+active ToonTasks + gag inventory via `OnscreenText`, built on the main thread
+through `taskMgr` (persists after detach), reversible on `--revert`. Data
+extraction validated headless under 3.7; the game-attribute paths (open-toontown
+`Quests`/`ZoneUtil`/`ToontownBattleGlobals` etc.) and DirectGui rendering need a
+live check — a few are flagged medium-confidence (`panda3d.core` vs
+`pandac.PandaModules` for `TextNode`, `experience.getExp`, TTR-only zone keys).
+Guards degrade a panel gracefully rather than crashing if a name differs.
+
 **Host/lldb driver framework: complete.** Attaches (AMFI disabled permits it),
 verifies prologue bytes, drives the interpreter.
 

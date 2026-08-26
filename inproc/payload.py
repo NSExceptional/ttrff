@@ -283,6 +283,36 @@ def probe_all(cfg):
 
 
 # --------------------------------------------------------------------------
+# HUD bridge -- the on-screen overlay lives in inproc/hud.py, which the driver
+# concatenates ahead of this file so setup_hud/teardown_hud share this module
+# namespace (report/reg are visible to them). These wrappers stay no-op-safe if
+# hud.py wasn't concatenated or the HUD is disabled in config.
+# --------------------------------------------------------------------------
+def _hud_apply(cfg):
+    hud_cfg = cfg.get("hud", {})
+    if not hud_cfg.get("enabled", False):
+        return
+    fn = globals().get("setup_hud")
+    if fn is None:
+        report["skipped"].append({"id": "hud", "reason": "hud.py not injected"})
+        return
+    try:
+        fn(hud_cfg)
+    except Exception as e:
+        _log_err("setup_hud", e)
+
+
+def _hud_teardown():
+    fn = globals().get("teardown_hud")
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception as e:
+        _log_err("teardown_hud", e)
+
+
+# --------------------------------------------------------------------------
 # Entry
 # --------------------------------------------------------------------------
 def main():
@@ -294,10 +324,12 @@ def main():
 
     if cfg.get("revert"):
         revert_all()
+        _hud_teardown()
     elif cfg.get("probe"):
         probe_all(cfg)  # read-only smoke test; changes nothing
     else:
         apply_enabled(cfg)
+        _hud_apply(cfg)
         if cfg.get("install_import_hook", True):
             try:
                 install_import_hook(cfg)

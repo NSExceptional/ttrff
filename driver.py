@@ -75,15 +75,24 @@ def find_py37():
 
 
 def build_payload_marshal(py37, cfg_path, status_path):
-    """Compile (header + payload.py) to a 3.7 code object on the host and return
-    the marshalled bytes. The header bakes the config/status paths into the code
-    object so no in-process env plumbing is needed once it runs."""
+    """Compile (header + hud.py + payload.py) to a single 3.7 code object on the
+    host and return the marshalled bytes. The header bakes the config/status
+    paths into the code object so no in-process env plumbing is needed once it
+    runs. hud.py (if present) is concatenated ahead of payload.py so its
+    setup_hud/teardown_hud functions live in the same module namespace that
+    payload.py's main() calls into -- the target has no importable sibling files,
+    so everything must be one code object."""
     header = (
         "import os\n"
         "os.environ['TTRMOD_CFG'] = %r\n"
         "os.environ['TTRMOD_STATUS'] = %r\n"
     ) % (cfg_path, status_path)
-    src = header + open(PAYLOAD, "r").read()
+    parts = [header]
+    hud_path = os.path.join(HERE, "inproc", "hud.py")
+    if os.path.exists(hud_path):
+        parts.append("# ==== inproc/hud.py ====\n" + open(hud_path, "r").read())
+    parts.append("# ==== inproc/payload.py ====\n" + open(PAYLOAD, "r").read())
+    src = "\n".join(parts)
     helper = _MARSHAL_HELPER % PAYLOAD
     proc = subprocess.run([py37, "-c", helper], input=src.encode("utf-8"),
                           capture_output=True)

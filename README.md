@@ -7,9 +7,11 @@ scaling their Panda3D interval play-rates.
 
 ## What this is (and is not)
 
-- **Is:** a runtime tool that speeds up cosmetic battle playback (cog-death
+- **Is:** a runtime tool that (a) speeds up cosmetic battle playback (cog-death
   explosion, dodge step-back, door open/close, combat run-in) so battles feel
-  snappier.
+  snappier, and (b) draws an always-on, read-only **street HUD** — current street
+  name, active ToonTasks, and gag inventory — so you don't have to open the
+  Shticker Book.
 - **Is not:** a competitive cheat. It touches **no** movement/turn/aim/damage
   logic and grants **no** server-validated advantage. Everything it changes is
   client-side animation timing. Combat run-in is included only because the first
@@ -75,10 +77,11 @@ target module loads later, so you can attach at the login screen.
 | path | role |
 |------|------|
 | `ttrmod` | bash entrypoint |
-| `driver.py` | host side: find PID, look up offsets, drive lldb |
+| `driver.py` | host side: find PID, look up offsets, marshal payload on 3.7, drive lldb |
 | `lldb/attach.py` | runs in lldb: attach, verify, call the C-API primitive |
-| `inproc/payload.py` | runs inside TTREngine: the actual monkeypatches |
-| `config.json` | which groups are on + their speed factors |
+| `inproc/payload.py` | runs inside TTREngine: the animation monkeypatches |
+| `inproc/hud.py` | runs inside TTREngine: the read-only street HUD overlay (concatenated ahead of payload.py) |
+| `config.json` | which groups/HUD are on + their options |
 | `offsets.json` | per-build CPython C-API vmaddrs (keyed by UUID) |
 
 ## Requirements
@@ -139,6 +142,28 @@ Each target is tried under both TTR's bare module name (`MovieUtil`) and the
 open-toontown dotted name (`toontown.battle.MovieUtil`). If a name differs in a
 future build, the payload logs what names *are* present in the module (see
 `modules_seen` in `/tmp/ttrmod-status.json`) and skips gracefully.
+
+## Street HUD overlay (`inproc/hud.py`)
+
+An always-on, **read-only** overlay drawn with Panda3D `OnscreenText`, anchored to
+the window corners so it tracks on resize. It shows, while you're on a street
+(hidden in playgrounds/interiors unless `always_show`):
+
+- **Street name** — resolved from the current zoneId via `ZoneUtil.getBranchZone`
+  + `ToontownGlobals.StreetNames` (playground/hood-name fallback).
+- **Active ToonTasks** — each quest rendered by reusing the game's own `Quest`
+  objects (`Quests.getQuest(id).getString()` + `.getProgressString(av, questDesc)`
+  + `.getLocationName()`), plus the turn-in NPC and its street.
+- **Gag inventory** — a per-track grid of counts by level (`inventory.numItem`),
+  with `.` for levels not yet unlocked.
+
+Config (`config.json` → `hud`): `enabled`, `show_tasks`, `show_inventory`,
+`show_street_name`, `always_show` (default false = street-only), `refresh_hz`
+(default 4), `scale`. It's built on the main thread via `taskMgr` (thread-safe
+scene-graph construction) and **persists after lldb detaches**, like the animation
+patches; `--revert` destroys the nodes and removes the tasks. Every game-attribute
+lookup is guarded — a TTR rename can blank a panel but never crashes the game.
+Reads only client-side state; no server interaction, no gameplay logic touched.
 
 ## Design note — how much of "combat entry" is shortenable
 
