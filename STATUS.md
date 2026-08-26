@@ -47,10 +47,12 @@ gd     = *(void**)(frame  + 48) # frame->f_globals  (has __builtins__)
 
 ## Remaining work to make it runnable
 
-1. **Pin one more address:** an out-of-line bytes/bytearray constructor to
-   materialize the marshalled-code `bytes` in-process (`PyBytes_FromStringAndSize`
-   is inlined everywhere) — or build the object via `r_object` + a hand-made
-   RFILE. ~1 focused `re` pass.
+1. ~~Pin the bytes constructor~~ **DONE** — `PyByteArray_FromStringAndSize` =
+   `0x1009791b4` (yields a `bytearray`, which `marshal.loads` accepts via the
+   buffer protocol). `offsets.json` is now complete and internally consistent
+   (all seven addresses populated, decimals match hex, prologue-`verify` bytes
+   recorded; a stale-decimal bug that would have tripped the verify-abort was
+   fixed). The only step left before this is runnable:
 2. **Rewire `driver.py` / `lldb/attach.py`** from the `exec_builtins` primitive to:
    marshal `compile(payload_src)` on a matching 3.7.x host → inject bytes →
    `marshal.loads` → read `gd` from the frame → `PyEval_EvalCode(co, gd, gd)` →
