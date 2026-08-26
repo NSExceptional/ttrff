@@ -1,0 +1,41 @@
+{
+  "_comment": "CPython C-API addresses per TTREngine build, keyed by the arm64 Mach-O UUID (as-linked vmaddrs, image base 0x100000000; driver adds the runtime ASLR slide). TTR auto-patches the engine; when the UUID changes, re-derive with the `re` skill and add a new entry. `verify` holds each function's prologue bytes so the driver aborts on a changed binary. IMPORTANT: this hardened LTO CPython 3.7 deploy build dead-strips PyRun_* AND the bytecode compiler, and exec/eval are code-object-only, so the runnable primitive is `marshal_evalcode` (inject a host-marshalled code object -> marshal.loads -> PyEval_EvalCode with f_globals read off the live frame), NOT exec_builtins. See STATUS.md. Driver rework + one more address (an out-of-line bytes constructor) are pending before this is runnable.",
+  "4C4C44C3-5555-3144-A136-F2D2B4A39415": {
+    "arch": "arm64",
+    "image_base_vmaddr": 4294967296,
+    "primitive": "marshal_evalcode",
+    "runnable": false,
+    "note": "TTREngine May 2024 build. Addresses below confirmed via the `re` skill. PENDING: an out-of-line bytes constructor (PyBytes_FromStringAndSize is inlined) + driver rework to the marshal_evalcode recipe. See STATUS.md.",
+    "addrs": {
+      "gil_ensure": 4305723920,
+      "gil_release": 4305724244,
+      "eval_code": 4305296708,
+      "err_printex": 4305728712,
+      "marshal_loads": 4305711136,
+      "r_object": 4305702204,
+      "bytes_from_string_and_size": 0
+    },
+    "vmaddrs_hex": {
+      "gil_ensure": "0x100a79e10",
+      "gil_release": "0x100a79f54",
+      "eval_code": "0x100a38d44",
+      "err_printex": "0x100a7a2c8",
+      "marshal_loads": "0x100a76a20",
+      "r_object": "0x100a7493c",
+      "bytes_from_string_and_size": "TBD"
+    },
+    "globals_from_frame": {
+      "_comment": "PyModule_GetDict/AddModule are inlined; read f_globals off the live frame instead.",
+      "current_tstate_ptr_vmaddr": "0x101C0ACD8",
+      "tstate_to_frame_offset": 24,
+      "frame_to_f_globals_offset": 48
+    },
+    "verify": {
+      "gil_ensure": "f8 5f bc a9 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
+      "gil_release": "f4 4f be a9 fd 7b 01 a9 fd 43 00 91 f3 03 00 aa",
+      "eval_code": "ff 43 01 d1 fd 7b 04 a9 fd 03 01 91 00 e4 00 6f",
+      "err_printex": "ff 43 03 d1 fc 6f 07 a9 fa 67 08 a9 f8 5f 09 a9",
+      "marshal_loads": "ff 43 03 d1 f4 4f 0b a9 fd 7b 0c a9 fd 03 03 91"
+    }
+  }
+}

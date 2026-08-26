@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Thin wrapper around driver.py. Runs from anywhere.
+#   ./ttrmod            apply patches from config.json
+#   ./ttrmod --revert   restore originals
+#   ./ttrmod --status   print last in-process status
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec /usr/bin/python3 "$HERE/driver.py" "$@"

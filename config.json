@@ -1,0 +1,11 @@
+{
+  "_comment": "Cosmetic battle-animation speedups for the owner's own TTR client. factor = speed multiplier (2.0 = twice as fast / roughly half the duration). Set enabled:false to leave a group untouched. Combat run-in scales client walk speed, which brings the client-driven d_joinDone forward (see README).",
+  "revert": false,
+  "install_import_hook": true,
+  "groups": {
+    "cog_death": { "enabled": true, "factor": 2.5 },
+    "dodge":     { "enabled": true, "factor": 2.0 },
+    "door":      { "enabled": true, "factor": 2.0 },
+    "runin":     { "enabled": true, "factor": 2.0 }
+  }
+}
