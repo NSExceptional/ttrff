@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,79 @@ DEFAULT_BIN = os.path.expanduser(
     "~/Library/Application Support/Toontown Rewritten/"
     "Toontown Rewritten.app/Contents/MacOS/TTREngine")
 STATUS_FILE = "/tmp/ttrmod-status.json"
+
+# The engine embeds a hardened, symbol-stripped CPython 3.7 whose bytecode
+# compiler is dead-stripped, so source cannot be compiled in-process. The
+# marshal_evalcode primitive instead compiles the payload to a code object on
+# the HOST and marshals it -- but the marshal/code-object format is version-
+# locked, so this MUST be done with a real CPython 3.7.x. Point TTRMOD_PY37 at
+# one, or install python.org 3.7. Any 3.7.x works (x86_64 under Rosetta is fine;
+# only compile()+marshal.dumps() are used -- no extension modules needed).
+PY37_CANDIDATES = [
+    os.environ.get("TTRMOD_PY37", ""),
+    "/Library/Frameworks/Python.framework/Versions/3.7/bin/python3.7",
+    "python3.7",
+]
+
+# stdin: payload source (utf-8); stdout: marshalled 3.7 code object (raw bytes).
+_MARSHAL_HELPER = (
+    "import sys, marshal\n"
+    "src = sys.stdin.buffer.read().decode('utf-8')\n"
+    "co = compile(src, %r, 'exec')\n"
+    "sys.stdout.buffer.write(marshal.dumps(co))\n"
+)
+
+
+def find_py37():
+    for cand in PY37_CANDIDATES:
+        if not cand:
+            continue
+        path = cand if os.path.sep in cand else shutil.which(cand)
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            ver = subprocess.check_output(
+                [path, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            continue
+        if ver == "3.7":
+            return path
+    return None
+
+
+def build_payload_marshal(py37, cfg_path, status_path):
+    """Compile (header + payload.py) to a 3.7 code object on the host and return
+    the marshalled bytes. The header bakes the config/status paths into the code
+    object so no in-process env plumbing is needed once it runs."""
+    header = (
+        "import os\n"
+        "os.environ['TTRMOD_CFG'] = %r\n"
+        "os.environ['TTRMOD_STATUS'] = %r\n"
+    ) % (cfg_path, status_path)
+    src = header + open(PAYLOAD, "r").read()
+    helper = _MARSHAL_HELPER % PAYLOAD
+    proc = subprocess.run([py37, "-c", helper], input=src.encode("utf-8"),
+                          capture_output=True)
+    if proc.returncode != 0 or not proc.stdout:
+        raise RuntimeError("3.7 compile/marshal failed:\n%s"
+                           % proc.stderr.decode("utf-8", "replace"))
+    return proc.stdout
+
+
+def _legacy_bootstrap(cfg_path, status_path):
+    """String bootstrap for the legacy exec_builtins/compile_eval primitives
+    (both dead-stripped in the shipping TTR build; kept for other builds)."""
+    inner = (
+        "import os\n"
+        "os.environ['TTRMOD_CFG'] = %r\n"
+        "os.environ['TTRMOD_STATUS'] = %r\n"
+        "exec(compile(open(%r,'r').read(), %r, 'exec'))\n"
+        % (cfg_path, status_path, PAYLOAD, PAYLOAD)
+    )
+    hexed = inner.encode("utf-8").hex()
+    # only single quotes + hex chars -> trivially safe through lldb C-string literal
+    return "exec(bytes.fromhex('%s').decode('utf-8'))" % hexed
 
 
 def find_pid():
@@ -60,24 +134,14 @@ def binary_uuid(binpath, arch="arm64"):
     return None
 
 
-def build_bootstrap(cfg_path, status_path):
-    inner = (
-        "import os\n"
-        "os.environ['TTRMOD_CFG'] = %r\n"
-        "os.environ['TTRMOD_STATUS'] = %r\n"
-        "exec(compile(open(%r,'r').read(), %r, 'exec'))\n"
-        % (cfg_path, status_path, PAYLOAD, PAYLOAD)
-    )
-    hexed = inner.encode("utf-8").hex()
-    # only single quotes + hex chars -> trivially safe through lldb C-string literal
-    return "exec(bytes.fromhex('%s').decode('utf-8'))" % hexed
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--binary", default=DEFAULT_BIN)
     ap.add_argument("--revert", action="store_true")
+    ap.add_argument("--probe", action="store_true",
+                    help="read-only smoke test: attach, report current target "
+                         "values, change nothing")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--pid", type=int, default=None)
     args = ap.parse_args()
@@ -108,14 +172,22 @@ def main():
         print("ERROR: no offsets recorded for this build.\n"
               "  binary UUID: %s\n"
               "  The engine was likely auto-patched. Re-derive the CPython C-API\n"
-              "  vmaddrs (PyGILState_Ensure/Release, PyRun_SimpleString) with the\n"
+              "  vmaddrs (PyGILState_Ensure/Release, PyEval_EvalCode, marshal.loads,\n"
+              "  PyByteArray_FromStringAndSize + the current-tstate global) with the\n"
               "  `re` skill and add an entry under this UUID in offsets.json.\n"
               "  Known UUIDs: %s" % (uuid, ", ".join(offs_all.keys()) or "(none)"),
               file=sys.stderr)
         return 3
 
-    primitive = off.get("primitive", "exec_builtins")
+    primitive = off.get("primitive", "marshal_evalcode")
     required = {
+        # The real primitive for TTR's hardened, compiler-stripped 3.7 build:
+        # host-marshalled code object -> marshal.loads -> PyEval_EvalCode, with
+        # f_globals read off the live frame (no module-dict call to pin).
+        "marshal_evalcode": ["gil_ensure", "gil_release", "eval_code",
+                             "marshal_loads", "bytes_from_string_and_size"],
+        # Legacy string-based primitives -- both dead-stripped in this build,
+        # kept only for other/hypothetical builds that still link them.
         "exec_builtins": ["ensure", "release", "import_module", "add_module",
                           "module_getdict", "call_method"],
         "compile_eval": ["ensure", "release", "add_module", "module_getdict",
@@ -132,23 +204,47 @@ def main():
               % (missing, primitive, uuid), file=sys.stderr)
         return 3
 
+    # marshal_evalcode needs the current-PyThreadState global (+ struct offsets)
+    # to read f_globals off the live frame -- PyModule_GetDict/AddModule are
+    # inlined in this build, so there's no dict-returning call to pin.
+    gff = off.get("globals_from_frame", {})
+    if primitive == "marshal_evalcode" and not gff.get("current_tstate_ptr_vmaddr"):
+        print("ERROR: offsets.json[%s] is missing globals_from_frame."
+              "current_tstate_ptr_vmaddr (needed to read f_globals off the live "
+              "frame). Re-derive with the `re` skill." % uuid, file=sys.stderr)
+        return 3
+
+    # we need a real CPython 3.7 to produce a code object the engine can unmarshal
+    py37 = None
+    if primitive == "marshal_evalcode":
+        py37 = find_py37()
+        if not py37:
+            print("ERROR: no CPython 3.7 found to marshal the payload for the "
+                  "engine's 3.7 interpreter.\n"
+                  "  A 3.8+ marshal blob will NOT load in 3.7. Install python.org "
+                  "3.7 (any 3.7.x)\n"
+                  "  or set TTRMOD_PY37=/path/to/python3.7. Only compile()+"
+                  "marshal.dumps() are used.", file=sys.stderr)
+            return 7
+
     pid = args.pid or find_pid()
     if not pid:
         print("ERROR: TTREngine is not running. Launch the game first "
               "(reaching the login screen is enough).", file=sys.stderr)
         return 4
 
-    # config: allow --revert to override the file's mode
+    # config: allow --revert / --probe to override the file's mode
     cfg = json.load(open(args.config))
     if args.revert:
         cfg = dict(cfg)
         cfg["revert"] = True
+    if args.probe:
+        cfg = dict(cfg)
+        cfg["probe"] = True
     # write the effective config to a temp file the payload will read
     cfg_fd, cfg_path = tempfile.mkstemp(prefix="ttrmod-cfg-", suffix=".json")
     with os.fdopen(cfg_fd, "w") as f:
         json.dump(cfg, f)
-
-    bootstrap = build_bootstrap(cfg_path, STATUS_FILE)
 
     job = {
         "pid": pid,
@@ -157,8 +253,18 @@ def main():
         "primitive": primitive,
         "addrs": {k: v for k, v in off["addrs"].items() if int(v)},
         "verify": off.get("verify", {}),
-        "bootstrap": bootstrap,
+        "globals_from_frame": gff,
     }
+    if primitive == "marshal_evalcode":
+        try:
+            blob = build_payload_marshal(py37, cfg_path, STATUS_FILE)
+        except RuntimeError as e:
+            print("ERROR: %s" % e, file=sys.stderr)
+            return 7
+        job["payload_marshal_hex"] = blob.hex()
+        job["py37"] = py37
+    else:
+        job["bootstrap"] = _legacy_bootstrap(cfg_path, STATUS_FILE)
     job_fd, job_path = tempfile.mkstemp(prefix="ttrmod-job-", suffix=".json")
     with os.fdopen(job_fd, "w") as f:
         json.dump(job, f)
@@ -173,7 +279,8 @@ def main():
     env = dict(os.environ)
     env["TTRMOD_JOB"] = job_path
     print("[ttrmod] %s pid=%d uuid=%s" % (
-        "REVERTING" if cfg.get("revert") else "applying", pid, uuid))
+        "PROBING (read-only)" if cfg.get("probe")
+        else "REVERTING" if cfg.get("revert") else "applying", pid, uuid))
     proc = subprocess.run(
         ["lldb", "--batch", "-o", "command script import %s" % ATTACH, "-o", "quit"],
         env=env, capture_output=True, text=True, timeout=120)
@@ -202,10 +309,12 @@ def main():
         time.sleep(0.1)
     if os.path.exists(STATUS_FILE):
         st = json.load(open(STATUS_FILE))
-        mode = "revert" if st.get("revert") else "apply"
-        print("[ttrmod] in-process (%s): applied=%d skipped=%d reverted=%d errors=%d" % (
-            mode, len(st.get("applied", [])), len(st.get("skipped", [])),
-            len(st.get("reverted", [])), len(st.get("errors", []))))
+        mode = "probe" if st.get("probe") else "revert" if st.get("revert") else "apply"
+        print("[ttrmod] in-process (%s): probe=%d applied=%d skipped=%d reverted=%d errors=%d" % (
+            mode, len(st.get("probe", [])), len(st.get("applied", [])),
+            len(st.get("skipped", [])), len(st.get("reverted", [])), len(st.get("errors", []))))
+        for p in st.get("probe", []):
+            print("   ? %-18s %s = %s" % (p["id"], p.get("target"), p.get("value")))
         for a in st.get("applied", []):
             print("   + %-18s %s  %s" % (a["id"], a["target"], a.get("detail", "")))
         for s in st.get("skipped", []):

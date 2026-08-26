@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Thin wrapper around driver.py. Runs from anywhere.
 #   ./ttrmod            apply patches from config.json
+#   ./ttrmod --probe    read-only smoke test (reports values, changes nothing)
 #   ./ttrmod --revert   restore originals
 #   ./ttrmod --status   print last in-process status
 set -euo pipefail

@@ -4,11 +4,27 @@
 # functions from vmaddrs supplied by the driver, verifies the prologue bytes,
 # then runs an injected Python bootstrap.
 #
-# TTR's frozen Panda3D "deploy-stub" build DEAD-STRIPS the whole PyRun_* family,
-# so we cannot use PyRun_SimpleString. Two surviving primitives are supported,
-# selected by job["primitive"]:
+# TTR's frozen Panda3D "deploy-stub" build DEAD-STRIPS the whole PyRun_* family
+# AND the bytecode compiler, and exec/eval are code-object-only. The real
+# primitive for this build is "marshal_evalcode"; the two string-based ones are
+# kept only for other/hypothetical builds. Selected by job["primitive"]:
 #
-#   "exec_builtins" (preferred):
+#   "marshal_evalcode" (the one that works on shipping TTR):
+#       gil  = PyGILState_Ensure()
+#       buf  = <lldb AllocateMemory + WriteMemory of the 3.7 marshal blob>
+#       ba   = PyByteArray_FromStringAndSize(buf, len)   # copies; then free buf
+#       co   = marshal.loads(0, ba)                       # METH_O: (mod, arg)
+#       # PyModule_GetDict/AddModule are inlined, so read f_globals off the frame:
+#       tstate = *(void**)(current_tstate_ptr + slide)
+#       gd     = *(void**)(*(void**)(tstate + 24) + 48)   # frame->f_globals
+#       res  = PyEval_EvalCode(co, gd, gd)
+#       if !res: PyErr_PrintEx(1)
+#       PyGILState_Release(gil)
+#     addr keys: gil_ensure, gil_release, bytes_from_string_and_size,
+#                marshal_loads, eval_code, [err_printex]
+#     job also needs: payload_marshal_hex, globals_from_frame
+#
+#   "exec_builtins" (legacy, dead-stripped here):
 #       gil  = PyGILState_Ensure()
 #       bmod = PyImport_ImportModule("builtins")
 #       main = PyImport_AddModule("__main__")
@@ -135,19 +151,91 @@ def run(debugger):
         def evp(expr):   # evaluate, return as unsigned (pointer/handle)
             return ev(expr).GetValueAsUnsigned()
 
-        boot = job["bootstrap"]
-        cstr = boot.replace("\\", "\\\\").replace('"', '\\"')  # for a C string literal
-        primitive = job.get("primitive", "exec_builtins")
+        boot = job.get("bootstrap", "")
+        cstr = boot.replace("\\", "\\\\").replace('"', '\\"') if boot else ""
+        primitive = job.get("primitive", "marshal_evalcode")
         out["primitive"] = primitive
+
+        # gil ensure/release use different addr keys under marshal_evalcode
+        # (offsets.json names them gil_ensure/gil_release) vs the legacy paths.
+        ensure_key = "gil_ensure" if primitive == "marshal_evalcode" else "ensure"
+        release_key = "gil_release" if primitive == "marshal_evalcode" else "release"
+
+        # For marshal_evalcode, capture the live game frame's f_globals *before*
+        # PyGILState_Ensure -- Ensure may swap _PyThreadState_Current to lldb's
+        # calling thread (whose frame is NULL). At attach time the global still
+        # points at the GIL-holding game thread with a valid frame; this is a
+        # pure memory read (no GIL needed).
+        gd_pre = None
+        if primitive == "marshal_evalcode":
+            gff = job.get("globals_from_frame", {})
+            tstate_vmaddr = int(str(gff.get("current_tstate_ptr_vmaddr", "0")), 0)
+            off_frame = int(gff.get("tstate_to_frame_offset", 24))
+            off_globals = int(gff.get("frame_to_f_globals_offset", 48))
+            if not tstate_vmaddr:
+                raise RuntimeError("globals_from_frame.current_tstate_ptr_vmaddr missing")
+            out["stage"] = "read f_globals off live frame (pre-GIL)"
+            tstate = evp("*(void**)%d" % (tstate_vmaddr + slide))
+            if not tstate:
+                raise RuntimeError("current PyThreadState is NULL "
+                                   "(no thread holds the GIL now; retry during active play)")
+            frame_ptr = evp("*(void**)%d" % (tstate + off_frame))
+            if not frame_ptr:
+                raise RuntimeError("top PyThreadState has no frame "
+                                   "(interpreter idle in C; retry during active play)")
+            gd_pre = evp("*(void**)%d" % (frame_ptr + off_globals))
+            if not gd_pre:
+                raise RuntimeError("frame f_globals is NULL")
+            out["frame_globals"] = hex(gd_pre)
 
         # 1) gil = PyGILState_Ensure()
         out["stage"] = "gil-ensure"
-        gil = ev("(long)((long(*)())%d)()" % addrs["ensure"]).GetValueAsSigned()
+        gil = ev("(long)((long(*)())%d)()" % addrs[ensure_key]).GetValueAsSigned()
         out["gil"] = gil
 
         res = 1  # non-null == success sentinel
         try:
-            if primitive == "exec_builtins":
+            if primitive == "marshal_evalcode":
+                # 3.7-marshalled code object -> a scratch buffer in the target
+                blob = bytes.fromhex(job["payload_marshal_hex"])
+                out["stage"] = "alloc target buffer"
+                perms = lldb.ePermissionsReadable | lldb.ePermissionsWritable
+                aerr = lldb.SBError()
+                buf = process.AllocateMemory(len(blob), perms, aerr)
+                if not aerr.Success() or not buf:
+                    raise RuntimeError("AllocateMemory failed: %s" % aerr.GetCString())
+                out["buf"] = hex(buf)
+                out["stage"] = "write marshal blob"
+                werr = lldb.SBError()
+                wrote = process.WriteMemory(buf, blob, werr)
+                if not werr.Success() or wrote != len(blob):
+                    raise RuntimeError("WriteMemory failed: %s (%s/%d)"
+                                       % (werr.GetCString(), wrote, len(blob)))
+
+                # ba = PyByteArray_FromStringAndSize(buf, len)  -- copies the data
+                out["stage"] = "PyByteArray_FromStringAndSize"
+                ba = evp('(void*)((void*(*)(char*,long))%d)(%d,%d)'
+                         % (addrs["bytes_from_string_and_size"], buf, len(blob)))
+                if not ba:
+                    raise RuntimeError("PyByteArray_FromStringAndSize returned NULL")
+                # bytearray owns a copy now; reclaim the scratch buffer
+                process.DeallocateMemory(buf)
+
+                # co = marshal.loads(0, ba)  -- METH_O; module arg is ignored
+                out["stage"] = "marshal.loads"
+                co = evp('(void*)((void*(*)(void*,void*))%d)(0,%d)'
+                         % (addrs["marshal_loads"], ba))
+                if not co:
+                    out["notes"].append("marshal.loads returned NULL")
+                    if "err_printex" in addrs:
+                        ev("(void)((void(*)(int))%d)(1)" % addrs["err_printex"])
+                    raise RuntimeError("marshal.loads failed (bad blob / version mismatch)")
+
+                # res = PyEval_EvalCode(co, gd, gd) -- gd captured pre-GIL above
+                out["stage"] = "PyEval_EvalCode"
+                res = evp('(void*)((void*(*)(void*,void*,void*))%d)(%d,%d,%d)'
+                          % (addrs["eval_code"], co, gd_pre, gd_pre))
+            elif primitive == "exec_builtins":
                 out["stage"] = "import builtins"
                 bmod = evp('(void*)((void*(*)(char*))%d)("builtins")' % addrs["import_module"])
                 out["stage"] = "add __main__"
@@ -177,13 +265,16 @@ def run(debugger):
             out["res_ptr"] = hex(res)
             if not res:
                 out["notes"].append("in-process call returned NULL (a Python exception was raised)")
-                if "err_print" in addrs:
+                if "err_printex" in addrs:
+                    out["stage"] = "err_printex"
+                    ev("(void)((void(*)(int))%d)(1)" % addrs["err_printex"])
+                elif "err_print" in addrs:
                     out["stage"] = "err_print"
                     ev("(void)((void(*)())%d)()" % addrs["err_print"])
         finally:
             # 3) PyGILState_Release(gil) -- always, even on failure
             out["stage"] = "gil-release"
-            ev("(void)((void(*)(long))%d)(%d)" % (addrs["release"], gil))
+            ev("(void)((void(*)(long))%d)(%d)" % (addrs[release_key], gil))
 
         process.Detach()
         out["stage"] = "detached"

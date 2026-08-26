@@ -24,6 +24,7 @@ STATUS_PATH = os.environ.get("TTRMOD_STATUS", "/tmp/ttrmod-status.json")
 report = {
     "ok": False,
     "revert": False,
+    "probe": [],        # [{"id","target","value"}] read-only smoke-test output
     "applied": [],     # [{"id","target","detail"}]
     "skipped": [],      # [{"id","reason"}]
     "reverted": [],
@@ -257,6 +258,30 @@ def apply_enabled(cfg):
         apply_patch(patch, gc)
 
 
+def probe_all(cfg):
+    """Read-only: report the current value/target of every patch without
+    changing anything. Used for the live-attach smoke test -- proves the whole
+    inject->marshal->eval->payload pipeline ran and can see the game modules,
+    while leaving gameplay untouched."""
+    for patch in PATCHES:
+        pid = patch["id"]
+        holder, attr, modname = _holder_and_attr(patch)
+        if holder is None:
+            report["probe"].append({"id": pid, "target": None,
+                                     "value": "module/class not loaded yet"})
+            continue
+        if not hasattr(holder, attr):
+            report["probe"].append({"id": pid, "target": "%s.%s" % (modname, attr),
+                                     "value": "<absent>"})
+            continue
+        try:
+            cur = getattr(holder, attr)
+            val = repr(cur) if patch["kind"] in ("const", "attr") else "<callable %s>" % getattr(cur, "__name__", "?")
+        except Exception as e:
+            val = "err %r" % e
+        report["probe"].append({"id": pid, "target": "%s.%s" % (modname, attr), "value": val})
+
+
 # --------------------------------------------------------------------------
 # Entry
 # --------------------------------------------------------------------------
@@ -269,6 +294,8 @@ def main():
 
     if cfg.get("revert"):
         revert_all()
+    elif cfg.get("probe"):
+        probe_all(cfg)  # read-only smoke test; changes nothing
     else:
         apply_enabled(cfg)
         if cfg.get("install_import_hook", True):

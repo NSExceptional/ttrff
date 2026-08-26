@@ -1,11 +1,11 @@
 {
-  "_comment": "CPython C-API addresses per TTREngine build, keyed by the arm64 Mach-O UUID (as-linked vmaddrs, image base 0x100000000; driver adds the runtime ASLR slide). TTR auto-patches the engine; when the UUID changes, re-derive with the `re` skill and add a new entry. `verify` holds each function's prologue bytes so the driver aborts on a changed binary. IMPORTANT: this hardened LTO CPython 3.7 deploy build dead-strips PyRun_* AND the bytecode compiler, and exec/eval are code-object-only, so the runnable primitive is `marshal_evalcode` (inject a host-marshalled code object -> marshal.loads -> PyEval_EvalCode with f_globals read off the live frame), NOT exec_builtins. PyModule_GetDict / PyImport_AddModule / PyBytes_FromStringAndSize are all inlined away by whole-program LTO (no standalone), hence the frame-globals read and the PyByteArray bytes-like constructor. See STATUS.md. Driver rework to the marshal_evalcode recipe is still pending.",
+  "_comment": "CPython C-API addresses per TTREngine build, keyed by the arm64 Mach-O UUID (as-linked vmaddrs, image base 0x100000000; driver adds the runtime ASLR slide). TTR auto-patches the engine; when the UUID changes, re-derive with the `re` skill and add a new entry. `verify` holds each function's prologue bytes so the driver aborts on a changed binary. IMPORTANT: this hardened LTO CPython 3.7 deploy build dead-strips PyRun_* AND the bytecode compiler, and exec/eval are code-object-only, so the runnable primitive is `marshal_evalcode` (inject a host-marshalled code object -> marshal.loads -> PyEval_EvalCode with f_globals read off the live frame), NOT exec_builtins. PyModule_GetDict / PyImport_AddModule / PyBytes_FromStringAndSize are all inlined away by whole-program LTO (no standalone), hence the frame-globals read and the PyByteArray bytes-like constructor. The driver marshals the payload with a real host CPython 3.7 (marshal/code-object format is version-locked; TTRMOD_PY37 or python.org 3.7). See STATUS.md. Driver rework to the marshal_evalcode recipe is COMPLETE; only a live attach smoke test remains.",
   "4C4C44C3-5555-3144-A136-F2D2B4A39415": {
     "arch": "arm64",
     "image_base_vmaddr": 4294967296,
     "primitive": "marshal_evalcode",
-    "runnable": false,
-    "note": "TTREngine May 2024 build. All addresses confirmed via the `re` skill and internally consistent. PENDING only: driver rework from exec_builtins to the marshal_evalcode recipe (STATUS.md), then a live attach smoke test.",
+    "runnable": true,
+    "note": "TTREngine May 2024 build. All addresses confirmed via the `re` skill and internally consistent. Driver + lldb harness are fully wired to marshal_evalcode and validated host-side (payload compiles+marshals under 3.7, probe path exercised offline). PENDING only: a live attach smoke test in the owner's running game (start with `driver.py --probe`).",
     "addrs": {
       "gil_ensure": 4305952272,
       "gil_release": 4305952596,

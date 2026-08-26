@@ -24,32 +24,43 @@ that. Do not distribute or use on accounts you do not own.
 ## How it works
 
 TTREngine statically embeds CPython 3.7 (Panda3D 1.11) with its symbol table
-**stripped**, and — because it's a frozen Panda3D *deploy-stub* build — the
-entire `PyRun_*` family (`PyRun_SimpleString`, `PyRun_String`, …) is
-**dead-stripped**; the app's frozen `__main__` runs via import + `PyEval_EvalCode`,
-so those source-runner entry points were never linked. The surviving C-API
-functions must be called by **address**. The tool therefore:
+**stripped**, and — because it's a frozen, LTO-inlined *deploy-stub* build — three
+things are gone that a normal injector would use: the whole `PyRun_*` family is
+**dead-stripped**, the **bytecode compiler is stripped** (`exec`/`eval` are
+code-object-only; there is no in-process `source → code` path), and
+`PyModule_GetDict` / `PyImport_AddModule` / `PyBytes_FromStringAndSize` are all
+**inlined away** (no standalone addresses to call). The surviving C-API functions
+must be called by **address**. The tool therefore uses the **`marshal_evalcode`**
+primitive:
 
 1. Reads the running binary's **arm64 Mach-O UUID** and looks up the CPython
    C-API vmaddrs for that exact build in `offsets.json` (derived once with the
    `re` skill; see "Re-deriving offsets").
-2. Drives `lldb` (AMFI is disabled on this machine, so attaching to the
-   hardened-runtime process is permitted) to run, on the live interpreter, the
-   **`exec_builtins`** primitive — every step callable by address, no
-   `PyRun_*` needed:
+2. On the **host**, compiles `payload.py` to a code object and `marshal.dumps`
+   it — using a real **CPython 3.7** (`TTRMOD_PY37`, python.org 3.7, or
+   `python3.7` on `PATH`). The marshal/code-object format is version-locked, so a
+   3.8+ blob will not load in the engine's 3.7; any 3.7.x works, including x86_64
+   under Rosetta (only `compile()`+`marshal.dumps()` are used).
+3. Drives `lldb` (AMFI is disabled on this machine, so attaching to the
+   hardened-runtime process is permitted) to run, on the live interpreter, every
+   step callable by address:
    ```
+   gd   = *(void**)(*(void**)(*(void**)current_tstate + 24) + 48);  // f_globals, read BEFORE the GIL
    gil  = PyGILState_Ensure();
-   bmod = PyImport_ImportModule("builtins");
-   main = PyImport_AddModule("__main__");
-   gd   = PyModule_GetDict(main);
-   PyObject_CallMethod(bmod, "exec", "sO", bootstrap, gd);  // execs payload in __main__
+   buf  = <AllocateMemory + WriteMemory of the 3.7 marshal blob>;
+   ba   = PyByteArray_FromStringAndSize(buf, len);   // copies; buffer then freed
+   co   = marshal.loads(0, ba);                       // METH_O; module arg ignored
+   res  = PyEval_EvalCode(co, gd, gd);                // execs payload
+   if (!res) PyErr_PrintEx(1);
    PyGILState_Release(gil);
    ```
-   (A `compile_eval` fallback — `Py_CompileStringExFlags` + `PyEval_EvalCode` —
-   is also implemented, selectable via `offsets.json`.) Before calling, it
-   verifies each function's prologue bytes and **aborts** if they don't match
-   (guards against a silently auto-patched engine).
-3. `inproc/payload.py` runs inside the game and monkeypatches the loaded modules.
+   `f_globals` is read off the live frame **before** `PyGILState_Ensure` (Ensure
+   can swap the current thread-state to lldb's calling thread, whose frame is
+   NULL). Before calling anything it verifies each function's prologue bytes and
+   **aborts** if they don't match (guards against a silently auto-patched engine).
+   (Two legacy string primitives, `exec_builtins` and `compile_eval`, remain in
+   the code for other/hypothetical builds but are dead-stripped in shipping TTR.)
+4. `inproc/payload.py` runs inside the game and monkeypatches the loaded modules.
 
 `payload.py` prefers **wrapping the animation factory functions** and scaling
 the returned interval with `.setPlayRate(factor)` — which is robust regardless
@@ -70,6 +81,16 @@ target module loads later, so you can attach at the login screen.
 | `config.json` | which groups are on + their speed factors |
 | `offsets.json` | per-build CPython C-API vmaddrs (keyed by UUID) |
 
+## Requirements
+
+- **AMFI disabled** on this machine (permits attaching to the hardened-runtime
+  process).
+- A host **CPython 3.7** to marshal the payload for the engine's 3.7 interpreter.
+  Set `TTRMOD_PY37=/path/to/python3.7`, or install python.org 3.7 (the driver
+  also auto-finds `/Library/Frameworks/Python.framework/Versions/3.7/bin/python3.7`
+  and `python3.7` on `PATH`). Any 3.7.x, incl. x86_64 under Rosetta — only
+  `compile()`+`marshal.dumps()` are used, so no extension modules are needed.
+
 ## Run steps
 
 1. Launch Toontown Rewritten normally and log in (the owner does this; the tool
@@ -77,17 +98,24 @@ target module loads later, so you can attach at the login screen.
    attach, but the battle modules only load in-district, so apply once you're in
    a playground/street for the patches to bind immediately (the import hook will
    otherwise bind them the moment those modules import).
-2. Apply:
+2. **Smoke test first (read-only, changes nothing):**
    ```
    cd ~/Developer/ttr-mods
+   ./ttrmod --probe
+   ```
+   Expect a `probe` report listing current values, e.g.
+   `cog_death_duration  MovieUtil.SUIT_LOSE_DURATION = 6.0`. This proves the whole
+   attach → marshal → eval → payload pipeline works without altering gameplay.
+3. Apply:
+   ```
    ./ttrmod
    ```
    You'll see which patches applied/were skipped. It's safe to re-run.
-3. Revert (restores originals in the live process, no restart needed):
+4. Revert (restores originals in the live process, no restart needed):
    ```
    ./ttrmod --revert
    ```
-4. Inspect the last in-process result:
+5. Inspect the last in-process result:
    ```
    ./ttrmod --status
    ```
@@ -131,22 +159,30 @@ TTR auto-patches `TTREngine`, which changes its UUID and function addresses.
 When `./ttrmod` reports "no offsets recorded for this build" / "missing
 addresses" (or the prologue verify fails), re-derive with the `re` skill
 (IDA/Hopper) on the arm64 slice of `…/Contents/MacOS/TTREngine`. For the
-`exec_builtins` primitive locate these (all core-runtime, present in the frozen
-build):
+`marshal_evalcode` primitive locate these (all core-runtime, present in the
+frozen build):
 
 - `PyGILState_Ensure` / `PyGILState_Release` — `pystate.c`, near the `autoTLSkey`
-  / "thread state must be current when releasing" strings. (For the current
-  build: Ensure `0x100a79e10`, Release `0x100a79f54`.)
-- `PyImport_ImportModule`, `PyImport_AddModule` — `import.c` (xref `"__main__"`,
-  `sys.modules`).
-- `PyModule_GetDict` — `moduleobject.c` (tiny; returns `md_dict`).
-- `PyObject_CallMethod` — `call.c` / `abstract.c`.
-- `PyErr_Print` (optional) — `pythonrun.c`, xref "Error in sys.excepthook:".
+  / "thread state must be current when releasing" strings. (Current build: Ensure
+  `0x100a79e10`, Release `0x100a79f54`.)
+- `PyEval_EvalCode` — `ceval.c` (thin wrapper over `_PyEval_EvalCodeWithName`).
+- `marshal.loads` impl — `marshalmodule.c`; METH_O `(module, arg)`, xref the
+  `"bad marshal data"` strings. (Current: `0x100a76a20`.)
+- `PyByteArray_FromStringAndSize` — `bytearrayobject.c`; any bytes-like the
+  `marshal.loads` `y*` parse accepts works. (Current: `0x1009791b4`.)
+- `PyErr_PrintEx` (optional but recommended) — `pythonrun.c`, xref "Error in
+  sys.excepthook:"; called with arg `1`.
+- The **current thread-state global** (`_PyThreadState_Current` /
+  `_PyRuntime.gilstate.tstate_current`) plus the `tstate→frame` (24) and
+  `frame→f_globals` (48) offsets, recorded under `globals_from_frame`. `f_globals`
+  is read off the live frame because `PyModule_GetDict`/`PyImport_AddModule` are
+  inlined away.
 
-The whole `PyRun_*` family is **dead-stripped** — do not look for
-`PyRun_SimpleString`. If the import/call functions are hard to pin, switch the
-build's `"primitive"` to `"compile_eval"` and instead locate `PyEval_EvalCode`
-(`ceval.c`) and `Py_CompileStringExFlags` (`pythonrun.c`).
+The whole `PyRun_*` family **and** the bytecode compiler are **dead-stripped** —
+do not look for `PyRun_SimpleString` or `Py_CompileString*`; there is no
+in-process source→code path, which is why the payload is marshalled on a 3.7
+host.
 
-Add an entry under the new UUID in `offsets.json` with the vmaddrs and the first
-16 prologue bytes of each (space-separated hex) in `verify`.
+Add an entry under the new UUID in `offsets.json` with the vmaddrs (both decimal
+in `addrs` and hex in `vmaddrs_hex`), the `globals_from_frame` block, and the
+first 16 prologue bytes of each function (space-separated hex) in `verify`.
