@@ -60,6 +60,24 @@ re-derived live" below. Net: `fires=1` on the real self-discovered method (`Loca
 clean revert, no crash — but `setPlayRate` never lands because the walk interval is NOT stored on the
 toon instance. The speedup itself is **still blocked** pending a different hook for the walk interval.
 
+**Milestone-2 COMPLETE (2026-09-05) — FIRST VISIBLE CLIENT-SIDE SPEEDUP LANDED + MEASURED.** The
+`base.transitions` iris/fade primary target is a DEAD END in TTR (see "Screen transitions" below):
+zone changes (door/tunnel/teleport) do NOT route through it — wrapping all 20 `Transitions` methods
+gave `fires=0` on a building entry, so the visible zone fade comes from the zone loader, not
+`base.transitions`. **Pivoted to the GENERAL INTERVAL HOOK (the sanctioned fallback) and it WORKS.**
+Wrap `MetaInterval.start` (the Python `Sequence`/`Parallel` base), read each started interval's
+`getName()`, LOG it, and `setPlayRate` ONLY names matching a substring. Live: `fires=398`, game
+alive, clean revert; logged the real (mostly readable) interval names — `teleportOut-<doId>`,
+`teleportIn-<doId>`, `openBook-<doId>`, `closeBook-<doId>`, **`irisTask`** (the screen iris — the
+original primary target, reachable here by its intact literal name), plus NPC `stareAt-ToonEyes-*`
+and auto-named `<clsHash>-<n>` sequences. Scaling `teleport*`/`iris`/`fade`/`tunnel` ×5 scaled
+`teleportOut-112139724` (our toon) + `irisTask` (`[SCALED]` confirmed). **MEASURED (frame timing,
+`scripts/tt-sample`, matched A/B both from the playground): the teleport-out animation phase
+shrank from ~4.07s (baseline) to ~0.83s (modded) = ~4.9× ≈ the 5.0 factor.** Evidence PNGs:
+baseline `scratchpad/base_tele3/` (playground→Zapwood) + `base_tele/` (interior, ~3.95s), modded
+`scratchpad/mod_tele_frames/`. This is the first real, measured, cosmetic client-side speedup on the
+live official client.
+
 ---
 
 ## The target — TTREngine
@@ -503,6 +521,54 @@ TTR.** Discovered empirically with findcls/findmeth (all read-only, in-world Too
   `"tunnel"`/`"walk"` on `vlta74f0161`); (3) if the interval is stored under a hashed attr set a
   frame or two later, poll `self.__dict__` for a newly-appearing `Interval`-typed value instead of a
   fixed attr. Whichever wins, the class resolution is already solved by the signature scan.
+- **RESOLVED (2026-09-05) by the general interval hook — option (1) generalized.** See below; the
+  tunnel walk, like every transition, is a named `Sequence` caught by wrapping `MetaInterval.start`.
+
+### Screen transitions & the GENERAL INTERVAL HOOK (2026-09-05) — how the speedup was actually landed
+
+The mission's primary target (scale `base.transitions` iris/fade on a door entry) is a **DEAD END in
+TTR** — but it led to the robust general solution.
+
+- **The `Transitions` class:** module **`direct.vlt12b20a87.vlt2a26f3c6`**, class **`vlt2a26f3c6`**
+  (22 own non-dunder members; only **`fadeScreen`** and **`letterboxOff`** are readable, the rest
+  hashed — incl. `irisIn/irisOut/fadeIn/fadeOut/letterboxOn`; the 2 string class-attrs
+  `IrisModelName/FadeModelName` are hashed too, `vlt9815a292`/`vltbd78e262`). Uniquely identified by
+  the signature `fadeScreen+letterboxOff` (findmeth count=1). Interval attr in the Panda source is
+  `self.transitionIval`.
+- **Why it's a dead end:** wrapping all 20 real methods on this class (attr=`transitionIval`, probe
+  on) and walking into a building gave **`fires=0`** — TTR's zone-change transition does NOT call
+  `base.transitions`'s methods; the visible zone fade + loading card come from the zone loader. (Also
+  attribute identifiers are hashed globally, so `transitionIval` would be a `vlt…` anyway.) So the
+  door-iris assumption doesn't hold on TTR. **A `Transitions`-method wrap can only ever fire if
+  something calls those methods; TTR's zone changes don't.**
+- **The GENERAL INTERVAL HOOK (WORKS, mission-sanctioned fallback):** every Panda `Sequence`/
+  `Parallel`/`Track` is a **Python `MetaInterval`** and `.start()` dispatches to the Python
+  `MetaInterval.start`. Class = **`direct.vltf283acbe.vlt615404bc`**, class **`vlt615404bc`**;
+  self-discover by signature **`start+setPlayRate+append+clearIntervals`** (NB: `addSequence` from
+  vanilla Panda is ABSENT/renamed here — use `append`+`clearIntervals`). Its subclasses (readable
+  **`Track`** + hashed Sequence/Parallel) inherit `start`. (Python base `Interval` = module
+  `direct.vltf283acbe`, class `vlt353dc210`, has `setupPlay/stepPlay/privInitialize` — wrap it too
+  for non-Meta intervals.) Wrap ONLY `start` (mod1's discovery signature is decoupled from the
+  wrap-list via `TTRMOD_WRAP`). In the wrap-after, `self` IS the interval: read `getName()`, log it,
+  and `setPlayRate(self, factor)` **only when the name contains a `TTRMOD_BYNAME` substring** — never
+  globally. Interval method names (`start`/`setPlayRate`/`getName`/`getDuration`/`privDoEvent`) are
+  READABLE (the `panda3d.direct` C++ base `CInterval` exposes them; C++ types can't be `setattr`-
+  wrapped, so target the Python `MetaInterval`/`Interval` subclasses instead).
+- **Discovered interval NAMES (live log, `TTRMOD_LOGNAMES=1`):** mostly READABLE and meaningful —
+  `teleportOut-<doId>`, `teleportIn-<doId>`, `openBook-<doId>`, `closeBook-<doId>`, and **`irisTask`**
+  (the screen iris, an intact string literal), plus NPC `stareAt-ToonEyes-*` and auto-named
+  `<clsHash>-<n>` sequences. So transitions/animations are scalable BY NAME regardless of how they're
+  built or which (hashed) method builds them.
+- **The landed speedup:** `TTRMOD_BYNAME="teleport,tunnel,iris,fade"` ×5 → `[SCALED]`
+  `teleportOut-112139724` (our toon) + `irisTask`. Frame-timing A/B (matched, both from playground,
+  `scripts/tt-sample 5 120`): teleport-out animation ~4.07s → ~0.83s = **~4.9×**. `fires=398`, game
+  alive, clean revert. The book open/close is too fast (~1 frame at ~11 fps `winctl shot`) to MEASURE
+  a speedup, but scales fine; teleport-out is long and cleanly measurable.
+- **NEXT mod groups to generalize (all via the same hook):** the **tunnel walk** (walk into a street
+  tunnel → its `Sequence` appears in the log, scale by name); **battle** movie/faceoff/run-in
+  (`Sequence` names surface on first cog battle); `irisTask`/`fadeTask` on natural door/zone entry
+  (confirm the loader's fade is a MetaInterval by logging during an entry). Each is just a new
+  `TTRMOD_BYNAME` substring — no new RE.
 
 ---
 
@@ -510,7 +576,7 @@ TTR.** Discovered empirically with findcls/findmeth (all read-only, in-world Too
 
 | path | role |
 |---|---|
-| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup). Env: `TTRMOD_METHODS` (signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_ATTR` (interval attr), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL` (poll secs). Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub), and the shared read-only signature/substring scans. |
+| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. |
 | `frida/inject.py` | legacy eval path (marshal.loads + `PyCode_NewWithPosOnlyArgs` + `PyEval_EvalCode`); diagnostic modes `--hello` (+`TTRMOD_HELLOSRC`), `TTRMOD_NOEVAL`, `TTRMOD_TESTOBJ`+`TTRMOD_TESTSRC`, `TTRMOD_LOADONLY`. `Process.setExceptionHandler`→`/tmp/ttrmod-crash.json`; hang → thread `sample()`→`/tmp/ttrmod-sample.json`; self-exits (no 120s hangs). |
 | `frida/ftest.py` | proven bare-attach sanity check |
 | `frida/diag.py` | attach diagnostics |
@@ -526,6 +592,8 @@ TTR.** Discovered empirically with findcls/findmeth (all read-only, in-world Too
 | `localtest/wrapafter_test.py` | **offline PROOF of the wrap-after trampoline** (milestone-2b, PASS) — orig-once + pass-through + `setPlayRate(factor)` + `iname_sub` selectivity + clean-miss-with-exception-cleared, against mocks |
 | `localtest/findcls_test.py` | **offline PROOF of the signature/substring class scan** (PASS) — registers a real target class under a hashed-looking `sys.modules` key + decoys (one-method / none), inheritance/mixed cases, attr!=`__name__`, and a junk module (ints/funcs/str/bytes/module/list); asserts the scan finds EXACTLY the all-methods classes with correct direct-vs-inherited attribution, no false-positives, junk-safe; widen surfaces single-method decoys; substring scan (own-dict) matches by method-name substring; and the mod1 self-discover→wrap path (HIT setPlayRate(5.0) + MISS clean-tstate). Carries the scan helpers **verbatim** from `trampoline_inject.py`. |
 | `localtest/abortleak_test.py` | offline A/B proving the exception-clear discipline |
+| `localtest/transitions_test.py` | **offline PROOF (PASS)** of the screen-transitions config: self-discovers a `Transitions`-shaped mock by `irisIn/irisOut/fadeIn/fadeOut`, wraps all four, `setPlayRate(5.0)` on `self.transitionIval` for iris AND fade, and the `t==0`/None path is a clean no-op with the tstate cleared |
+| `localtest/ivalname_test.py` | **offline PROOF (PASS) of the GENERAL INTERVAL HOOK** (the `byname` spec): discovers the Python `MetaInterval` by `start+setPlayRate+append+addSequence`, wraps ONLY `start`, logs every started interval's `getName()`, and `setPlayRate(5.0)`s ONLY the name-matching interval (non-match untouched, pass-through + tstate clean) |
 | `lldb/attach.py` | dead lldb path (kept for reference; do not use) |
 | `driver.py` | lldb-era host driver (legacy) |
 | `ttrmod` | bash entrypoint (legacy `--probe`/apply/`--revert` wrapper) |

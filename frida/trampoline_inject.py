@@ -262,6 +262,29 @@ rpc.exports = {
               }
             }
             ST.clearExc(); return n;
+          } else if (spec.mode === 'byname'){
+            // GENERAL INTERVAL HOOK: `inst` IS the interval (we wrapped its start()). Read its
+            // getName(); optionally LOG it (deduped, capped) so we can discover the real names live;
+            // and scale (setPlayRate on-the-fly, AFTER start() already ran) ONLY when the name
+            // contains one of spec.subs -- so we never globally rescale every interval.
+            var gm = ST.GetAttrStr(inst, Memory.allocUtf8String('getName'));
+            if (gm.isNull()){ ST.clearExc(); return 0; }
+            var nm3 = ST.TupleNew ? ST.Call(gm, ST.TupleNew(0), ptr(0)) : ptr(0);
+            if (nm3.isNull()){ ST.clearExc(); return 0; }
+            var nms = null; try { nms = ST.AsUTF8(nm3).readCString(); } catch(e){ nms = null; }
+            if (nms === null){ ST.clearExc(); return 0; }
+            if (spec.log){
+              ST.seenNames = ST.seenNames || {}; ST.nameCount = ST.nameCount || 0;
+              if (ST.seenNames[nms] === undefined && ST.nameCount < 250){ ST.seenNames[nms] = 1; ST.nameCount++; try { send({t:'ivalname', name:nms}); } catch(e){} }
+            }
+            var subs = spec.subs || [], hit = false;
+            for (var si=0; si<subs.length; si++){ if (subs[si] && nms.indexOf(subs[si]) >= 0){ hit = true; break; } }
+            if (hit){
+              var ok = ST.setPlayRate(inst, factorVal);
+              if (ok){ try { ST.scaledNames = ST.scaledNames || {}; ST.scaledNames[nms] = (ST.scaledNames[nms]||0)+1; send({t:'scaled', name:nms, factor:factorVal}); } catch(e){} }
+              ST.clearExc(); return ok ? 1 : 0;
+            }
+            ST.clearExc(); return 0;
           }
         } catch(e){ ST.clearExc(); }
         return 0;
@@ -269,9 +292,9 @@ rpc.exports = {
       // wrap-after NativeCallback (METH_VARARGS|KEYWORDS=0x3): call the ORIGINAL once, then (only if
       // it did not raise) discover the just-started interval and setPlayRate it; return the original
       // result. args = (inst, *call_args); inst = ob_item[0] @ tuple+0x18 (ob_size @ +0x10).
-      ST.makeWrapAfter = function(orig, spec, factorVal){
+      ST.makeWrapAfter = function(orig, spec, factorVal, label){
         var cb = new NativeCallback(function (self, args, kwargs) {
-          try { ST.fires = (ST.fires||0) + 1; if (ST.fires<=3) send({t:'fired', n:ST.fires}); } catch(e){}
+          try { ST.fires = (ST.fires||0) + 1; if (ST.fires<=8) send({t:'fired', n:ST.fires, method:label}); } catch(e){}
           var result = ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original, exactly once
           if (result.isNull()){ return result; }              // original raised -> propagate untouched
           try {
@@ -279,12 +302,17 @@ rpc.exports = {
             try { if (args.add(0x10).readS64().toNumber() >= 1) inst = args.add(0x18).readPointer(); } catch(e){}
             var _applied = 0;
             if (!inst.isNull()) _applied = ST.applyAfter(inst, spec, factorVal);   // # intervals setPlayRate'd
-            try { if ((ST.fires||0) <= 3) send({t:'applied', fire:(ST.fires||0), n:_applied, attr:spec.attr, factor:factorVal}); } catch(e){}
-            // OPTIONAL first-fire diagnostic: dump the instance's track-like __dict__ keys so we can
-            // see the REAL interval attr if `spec.attr` was hashed/renamed (read-only; heavily guarded).
-            if (ST.probeAttrs && !inst.isNull() && (ST.fires||0) <= 2){
+            // count landed applications per wrapped method -> identifies WHICH (hashed) method scaled a
+            // real interval (i.e. is a transition-starter), and confirms the attr resolved.
+            try { if (_applied > 0){ ST.appliedBy = ST.appliedBy || {}; ST.appliedBy[label] = (ST.appliedBy[label]||0) + _applied; } } catch(e){}
+            try { if ((ST.fires||0) <= 8 || _applied > 0) send({t:'applied', fire:(ST.fires||0), method:label, n:_applied, attr:spec.attr, factor:factorVal}); } catch(e){}
+            // DIAGNOSTIC: dump the instance's __dict__ (VALUE types) to reveal the REAL interval attr
+            // even when spec.attr was hashed/renamed. Widened to the first several fires (nested
+            // transition calls burn through the count fast) and only SENT when it actually finds an
+            // Interval-typed attr (or on the very first fire), so it isn't noisy. Read-only + cleared.
+            if (ST.probeAttrs && !inst.isNull() && (ST.fires||0) <= 15){
               try {
-                var pinfo = { fire:(ST.fires||0) };
+                var pinfo = { fire:(ST.fires||0), method:label };
                 // (a) instance __dict__ keys that look interval/animation-ish
                 var idict = ST.GetAttrStr(inst, Memory.allocUtf8String('__dict__'));
                 if (!idict.isNull() && ST.GetIter && ST.IterNext && ST.AsUTF8){
@@ -330,7 +358,10 @@ rpc.exports = {
                   pinfo.activeIntervals_count = c; pinfo.activeIntervals = ivn;
                 } else { pinfo.activeIntervals = 'ABSENT'; }
                 ST.clearExc();
-                send({t:'probe', p:pinfo});
+                // send only when it found an interval-typed attr (the payload we're after) or on the
+                // first fire (baseline), to avoid spamming for the nested no-op transition calls.
+                if ((pinfo.interval_typed_attrs && pinfo.interval_typed_attrs.length) || (ST.fires||0) <= 1)
+                  send({t:'probe', p:pinfo});
               } catch(e){}
               ST.clearExc();
             }
@@ -707,15 +738,24 @@ rpc.exports = {
               if (!targets.length){ ST.fin({ok:false, stage:'no class matched signature '+m.methods.join('+')+' (walk in-world first?)'}); return; }
               ST.installed = [];
               var wired = [], anyOk = false, ti, mi;
+              // discovery uses m.methods (the signature); the methods we actually WRAP are
+              // m.wrapMethods (default = m.methods) -- lets us discover the interval class by a broad
+              // signature but wrap only `start`.
+              var wrapMethods = (m.wrapMethods && m.wrapMethods.length) ? m.wrapMethods : m.methods;
               for (ti = 0; ti < targets.length; ti++){
                 var cls0 = targets[ti].clsPtr; ST.keep.push(cls0);
-                for (mi = 0; mi < m.methods.length; mi++){
-                  var meth0 = m.methods[mi];
+                for (mi = 0; mi < wrapMethods.length; mi++){
+                  var meth0 = wrapMethods[mi];
                   var mn0 = Memory.allocUtf8String(meth0);
                   var orig0 = ST.GetAttrStr(cls0, mn0);
                   if (orig0.isNull()){ ST.clearExc(); wired.push({cls:targets[ti].class_name, method:meth0, ok:false, reason:'method absent'}); continue; }
+                  // SAFETY: only wrap real functions. Vault-hashed class __dict__ keys include string
+                  // class-attrs (e.g. Transitions.IrisModelName/FadeModelName -> vlt...); replacing one
+                  // with a trampoline would corrupt it. A plain method is a 'function' object.
+                  var otn0 = ST.tpname(orig0);
+                  if (otn0 !== 'function'){ ST.clearExc(); wired.push({cls:targets[ti].class_name, method:meth0, ok:false, reason:'not a function ('+otn0+')'}); continue; }
                   ST.keep.push(orig0); ST.keep.push(mn0);
-                  var im0 = ST.makeWrapAfter(orig0, m.spec, m.factor);
+                  var im0 = ST.makeWrapAfter(orig0, m.spec, m.factor, meth0);
                   if (im0.isNull()){ wired.push({cls:targets[ti].class_name, method:meth0, ok:false, reason:'wrap build NULL'}); continue; }
                   var rc0 = ST.SetAttrStr(cls0, mn0, im0);
                   ST.installed.push({cls:cls0, mn:mn0, orig:orig0});
@@ -784,6 +824,9 @@ rpc.exports = {
   },
   // report fire count on demand (host polls after the user triggers the target)
   fires: function () { return ST ? (ST.fires||0) : -1; },
+  // per-method count of intervals actually setPlayRate'd (identifies which hashed method is a
+  // transition-starter and confirms the interval attr resolved). {} until something lands.
+  appliedBy: function () { return (ST && ST.appliedBy) ? ST.appliedBy : {}; },
 
   // REVERT: restore the original method (must run before session detach, on a GIL thread).
   // Re-arm a one-shot frame-eval hook that setattrs the original back, then detaches.
@@ -846,6 +889,16 @@ def main():
     MOD1["probe_attrs"] = os.environ.get("TTRMOD_PROBE_ATTRS", "") in ("1", "true", "yes")
     if os.environ.get("TTRMOD_ATTR"):
         MOD1["spec"] = {"mode": "attr", "attr": os.environ["TTRMOD_ATTR"]}   # override the interval attr
+    # GENERAL INTERVAL HOOK: discover the interval class by TTRMOD_METHODS, wrap only TTRMOD_WRAP
+    # (e.g. "start"), and use the `byname` spec -- read each started interval's getName(), LOG it
+    # (TTRMOD_LOGNAMES=1), and setPlayRate ONLY intervals whose name contains a TTRMOD_BYNAME substring.
+    MOD1["wrapMethods"] = [s.strip() for s in os.environ.get("TTRMOD_WRAP", "").split(",") if s.strip()]
+    byname = [s.strip() for s in os.environ.get("TTRMOD_BYNAME", "").split(",") if s.strip()]
+    if byname or os.environ.get("TTRMOD_LOGNAMES", "") in ("1", "true", "yes"):
+        MOD1["spec"] = {"mode": "byname", "subs": byname,
+                        "log": os.environ.get("TTRMOD_LOGNAMES", "") in ("1", "true", "yes")}
+    if os.environ.get("TTRMOD_FACTOR"):
+        MOD1["factor"] = float(os.environ["TTRMOD_FACTOR"])
 
     mode = os.environ.get("TTRMOD_MODE", "install")
     pid = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()[0].decode()
@@ -870,6 +923,10 @@ def main():
             elif pl.get("t") == "fired": print("[FIRED]", json.dumps(pl))
             elif pl.get("t") == "probe": print("[PROBE]", json.dumps(pl))
             elif pl.get("t") == "applied": print("[APPLIED]", json.dumps(pl))
+            elif pl.get("t") == "ivalname":
+                box.setdefault("names", []).append(pl.get("name")); print("[IVALNAME]", pl.get("name"))
+            elif pl.get("t") == "scaled":
+                box.setdefault("scaled", []).append(pl.get("name")); print("[SCALED]", pl.get("name"), "x", pl.get("factor"))
             elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
@@ -915,6 +972,11 @@ def main():
         try: f = ex.fires()
         except Exception: break
         if f != last: print("[tramp-live] fires=%d" % f); last = f
+    try:
+        ab = ex.appliedBy()
+        if ab: print("[tramp-live] appliedBy (method -> #intervals scaled):", json.dumps(ab))
+    except Exception:
+        pass
     alive = subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
     print("[tramp-live] final fires=%d  game_alive=%s" % (last, alive))
     # MUST revert before detaching: the trampoline's native code dies with the session, so a
