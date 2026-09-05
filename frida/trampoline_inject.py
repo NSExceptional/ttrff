@@ -1061,14 +1061,36 @@ def main():
     else:
         target_label = T_METHOD
         trigger_hint = "trigger '%s' in-game (e.g. walk through a door for a screen wipe)" % T_METHOD
-    poll_s = float(os.environ.get("TTRMOD_POLL", "30"))
-    print("[tramp-live] %s. Polling %gs..." % (trigger_hint, poll_s))
-    t = time.time(); last = 0
-    while time.time() - t < poll_s and not box.get("detached"):
-        time.sleep(2.0)
-        try: f = ex.fires()
-        except Exception: break
-        if f != last: print("[tramp-live] fires=%d" % f); last = f
+    # modset is the "play" mode: stay resident until Ctrl+C so the mods keep working
+    # while you play. Test modes keep a bounded poll. TTRMOD_POLL overrides either way
+    # (a number = poll that many seconds; 0 = stay resident regardless of mode).
+    poll_env = os.environ.get("TTRMOD_POLL")
+    if poll_env is not None:
+        poll_s = float(poll_env)
+    else:
+        poll_s = 0.0 if mode == "modset" else 30.0
+    persist = poll_s <= 0
+    if persist:
+        print("[tramp-live] %s" % trigger_hint)
+        print("[tramp-live] MODS LIVE — leave this running while you play. Press Ctrl+C to stop and cleanly revert.")
+    else:
+        print("[tramp-live] %s. Polling %gs..." % (trigger_hint, poll_s))
+    t = time.time(); last = 0; last_beat = t
+    try:
+        while not box.get("detached"):
+            time.sleep(2.0)
+            try: f = ex.fires()
+            except Exception: break
+            now = time.time()
+            if persist:
+                if now - last_beat >= 30.0:
+                    print("[tramp-live] alive — fires=%d (Ctrl+C to stop + revert)" % f); last_beat = now
+            else:
+                if f != last: print("[tramp-live] fires=%d" % f)
+                if now - t >= poll_s: break
+            last = f
+    except KeyboardInterrupt:
+        print("\n[tramp-live] Ctrl+C — stopping: reverting mods and detaching cleanly...")
     try:
         ab = ex.appliedBy()
         if ab: print("[tramp-live] appliedBy (method -> #intervals scaled):", json.dumps(ab))
