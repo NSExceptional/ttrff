@@ -633,7 +633,7 @@ door, battle), plus the local toon's own (tunnel walk, iris). Names are mostly r
 | transitions | `irisTask` | any zone change (teleport/tunnel/door) — the screen **iris** | 3.0 | **`[SCALED]` ×3 confirmed** (own teleport; iris close frame-captured ~380→~127ms) |
 | door | `leftDoorOpen/Close-<id>`, `rightDoorOpen/Close-<id>`, `avatarEnterDoor-<id>-<id>`, `avatarExitDoor-<id>-<id>` | a toon enters/leaves a building | 3.0 | **`[SCALED]` ×3 confirmed** (discovered run 1 → added → scaled later runs) |
 | battle | `faceoff-battle<id>` (faceoff), `movie-track` + `movie-reward-track` (attack/reward movie), `to-pending-toon` (run-in) | a cog battle in-zone | 3.0 | **names discovered live** (others' fights); tabled → scales on next in-zone battle (client visual only) |
-| tunnel | `tunnelOut`/`tunnelIn` (substring `tunnel`) | walk the local toon into a street tunnel | 4.0 | **entry proven (`base_tunnel2`), scaling by-mechanism** — fires only on OWN entry (not broadcast); a clean modded capture was blocked by unreliable blind tunnel-trigger navigation |
+| tunnel | **context-scaled via `LocalToon.tunnelOut`** (the walk interval is auto-named `vlt8e0d5a85-<n>` and unreachable by name — see "Context-scaling" below) | walk the LOCAL toon into a street tunnel | 4.0 | **wrap-around context mechanism, offline-validated (`localtest/wraparound_test.py`)** — scales any interval started during `tunnelOut`; live trigger pending (fires on OWN entry only, not broadcast). Arrival `tunnelIn` is hashed away → pending its hashed name |
 
 Also seen, **left untouched on purpose** (unknown/not cosmetic-speed): `bellicose` (×15), `trackName`
 (×6), `treasureFlyTrack`, `ripples-track-<n>` (pond), `Floater` (floating text), `stareAt-ToonEyes-*`
@@ -646,14 +646,83 @@ The ambient flood is why `[IVALNAME]` dedup is capped (400) — the tunnel walk 
   right factor, no crash, clean revert.
 - **Names captured, scaling pending an in-zone battle:** battle (faceoff/movie/reward/run-in). The door
   group is the proof-of-concept that a newly-discovered name, once tabled, scales live.
-- **Pending own-toon capture:** tunnel walk (`tunnelOut`/`tunnelIn`). Fires only locally; a reliable
-  own-toon tunnel entry (or a better input method than blind `winctl` holds) is the one remaining
-  confirmation. Book scales fine but is too fast (<1 frame) to *frame-measure* a speedup.
+- **Tunnel walk — now CONTEXT-scaled (`tunnelOut`), pending a live trigger:** the departure walk is
+  scaled by CREATION CONTEXT (see "Context-scaling" below), not by name — its interval is fire-and-
+  forget and auto-named `vlt8e0d5a85-<n>`, so no `match` substring could reach it. Offline-validated
+  (`localtest/wraparound_test.py`). It fires only on the local toon's own entry (not broadcast), so the
+  one remaining confirmation is the user walking a toon through a street tunnel. Arrival `tunnelIn` is
+  hashed on this build → pending its hashed name. Book scales fine but is too fast (<1 frame) to
+  *frame-measure* a speedup.
 
 ### Milestone
 **First measured live speedup = teleport-out ~4.9× (byname hook).** `modset` then confirmed the same
 mechanism scaling **5 groups** (teleport/book/transitions/door + battle-names) across 4 crash-free live
 runs — the production mod-set is functional end-to-end.
+
+### Context-scaling — the wrap-AROUND upgrade for the tunnel walk (2026-09-05)
+
+**Why name-matching failed for the tunnel walk.** Every other group's interval has a readable,
+targetable name (`teleportOut-<id>`, `openBook-<id>`, `irisTask`, `leftDoorOpen-<id>`, …), so the
+`modset` name→factor table catches them. The **street-tunnel walk does not**: its interval is created
+and started *inside* `LocalToon.tunnelOut` as **fire-and-forget** (never stored on the toon — confirmed
+by the first-fire `__dict__` probe: no `tunnelTrack`, no `activeIntervals`, `self.track` is `None`), and
+it is **auto-named with a hashed class prefix** (`vlt8e0d5a85-<counter>`). That same prefix is the
+dominant *ambient* sequence in-world (~1240 unique/session), so **no substring can distinguish the walk
+from the flood** — confirmed live: walking a tunnel with the `tunnel` name entry active produced **no
+`[SCALED]`** for it. Name-matching is structurally the wrong tool here.
+
+**The fix — scale by CREATION CONTEXT, not name.** We already know the method that spawns the walk
+(`LocalToon.tunnelOut`, a readable method on the hashed class `vlt24ab6c6d.vlt7892fa9a.vlt725d40df`).
+So instead of one wrap-AFTER, `tunnelOut` gets a **wrap-AROUND** wrapper (`ST.makeCtxWrap`):
+- it saves the previous context, sets a global **`ST.ctx = {group, factor}`** *before* calling the
+  original, and **restores the previous value *after* in a `finally`** — so the flag clears even if the
+  original raises (the same exception-clear discipline as the wrap-after path), and nested/reentrant
+  context methods save+restore correctly (no clobber, no leak);
+- the existing `MetaInterval.start` wrap-after (the `modset` spec) now **checks `ST.ctx` first**: if a
+  context is active when an interval *starts*, it `setPlayRate`s **that** interval by `ctx.factor` —
+  regardless of its (hashed) name — and **always logs the name via the `[IVALNAME]` path with a `ctx=`
+  tag**, so we finally learn the real hashed name of the walk. Intervals that start with **no** context
+  set fall through to the normal name-table path, **unchanged**. Context takes priority over the table.
+
+This reaches fire-and-forget / auto-named intervals that no name could safely target, while leaving all
+existing name-based groups and behavior intact.
+
+**How the owning class is resolved (never hardcode the hash).** The context installer resolves each
+context method's owning class by that method's **signature** via the existing read-only `scanBySignature`
+scan (`TTRMOD_MODE=findcls`-style): `tunnelOut` alone is a **unique** signature (exact-scan count = 1) →
+resolves `LocalToon` (`vlt725d40df`, `all_direct:true`) without ever naming the per-build hash. It then
+wraps the method wrap-around. Non-fatal by design: a context method that doesn't resolve (a class not yet
+in-world, or a hashed-away name) is reported in `ctx_wired` and skipped — it never blocks the install.
+Ctx wraps are recorded in `ST.installed` and reverted like any other wrap.
+
+**`modset.json` `context` entry (the tunnel):**
+```jsonc
+"context": [
+  { "method": "tunnelOut", "factor": 4.0, "group": "tunnel" }
+]
+```
+`method` = a **readable** method whose call brackets the interval creation (its owning class is resolved
+by signature); `factor`/`group` as for `entries`; `enabled:false` skips it.
+
+**`tunnelIn` (the arrival walk) is still pending.** On this build only `tunnelOut` is readable on
+`LocalToon`; **`tunnelIn` is hashed away**, so resolving it by the readable name finds nothing (it's
+present in the config as an `enabled:false` context entry, reported unresolved and skipped — never
+blocks). To enable it: discover its real hashed method name live (`TTRMOD_MODE=findmeth
+TTRMOD_SUBSTR="unnel,walk"`, or a `TTRMOD_LISTCLS` dump of `LocalToon`), set `method` to that hash, and
+drop `enabled:false`. The wrap-around mechanism itself is name-agnostic and will scale its walk the
+moment the method is wired.
+
+**Offline validation** (`localtest/wraparound_test.py`, stock arm64 CPython 3.8, real native
+trampolines, mock `LocalToon`/`MetaInterval` — mirrors `modset_test.py`/`wrapafter_test.py`): proves
+(a) an interval started *during* a wrapped context method is scaled by the **context** factor (4.0) and
+its (hashed `vlt8e0d5a85-…`) name is logged with `ctx=tunnel`, though it matches **no** table entry;
+(b) an interval started *outside* any context is **not** ctx-scaled — it goes through the name table
+(matching name → table factor; non-matching → untouched + logged); (c) the context flag is **cleared
+even when the wrapped method raises** (ctx back to null, the original's exception propagates as the only
+thing on the tstate, and a later interval is not ctx-scaled — no leak); (d) **nesting is safe** — an
+outer context (4.0) that calls an inner context (9.0) restores the outer on the inner's return
+(before/after intervals → 4.0, inner → 9.0, ctx null once the outer returns); plus tstate clean
+throughout and original always called once. **PASS**, alongside all existing offline tests.
 
 ---
 
@@ -661,7 +730,7 @@ runs — the production mod-set is functional end-to-end.
 
 | path | role |
 |---|---|
-| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**) / **`modset`** (THE PRODUCTION mode: the general interval hook driven by the `modset.json` name→factor table; reuses the mod1 install path but with the per-entry `modset` spec, defaults to pinning the `MetaInterval` class + wrapping `start`, and prints `[SCALED] … (group)` + `scaledInfo` group/name tallies). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. Also `TTRMOD_MODSET` (table path, default `modset.json`) and the `scaledInfo` rpc (per-name/per-group scale tallies). **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. **Modset recipe (production):** `TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150` (table = `modset.json`). |
+| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**) / **`modset`** (THE PRODUCTION mode: the general interval hook driven by the `modset.json` name→factor table; reuses the mod1 install path but with the per-entry `modset` spec, defaults to pinning the `MetaInterval` class + wrapping `start`, and prints `[SCALED] … (group)` + `scaledInfo` group/name tallies). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. Also `TTRMOD_MODSET` (table path, default `modset.json`) and the `scaledInfo` rpc (per-name/per-group scale tallies). **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. **Modset recipe (production):** `TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150` (table = `modset.json`). Also carries **wrap-AROUND context-scaling** (`ST.makeCtxWrap` + `ST.ctx` + the `modset.json` `context` section): for a configured method (e.g. `tunnelOut`, class resolved by signature) it sets a context flag around the call so any interval that *starts* during it is scaled by the context factor and logged with a `ctx=` tag — reaching fire-and-forget / auto-named intervals (the tunnel walk) that no name can target. See "Context-scaling" above. |
 | `frida/inject.py` | legacy eval path (marshal.loads + `PyCode_NewWithPosOnlyArgs` + `PyEval_EvalCode`); diagnostic modes `--hello` (+`TTRMOD_HELLOSRC`), `TTRMOD_NOEVAL`, `TTRMOD_TESTOBJ`+`TTRMOD_TESTSRC`, `TTRMOD_LOADONLY`. `Process.setExceptionHandler`→`/tmp/ttrmod-crash.json`; hang → thread `sample()`→`/tmp/ttrmod-sample.json`; self-exits (no 120s hangs). |
 | `frida/ftest.py` | proven bare-attach sanity check |
 | `frida/diag.py` | attach diagnostics |
@@ -680,11 +749,12 @@ runs — the production mod-set is functional end-to-end.
 | `localtest/transitions_test.py` | **offline PROOF (PASS)** of the screen-transitions config: self-discovers a `Transitions`-shaped mock by `irisIn/irisOut/fadeIn/fadeOut`, wraps all four, `setPlayRate(5.0)` on `self.transitionIval` for iris AND fade, and the `t==0`/None path is a clean no-op with the tstate cleared |
 | `localtest/ivalname_test.py` | **offline PROOF (PASS) of the GENERAL INTERVAL HOOK** (the `byname` spec): discovers the Python `MetaInterval` by `start+setPlayRate+append+addSequence`, wraps ONLY `start`, logs every started interval's `getName()`, and `setPlayRate(5.0)`s ONLY the name-matching interval (non-match untouched, pass-through + tstate clean) |
 | **`localtest/modset_test.py`** | **offline PROOF (PASS) of the `modset` table logic** — discovers the `MetaInterval` by `start+setPlayRate+append+clearIntervals`, wraps `start`, and against a mock scales each started interval with the FIRST-matching table entry's OWN factor/group (teleport 4 / book 3 / iris 3 / tunnel 4), honors first-match ordering (`openBook`→3.0 not the broad `Book`→99.0), leaves unmatched intervals untouched-but-logged, and is junk-safe (getName() raising / returning a non-string → clean, tstate clear). Mirrors the shipping `modset` branch. |
+| **`localtest/wraparound_test.py`** | **offline PROOF (PASS) of the wrap-AROUND context-scaling** — resolves a mock `LocalToon` by the `tunnelOut` signature, wraps context methods wrap-around, and against a mock `MetaInterval` proves: (a) an interval started *during* a context method is scaled by the CONTEXT factor and its (hashed `vlt8e0d5a85-…`) name logged with `ctx=tunnel` though it matches no table entry; (b) outside a context, only the name table applies; (c) the context flag clears even when the wrapped method raises (no leaked ctx / tstate exception); (d) nesting/reentrancy saves+restores the outer context. Mirrors the shipping `makeCtxWrap` + `modset` ctx branch. |
 | `lldb/attach.py` | dead lldb path (kept for reference; do not use) |
 | `driver.py` | lldb-era host driver (legacy) |
 | `ttrmod` | bash entrypoint (legacy `--probe`/apply/`--revert` wrapper) |
 | `config.json` | LEGACY eval-path groups (battle 3, runin 3, teleport 5, tunnel 5, book 100, iris 5) + `install_import_hook`; superseded by `modset.json` for the live route |
-| **`modset.json`** | **the PRODUCTION name→factor table** for `TTRMOD_MODE=modset` (16 active entries across teleport/book/transitions/door/battle + a `tunnel` substring; `pending` docs the unconfirmed tunnel/unknown names). Owner-editable; see "The `modset` mode" above. |
+| **`modset.json`** | **the PRODUCTION name→factor table** for `TTRMOD_MODE=modset` (16 active entries across teleport/book/transitions/door/battle + a `tunnel` substring; `pending` docs the unconfirmed tunnel/unknown names). Also carries the **`context`** section — wrap-around context-scaling targets resolved by method signature (`tunnelOut` active x4.0; `tunnelIn` present but `enabled:false` pending its hashed name). Owner-editable; see "The `modset` mode" + "Context-scaling" above. |
 | `offsets.json` | per-build eval-path C-API vmaddrs, keyed by UUID (+ prologue `verify` bytes) |
 | `capi-symbols.json` / `.md` | trampoline-route symbols, pass 1 |
 | `capi-symbols2.json` / `.md` | trampoline-route symbols, pass 2 (authoritative corrections) |

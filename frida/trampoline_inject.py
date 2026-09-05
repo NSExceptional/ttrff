@@ -66,6 +66,7 @@ MOD1 = {
     "spec":     {"mode": "attr", "attr": "tunnelTrack"},
     "factor":   5.0,
     "override": None,                                    # {"module":..,"cls":..} if TTRMOD_TMOD+TCLS set
+    "context":  [],                                      # wrap-around context targets (modset only): [{method,factor,group}]
 }
 
 # GENERAL INTERVAL HOOK target (the proven-live modset class). Every Panda Sequence/Parallel/Track
@@ -106,7 +107,13 @@ def load_symbols():
 def load_modset(path):
     """Load the modset name->factor table. Each active entry -> {match, factor, group, prefix}.
     Entries with enabled:false (the stubbed/pending groups, e.g. battle) are skipped. `pending`
-    is a free-form list ignored by the loader (documentation of names still to confirm live)."""
+    is a free-form list ignored by the loader (documentation of names still to confirm live).
+
+    Also loads the `context` section: entries -> {method, factor, group}. These are wrap-AROUND
+    CONTEXT targets -- a method (resolved to its owning class by its signature) whose call sets a
+    global context so that intervals STARTED during it are scaled by CREATION CONTEXT rather than by
+    name (for fire-and-forget / auto-named intervals like the tunnel walk). enabled:false skips a
+    context entry (e.g. tunnelIn, whose real method name is hashed and still to be discovered)."""
     data = json.load(open(path))
     entries = []
     for e in data.get("entries", []):
@@ -117,7 +124,16 @@ def load_modset(path):
             continue
         entries.append({"match": m, "factor": float(e.get("factor", 3.0)),
                         "group": e.get("group", "?"), "prefix": bool(e.get("prefix", False))})
-    return entries, bool(data.get("log_unmatched", True))
+    context = []
+    for c in data.get("context", []):
+        if not c.get("enabled", True):
+            continue
+        meth = c.get("method")
+        if not meth:
+            continue
+        context.append({"method": meth, "factor": float(c.get("factor", 3.0)),
+                        "group": c.get("group", "?")})
+    return entries, bool(data.get("log_unmatched", True)), context
 
 
 def readiness(syms):
@@ -171,7 +187,13 @@ rpc.exports = {
         cell:       rt(p.tstate_cell),
         interp_off: p.interp_off, modules_off: p.modules_off,
         tmod: p.tmod, tcls: p.tcls, tmeth: p.tmeth,
-        done:false, keep:[]
+        done:false, keep:[],
+        // WRAP-AROUND CONTEXT (context-scaling). ctx is null except while a wrapped context
+        // method (e.g. LocalToon.tunnelOut) is on the stack, when it holds {group, factor, label}.
+        // The MetaInterval.start hook scales -- by ctx.factor -- any interval that STARTS while
+        // ctx is set, so fire-and-forget / auto-named intervals (the tunnel walk) are caught by
+        // CREATION CONTEXT instead of by name. Nesting-safe: each ctx wrapper saves+restores prev.
+        ctx: null
       };
       // 1-tuple builder for the self-bind: prefer PyTuple_New+SetItem, else PyTuple_Pack.
       if (F['PyTuple_New'] && F['PyTuple_SetItem']){
@@ -326,6 +348,26 @@ rpc.exports = {
             if (nm4.isNull()){ ST.clearExc(); return 0; }
             var nms4 = null; try { nms4 = ST.AsUTF8(nm4).readCString(); } catch(e){ nms4 = null; }
             if (nms4 === null){ ST.clearExc(); return 0; }
+            // CONTEXT SCALING (takes priority over the name table): if a wrap-around context method
+            // is on the stack (ST.ctx set), this interval was CREATED inside it -> scale it by the
+            // context's factor regardless of its (possibly auto-named/hashed) getName(). ALWAYS log
+            // the name via the [IVALNAME] path with a ctx= tag so we finally learn the real hashed
+            // name of the tunnel walk. This reaches fire-and-forget intervals that no substring could
+            // safely target. Every miss clears the tstate (same crash-guard discipline as below).
+            if (ST.ctx){
+              ST.ctxSeen = ST.ctxSeen || {}; ST.ctxCount = ST.ctxCount || 0;
+              if (ST.ctxSeen[nms4] === undefined && ST.ctxCount < 400){
+                ST.ctxSeen[nms4] = 1; ST.ctxCount++; try { send({t:'ivalname', name:nms4, ctx:ST.ctx.group}); } catch(e){}
+              }
+              var okc = ST.setPlayRate(inst, ST.ctx.factor);
+              if (okc){ try {
+                ST.scaledNames = ST.scaledNames || {}; var firstSeenC = (ST.scaledNames[nms4] === undefined);
+                ST.scaledNames[nms4] = (ST.scaledNames[nms4]||0) + 1;
+                ST.scaledGroups = ST.scaledGroups || {}; ST.scaledGroups[ST.ctx.group] = (ST.scaledGroups[ST.ctx.group]||0) + 1;
+                if (firstSeenC) send({t:'scaled', name:nms4, factor:ST.ctx.factor, group:ST.ctx.group, ctx:ST.ctx.group});
+              } catch(e){} }
+              ST.clearExc(); return okc ? 1 : 0;
+            }
             var entries = spec.entries || [], matched = null;
             for (var mi=0; mi<entries.length; mi++){
               var en = entries[mi]; if (!en || !en.match) continue;
@@ -434,6 +476,36 @@ rpc.exports = {
         }, 'pointer', ['pointer','pointer','pointer']);
         ST.keep.push(cb);
         var mname = Memory.allocUtf8String('ttrmod_wrapafter'); ST.keep.push(mname);
+        var mdef = Memory.alloc(32); ST.keep.push(mdef);
+        mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
+        var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
+        ST.keep.push(cfunc);
+        var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
+        ST.keep.push(im); return im;
+      };
+      // WRAP-AROUND context wrapper (METH_VARARGS|KEYWORDS=0x3): for a configured context method
+      // (e.g. LocalToon.tunnelOut) SET the global ST.ctx BEFORE calling the original and RESTORE the
+      // previous value AFTER, in a finally -- so ctx clears even if the original raises (same
+      // exception-clear discipline as wrap-after) and nested/reentrant context methods save+restore
+      // correctly. While ctx is set, the MetaInterval.start hook scales every interval that starts
+      // (by ctx.factor) -- that is how the fire-and-forget tunnel-walk interval is caught. The
+      // original result is passed straight through (NULL => it raised => propagate untouched, exc
+      // left intact -- we NEVER clear a genuine exception from the original).
+      ST.makeCtxWrap = function(orig, group, factorVal, label){
+        var cb = new NativeCallback(function (self, args, kwargs) {
+          try { ST.ctxFires = (ST.ctxFires||0) + 1; if (ST.ctxFires<=8) send({t:'fired', n:ST.ctxFires, method:label, ctx:group}); } catch(e){}
+          var prev = ST.ctx;                                   // save (nesting/reentrancy safe)
+          ST.ctx = { group: group, factor: factorVal, label: label };
+          var result;
+          try {
+            result = ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original, exactly once
+          } finally {
+            ST.ctx = prev;                                     // restore ALWAYS (finally == cleared-on-raise)
+          }
+          return result;                                       // pass the original result through
+        }, 'pointer', ['pointer','pointer','pointer']);
+        ST.keep.push(cb);
+        var mname = Memory.allocUtf8String('ttrmod_ctxwrap'); ST.keep.push(mname);
         var mdef = Memory.alloc(32); ST.keep.push(mdef);
         mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
         var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
@@ -826,11 +898,48 @@ rpc.exports = {
                   wired.push({cls:targets[ti].class_name, method:meth0, ok:(rc0===0), setattr_rc:rc0});
                 }
               }
+              // WRAP-AROUND CONTEXT targets (e.g. tunnelOut). Resolve each configured context
+              // method's OWNING class by that method's SIGNATURE (never by the hashed class name),
+              // preferring where it is defined directly, then wrap the method wrap-AROUND so ST.ctx
+              // is set for the call's duration. NON-FATAL: a context method that doesn't resolve
+              // (e.g. the hashed-away tunnelIn, or a class not yet in-world) is reported and skipped
+              // -- it never blocks the modset install. Reverted via ST.installed like any wrap.
+              var ctxList = m.context || [], ctxWired = [];
+              for (var ci2 = 0; ci2 < ctxList.length; ci2++){
+                var ce = ctxList[ci2];
+                if (!ce || !ce.method){ continue; }
+                var cFactor = (ce.factor !== undefined && ce.factor !== null) ? ce.factor : m.factor;
+                var cfound = ST.scanBySignature(mods0, [ce.method]);
+                var cdirect = cfound.filter(function(r){ return r.all_direct; });
+                var cchosen = cdirect.length ? cdirect : cfound;
+                if (!cchosen.length){
+                  ctxWired.push({method:ce.method, group:ce.group, factor:cFactor, ok:false,
+                                 reason:'no class matched signature (hashed away, or class not in-world yet)'});
+                  continue;
+                }
+                for (var cj = 0; cj < cchosen.length; cj++){
+                  var ccls = cchosen[cj].clsPtr; ST.keep.push(ccls);
+                  var cmn = Memory.allocUtf8String(ce.method);
+                  var corig = ST.GetAttrStr(ccls, cmn);
+                  if (corig.isNull()){ ST.clearExc(); ctxWired.push({method:ce.method, group:ce.group, cls:cchosen[cj].class_name, ok:false, reason:'method absent'}); continue; }
+                  var cotn = ST.tpname(corig);
+                  if (cotn !== 'function'){ ST.clearExc(); ctxWired.push({method:ce.method, group:ce.group, cls:cchosen[cj].class_name, ok:false, reason:'not a function ('+cotn+')'}); continue; }
+                  ST.keep.push(corig); ST.keep.push(cmn);
+                  var cim = ST.makeCtxWrap(corig, ce.group, cFactor, ce.method);
+                  if (cim.isNull()){ ctxWired.push({method:ce.method, group:ce.group, cls:cchosen[cj].class_name, ok:false, reason:'ctx wrap build NULL'}); continue; }
+                  var crc = ST.SetAttrStr(ccls, cmn, cim);
+                  ST.installed.push({cls:ccls, mn:cmn, orig:corig});
+                  if (crc === 0) anyOk = true;
+                  ctxWired.push({method:ce.method, group:ce.group, factor:cFactor,
+                                 cls:cchosen[cj].class_name, all_direct:cchosen[cj].all_direct,
+                                 ok:(crc===0), setattr_rc:crc});
+                }
+              }
               ST.fin({ok:anyOk, stage:'mod1_installed',
                       resolved_by: (m.override && m.override.module ? 'override' : 'signature-scan'),
                       targets: targets.map(function(t){ return {module:t.module, attr:t.attr, class_name:t.class_name, all_direct:t.all_direct}; }),
                       methods: m.methods, attr: m.spec.attr, factor: m.factor,
-                      wired: wired,
+                      wired: wired, ctx_wired: ctxWired,
                       note:'wrap-after live; walk into a street tunnel to see it fire + speed the walk'});
             } catch(e){ ST.fin({ok:false, stage:'mod1 ex', e:String(e)}); }
             return;
@@ -976,7 +1085,7 @@ def main():
     # clearing both would fall back to the signature scan (META_INTERVAL_SIG).
     if mode == "modset":
         tbl_path = os.environ.get("TTRMOD_MODSET", os.path.join(ROOT, "modset.json"))
-        entries, log_unmatched = load_modset(tbl_path)
+        entries, log_unmatched, context = load_modset(tbl_path)
         if not (ovr_mod and ovr_cls):
             MOD1["override"] = {"module": META_INTERVAL_MODULE, "cls": META_INTERVAL_CLASS}
         MOD1["methods"] = list(META_INTERVAL_SIG)   # signature fallback if the override is cleared
@@ -987,8 +1096,13 @@ def main():
         if env_log != "":
             want_log = env_log in ("1", "true", "yes")
         MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log}
+        # wrap-around CONTEXT targets (resolve owning class by the method signature; wrap wrap-around).
+        MOD1["context"] = context
         print("[tramp-live] modset: %d active entries; groups=%s; log_unmatched=%s; table=%s" % (
             len(entries), sorted(set(e["group"] for e in entries)), want_log, tbl_path))
+        if context:
+            print("[tramp-live] modset context: %d wrap-around target(s) -> %s" % (
+                len(context), ", ".join("%s(x%g,%s)" % (c["method"], c["factor"], c["group"]) for c in context)))
 
     pid = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()[0].decode()
     if mode == "findcls":
@@ -1015,11 +1129,15 @@ def main():
             elif pl.get("t") == "probe": print("[PROBE]", json.dumps(pl))
             elif pl.get("t") == "applied": print("[APPLIED]", json.dumps(pl))
             elif pl.get("t") == "ivalname":
-                box.setdefault("names", []).append(pl.get("name")); print("[IVALNAME]", pl.get("name"))
+                box.setdefault("names", []).append(pl.get("name"))
+                _ctx = pl.get("ctx")
+                print("[IVALNAME]", pl.get("name"), ("ctx=%s" % _ctx) if _ctx else "")
             elif pl.get("t") == "scaled":
                 box.setdefault("scaled", []).append(pl.get("name"))
+                _ctx = pl.get("ctx")
                 print("[SCALED]", pl.get("name"), "x", pl.get("factor"),
-                      ("(%s)" % pl.get("group")) if pl.get("group") else "")
+                      ("(%s)" % pl.get("group")) if pl.get("group") else "",
+                      ("ctx=%s" % _ctx) if _ctx else "")
             elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
