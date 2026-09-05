@@ -539,6 +539,13 @@ TTR.** Discovered empirically with findcls/findmeth (all read-only, in-world Too
   `tunnelOut`'s walk is a **fire-and-forget interval** (started without being stored on `self`, or
   built async / on the Place), which the wrap-after-then-`getattr(self, attr)` pattern cannot reach.
   `_apply_after` returned 0 (clean no-op) every run — hence no crash, but no speed change.
+  - **CORRECTION (2026-09-05, later):** the probe's *timing* was the flaw, not the toon. It ran right
+    after **`tunnelOut`** returns — but `tunnelOut` only `b_setTunnelOut(...)`s to the server; the walk
+    interval `self.tunnelTrack` is created in **`handleTunnelOut`**, which runs **later** (after the
+    server echoes the b_set). So at probe time `self.tunnelTrack` genuinely did not exist yet — it is set
+    during/after the walk, and its attr name is hashed too. The reference (`toontown/toon/LocalToon.py`)
+    confirms `self.tunnelTrack = Sequence(...)` in `handleTunnelIn/handleTunnelOut`. The correct fix is
+    **spawn-context** (scale by the hashed handler's frame co_name) — see "Spawn-context" far below.
 - **Exact NEXT STEP to actually speed the tunnel walk:** don't look on `self`. Options, in order:
   (1) hook Panda **`CInterval::set_play_rate`** / the `Sequence`/`Interval` **constructor** natively
   (Panda C++ symbols are far less stripped) and scale any interval created during the walk window;
@@ -633,7 +640,7 @@ door, battle), plus the local toon's own (tunnel walk, iris). Names are mostly r
 | transitions | `irisTask` | any zone change (teleport/tunnel/door) — the screen **iris** | 3.0 | **`[SCALED]` ×3 confirmed** (own teleport; iris close frame-captured ~380→~127ms) |
 | door | `leftDoorOpen/Close-<id>`, `rightDoorOpen/Close-<id>`, `avatarEnterDoor-<id>-<id>`, `avatarExitDoor-<id>-<id>` | a toon enters/leaves a building | 3.0 | **`[SCALED]` ×3 confirmed** (discovered run 1 → added → scaled later runs) |
 | battle | `faceoff-battle<id>` (faceoff), `movie-track` + `movie-reward-track` (attack/reward movie), `to-pending-toon` (run-in) | a cog battle in-zone | 3.0 | **names discovered live** (others' fights); tabled → scales on next in-zone battle (client visual only) |
-| tunnel | **context-scaled via `LocalToon.tunnelOut`** (the walk interval is auto-named `vlt8e0d5a85-<n>` and unreachable by name — see "Context-scaling" below) | walk the LOCAL toon into a street tunnel | 4.0 | **wrap-around context mechanism, offline-validated (`localtest/wraparound_test.py`)** — scales any interval started during `tunnelOut`; live trigger pending (fires on OWN entry only, not broadcast). Arrival `tunnelIn` is hashed away → pending its hashed name |
+| tunnel | **spawn-context-scaled by the co_name of the hashed `handleTunnelOut`/`handleTunnelIn`** (the walk interval is auto-named `vlt8e0d5a85-<n>` and unreachable by name — see "Spawn-context" below; the earlier `tunnelOut` wrap-around was the WRONG target) | walk the LOCAL toon into/out of a street tunnel | 4.0 | **spawn-context mechanism, offline-validated (`localtest/spawnctx_test.py`)** — scales the interval whose spawning frame's co_name is configured; live trigger pending (fires on OWN entry only, not broadcast). The two hashed handler co_names are discovered from one live walk via `[SPAWNCO]` |
 
 Also seen, **left untouched on purpose** (unknown/not cosmetic-speed): `bellicose` (×15), `trackName`
 (×6), `treasureFlyTrack`, `ripples-track-<n>` (pond), `Floater` (floating text), `stareAt-ToonEyes-*`
@@ -645,14 +652,22 @@ The ambient flood is why `[IVALNAME]` dedup is capped (400) — the tunnel walk 
 - **Live-confirmed (own trigger):** teleport, book, transitions (iris), door — all `[SCALED]` with the
   right factor, no crash, clean revert.
 - **Names captured, scaling pending an in-zone battle:** battle (faceoff/movie/reward/run-in). The door
-  group is the proof-of-concept that a newly-discovered name, once tabled, scales live.
-- **Tunnel walk — now CONTEXT-scaled (`tunnelOut`), pending a live trigger:** the departure walk is
-  scaled by CREATION CONTEXT (see "Context-scaling" below), not by name — its interval is fire-and-
-  forget and auto-named `vlt8e0d5a85-<n>`, so no `match` substring could reach it. Offline-validated
-  (`localtest/wraparound_test.py`). It fires only on the local toon's own entry (not broadcast), so the
-  one remaining confirmation is the user walking a toon through a street tunnel. Arrival `tunnelIn` is
-  hashed on this build → pending its hashed name. Book scales fine but is too fast (<1 frame) to
-  *frame-measure* a speedup.
+  group is the proof-of-concept that a newly-discovered name, once tabled, scales live. **Battle is
+  COSMETIC-ONLY (server-gated round pacing).** Scaling `movie-track` etc. speeds the *rendering* of a
+  round; it does **not** shorten the fight. The battle movie's done-callback is chained to `movie-track`,
+  so the client already reports the round "done" as soon as its own animation finishes — the client is
+  not the thing holding up the next round. The **inter-round wait is the server's** (the AI collects each
+  client's `d_...Done`/its own timers, then advances), so it is **not client-reducible**; the mod only
+  makes the visuals snappier within each server-paced round. Nothing ported to the real server changes.
+- **Tunnel walk — now SPAWN-CONTEXT-scaled (by the hashed handler's co_name), pending a live trigger:**
+  the walk is scaled by the **co_name of the frame that spawns its interval** (`handleTunnelOut` /
+  `handleTunnelIn`), not by name — its interval is fire-and-forget and auto-named `vlt8e0d5a85-<n>`, so no
+  `match` substring could reach it, and (crucially) the earlier `tunnelOut` wrap-around scaled **nothing**
+  because `tunnelOut` is only a server-broadcast sender, not the animator (see "Spawn-context" below).
+  Offline-validated (`localtest/spawnctx_test.py`). It fires only on the local toon's own entry (not
+  broadcast), so the remaining confirmation is the user walking a toon through a street tunnel; the two
+  hashed handler co_names surface from that one walk via `[SPAWNCO]`. Book scales fine but is too fast
+  (<1 frame) to *frame-measure* a speedup.
 
 ### Milestone
 **First measured live speedup = teleport-out ~4.9× (byname hook).** `modset` then confirmed the same
@@ -660,6 +675,16 @@ mechanism scaling **5 groups** (teleport/book/transitions/door + battle-names) a
 runs — the production mod-set is functional end-to-end.
 
 ### Context-scaling — the wrap-AROUND upgrade for the tunnel walk (2026-09-05)
+
+> **CORRECTION (2026-09-05, later): `tunnelOut` was the WRONG target — see "Spawn-context" below.**
+> This section's *mechanism* (wrap-around a signature-resolved method; scale intervals started during
+> it) is real, tested, and kept for genuinely-synchronous spawners. But `tunnelOut` does **not** animate:
+> the open-toontown reference (`toontown/toon/LocalToon.py`) proves `tunnelOut`/`tunnelIn` only call
+> `self.b_setTunnelOut/In(...)` — a **server broadcast** — and the walk is built+started **later**, in the
+> **hashed** handlers `handleTunnelOut`/`handleTunnelIn`, *after* the server echoes the b_set — **outside**
+> `tunnelOut`'s synchronous window (confirmed live: `[FIRED] tunnelOut` fired once, scaled 0). Both
+> `tunnelOut`/`tunnelIn` context entries are now **disabled**; the walk is handled by **spawn-context**
+> (the co_name of the hashed handler) instead. Read the next section, not this one, for the tunnel walk.
 
 **Why name-matching failed for the tunnel walk.** Every other group's interval has a readable,
 targetable name (`teleportOut-<id>`, `openBook-<id>`, `irisTask`, `leftDoorOpen-<id>`, …), so the
@@ -724,13 +749,81 @@ outer context (4.0) that calls an inner context (9.0) restores the outer on the 
 (before/after intervals → 4.0, inner → 9.0, ctx null once the outer returns); plus tstate clean
 throughout and original always called once. **PASS**, alongside all existing offline tests.
 
+### Spawn-context — the co_name fix for the tunnel walk (2026-09-05, the CORRECT target)
+
+**The real tunnel mechanism (from the open-toontown reference `toontown/toon/LocalToon.py`).**
+- `tunnelOut(self, tunnelOrigin)` / `tunnelIn(self, tunnelOrigin)` — **b_set SENDERS**, not animators.
+  They only call `self.b_setTunnelOut(...)` / `self.b_setTunnelIn(...)` (a **server broadcast**). No
+  interval. Wrapping them (wrap-after OR wrap-around) catches nothing (`[FIRED] tunnelOut` scaled 0 live).
+- `handleTunnelOut(self, startTime, …)` / `handleTunnelIn(self, startTime, …)` — the **real animators**,
+  run *after* the server echoes the `b_set`. Each builds an **UNNAMED** `self.tunnelTrack = Sequence(…)`
+  (auto-named `vlt8e0d5a85-<n>` on TTR — the same prefix as the ~1240 ambient sequences, so unmatchable by
+  name) and immediately calls `self.tunnelTrack.start(…)`. They also `base.transitions.irisIn(0.4)` (the
+  iris we already scale). On TTR **both handlers, and likely the `tunnelTrack` attr, are HASHED** — only
+  the readable `tunnelOut` sender is a resolvable-by-signature method. So the walk interval is a
+  fire-and-forget, unnamed, hashed-attr'd Sequence, started *outside* any readable method's window.
+
+**The fix — scale by the SPAWNING FRAME's co_name (approach 2).** In the `MetaInterval.start` wrap-after,
+after the original `start()` runs, read the co_name of the current Python frame — which, because our
+`start` wrapper is a **native C trampoline** (it pushes no Python frame), **is the caller of `start()`**,
+i.e. the function that spawned the interval (`handleTunnelOut`/`handleTunnelIn` for the walk). Chain:
+`tstate->frame` (**+0x18**) → `f_code` (**+0x20**) → `co_name` (**+0x70**), read via `PyUnicode_AsUTF8`.
+If that co_name **exactly** matches a `spawn_context` entry, `setPlayRate` the interval by that entry's
+factor — regardless of its (unmatchable) name. Exact match ⇒ **only** intervals spawned by a named
+function are touched, and a hashed co_name (unique to its source) collides with nothing else. This needs
+**no class resolution** for the handler (no extra trampoline, no hashed-name lookup) — just the existing
+`start` wrap plus a three-deref frame read. It generalizes to any future fire-and-forget spawner.
+
+**CPython 3.8 offsets — derived and VERIFIED.** `+0x18`/`+0x20`/`+0x70` are ABI-fixed for CPython 3.8.x
+64-bit (identical between TTR's 3.8.17 and stock 3.8.14). Cross-checked two ways: (1) `ctypes` on stock
+3.8 — `frame.f_code` reads back at `+0x20`, `co_name` at `+0x70` (value matches), `tstate->frame` at
+`+0x18` is the live current frame; (2) end-to-end in `localtest/spawnctx_test.py`, where the trampoline
+reads the co_name of a real running 3.8 frame back as exactly the function's name. (They also bracket the
+already-trusted `interp`@+0x10 and `curexc`@+0x58 offsets.)
+
+**Discovery of the hashed handler co_names (the one live step).** `handleTunnelOut`/`handleTunnelIn` are
+hashed, so their real co_names are unknown until observed. The unmatched-interval logger now emits, once
+per **distinct** spawning co_name, `[SPAWNCO] <co_name> (e.g. interval <name>)` — deduped **by co_name**
+(not by interval name, whose counter changes every walk), so the ~1240 ambient sequences collapse to a
+handful of spawner co_names and a **new** co_name appears exactly when the user walks a tunnel: that is
+the hashed handler. Paste it into a `spawn_context` entry's `co_name`. `modset.json` seeds both directions
+with the **readable** guesses `handleTunnelOut`/`handleTunnelIn` — if TTR left the code objects' co_names
+intact these scale on the first walk; otherwise they are replaced with the discovered hashes.
+
+**`modset.json` `spawn_context` (the tunnel):**
+```jsonc
+"spawn_context": [
+  { "co_name": "handleTunnelOut", "factor": 4.0, "group": "tunnel" },
+  { "co_name": "handleTunnelIn",  "factor": 4.0, "group": "tunnel" }
+]
+```
+`co_name` = the (hashed) spawning-method name; `factor`/`group` as for `entries`; `enabled:false` skips.
+Both directions are covered so departure **and** arrival scale once the two co_names are confirmed.
+
+**Approach 3 (fallback), if ever needed.** The `context` wrap-around mechanism can wrap the hashed handler
+*directly*: once its hashed name is known, add it as a `context` entry — `scanBySignature([<hash>])`
+resolves `LocalToon` by that method's signature and wraps it wrap-around, so the `tunnelTrack.start()`
+inside is caught by the ctx flag. Spawn-context (approach 2) is preferred: less invasive (no trampoline on
+the handler), pure reads, and it self-documents the co_names.
+
+**Offline validation** (`localtest/spawnctx_test.py`, stock arm64 CPython 3.8, real native trampolines,
+mock hashed-named `LocalToon` handlers + `MetaInterval`): proves (a) an interval started inside
+`vlt_handleTunnelOut` (co_name in `spawn_context`) is scaled by the spawn factor (4.0) though its
+auto-named `vlt8e0d5a85-<n>` name matches no table entry, and the co_name reads back as exactly
+`vlt_handleTunnelOut`; (b) the arrival `vlt_handleTunnelIn` likewise scales (4.0), co_name exact — both
+directions; (c) an interval started by a **different** method (`vlt_someOtherAnim`, co_name **not** in the
+set) with the same auto-named shape is **NOT** scaled (play_rate stays 1.0) and its co_name is surfaced in
+the `[SPAWNCO]` log — unrelated spawners spared, discovery path proven; (d) the name table still applies
+to directly-started intervals (`teleportOut` → 5.0) alongside spawn; plus tstate clean throughout and the
+original always called once. **PASS**, alongside all existing offline tests.
+
 ---
 
 ## Files & how to run
 
 | path | role |
 |---|---|
-| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**) / **`modset`** (THE PRODUCTION mode: the general interval hook driven by the `modset.json` name→factor table; reuses the mod1 install path but with the per-entry `modset` spec, defaults to pinning the `MetaInterval` class + wrapping `start`, and prints `[SCALED] … (group)` + `scaledInfo` group/name tallies). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. Also `TTRMOD_MODSET` (table path, default `modset.json`) and the `scaledInfo` rpc (per-name/per-group scale tallies). **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. **Modset recipe (production):** `TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150` (table = `modset.json`). Also carries **wrap-AROUND context-scaling** (`ST.makeCtxWrap` + `ST.ctx` + the `modset.json` `context` section): for a configured method (e.g. `tunnelOut`, class resolved by signature) it sets a context flag around the call so any interval that *starts* during it is scaled by the context factor and logged with a `ctx=` tag — reaching fire-and-forget / auto-named intervals (the tunnel walk) that no name can target. See "Context-scaling" above. |
+| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**) / **`modset`** (THE PRODUCTION mode: the general interval hook driven by the `modset.json` name→factor table; reuses the mod1 install path but with the per-entry `modset` spec, defaults to pinning the `MetaInterval` class + wrapping `start`, and prints `[SCALED] … (group)` + `scaledInfo` group/name tallies). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. Also `TTRMOD_MODSET` (table path, default `modset.json`) and the `scaledInfo` rpc (per-name/per-group scale tallies). **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. **Modset recipe (production):** `TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150` (table = `modset.json`). Also carries **wrap-AROUND context-scaling** (`ST.makeCtxWrap` + `ST.ctx` + the `modset.json` `context` section): for a configured method (class resolved by signature) it sets a context flag around the call so any interval that *starts* during it is scaled by the context factor and logged with a `ctx=` tag — for genuinely-synchronous spawners. And **spawn-context scaling** (`ST.spawnCoName` + the `modset.json` `spawn_context` section): reads the co_name of the frame that *called* `start()` (`tstate->frame`+0x18 → `f_code`+0x20 → `co_name`+0x70) and scales the interval iff that co_name exactly matches an entry — the CORRECT fix for the tunnel walk (spawned by the hashed `handleTunnelOut`/`handleTunnelIn`, not the b_set-only `tunnelOut`). Unmatched intervals' distinct spawning co_names are logged as `[SPAWNCO]` for discovery. See "Spawn-context" above. |
 | `frida/inject.py` | legacy eval path (marshal.loads + `PyCode_NewWithPosOnlyArgs` + `PyEval_EvalCode`); diagnostic modes `--hello` (+`TTRMOD_HELLOSRC`), `TTRMOD_NOEVAL`, `TTRMOD_TESTOBJ`+`TTRMOD_TESTSRC`, `TTRMOD_LOADONLY`. `Process.setExceptionHandler`→`/tmp/ttrmod-crash.json`; hang → thread `sample()`→`/tmp/ttrmod-sample.json`; self-exits (no 120s hangs). |
 | `frida/ftest.py` | proven bare-attach sanity check |
 | `frida/diag.py` | attach diagnostics |
@@ -749,6 +842,7 @@ throughout and original always called once. **PASS**, alongside all existing off
 | `localtest/transitions_test.py` | **offline PROOF (PASS)** of the screen-transitions config: self-discovers a `Transitions`-shaped mock by `irisIn/irisOut/fadeIn/fadeOut`, wraps all four, `setPlayRate(5.0)` on `self.transitionIval` for iris AND fade, and the `t==0`/None path is a clean no-op with the tstate cleared |
 | `localtest/ivalname_test.py` | **offline PROOF (PASS) of the GENERAL INTERVAL HOOK** (the `byname` spec): discovers the Python `MetaInterval` by `start+setPlayRate+append+addSequence`, wraps ONLY `start`, logs every started interval's `getName()`, and `setPlayRate(5.0)`s ONLY the name-matching interval (non-match untouched, pass-through + tstate clean) |
 | **`localtest/modset_test.py`** | **offline PROOF (PASS) of the `modset` table logic** — discovers the `MetaInterval` by `start+setPlayRate+append+clearIntervals`, wraps `start`, and against a mock scales each started interval with the FIRST-matching table entry's OWN factor/group (teleport 4 / book 3 / iris 3 / tunnel 4), honors first-match ordering (`openBook`→3.0 not the broad `Book`→99.0), leaves unmatched intervals untouched-but-logged, and is junk-safe (getName() raising / returning a non-string → clean, tstate clear). Mirrors the shipping `modset` branch. |
+| **`localtest/spawnctx_test.py`** | **offline PROOF (PASS) of SPAWN-CONTEXT scaling** (approach 2, the CORRECT tunnel fix) — wraps `MetaInterval.start`, and against mock hashed-named `LocalToon` handlers proves: an interval started inside `vlt_handleTunnelOut`/`vlt_handleTunnelIn` (co_name in `spawn_context`) is scaled by the spawn factor (4.0) though its auto-named `vlt8e0d5a85-<n>` name matches no table entry, and the spawning co_name reads back EXACTLY (both directions); an interval started by a different method (`vlt_someOtherAnim`, co_name not in the set) is NOT scaled and its co_name is surfaced in the `[SPAWNCO]` discovery log; the name table still applies to directly-started intervals (`teleportOut`→5.0); tstate clean throughout, original called once. Verifies the CPython 3.8 frame/code/co_name offsets (+0x18/+0x20/+0x70) end-to-end against real 3.8 frames. Mirrors the shipping `spec.mode==='modset'` spawn branch + `ST.spawnCoName`. |
 | **`localtest/wraparound_test.py`** | **offline PROOF (PASS) of the wrap-AROUND context-scaling** — resolves a mock `LocalToon` by the `tunnelOut` signature, wraps context methods wrap-around, and against a mock `MetaInterval` proves: (a) an interval started *during* a context method is scaled by the CONTEXT factor and its (hashed `vlt8e0d5a85-…`) name logged with `ctx=tunnel` though it matches no table entry; (b) outside a context, only the name table applies; (c) the context flag clears even when the wrapped method raises (no leaked ctx / tstate exception); (d) nesting/reentrancy saves+restores the outer context. Mirrors the shipping `makeCtxWrap` + `modset` ctx branch. |
 | `lldb/attach.py` | dead lldb path (kept for reference; do not use) |
 | `driver.py` | lldb-era host driver (legacy) |

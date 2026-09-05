@@ -43,6 +43,14 @@ INSTANCEMETHOD_TYPE = 0x101a79c20
 TSTATE_CELL         = 0x101c0acd8   # *cell = current PyThreadState
 INTERP_OFF          = 0x10          # tstate -> interp
 MODULES_OFF         = 0x38          # interp -> modules dict (== sys.modules)
+# CPython 3.8 struct offsets for reading the SPAWNING frame's function name (approach-2
+# spawn-context scaling). ABI-fixed by the interpreter version (3.8.x, 64-bit) -- identical
+# between TTR's 3.8.17 and stock 3.8.14, and VERIFIED end-to-end offline against real CPython
+# 3.8 frames (localtest/spawnctx_test.py asserts co_name reads back correctly). Chain:
+# tstate->frame (PyThreadState.frame) -> f_code (PyFrameObject.f_code) -> co_name (PyCodeObject.co_name).
+FRAME_OFF           = 0x18          # PyThreadState.frame   (interp @ +0x10, curexc @ +0x58 bracket it)
+FCODE_OFF           = 0x20          # PyFrameObject.f_code   (after PyObject_VAR_HEAD 0x18 + f_back 0x18)
+CONAME_OFF          = 0x70          # PyCodeObject.co_name   (a str; read via PyUnicode_AsUTF8)
 
 # milestone-2 manual PyFloat builder (STATUS.md recipe; PyFloat_FromDouble is inlined away).
 # Absolute vmaddrs -> slid at runtime. Layout validated offline in localtest/pyfloat_test.py
@@ -113,7 +121,15 @@ def load_modset(path):
     CONTEXT targets -- a method (resolved to its owning class by its signature) whose call sets a
     global context so that intervals STARTED during it are scaled by CREATION CONTEXT rather than by
     name (for fire-and-forget / auto-named intervals like the tunnel walk). enabled:false skips a
-    context entry (e.g. tunnelIn, whose real method name is hashed and still to be discovered)."""
+    context entry (e.g. tunnelIn, whose real method name is hashed and still to be discovered).
+
+    And the `spawn_context` section: entries -> {co_name, factor, group}. These scale an interval by
+    the co_name of the Python frame that CALLED start() -- i.e. the (possibly hashed) name of the
+    function that spawned it. This is the approach-2 mechanism for fire-and-forget / auto-named
+    intervals whose OWN name matches nothing and whose synchronous creator is a HASHED method that
+    can't be wrapped by readable name (the street-tunnel WALK: LocalToon.handleTunnelOut/In build an
+    unnamed self.tunnelTrack and start() it). Exact co_name match, so only intervals spawned by a
+    named function are touched. enabled:false skips one."""
     data = json.load(open(path))
     entries = []
     for e in data.get("entries", []):
@@ -133,7 +149,16 @@ def load_modset(path):
             continue
         context.append({"method": meth, "factor": float(c.get("factor", 3.0)),
                         "group": c.get("group", "?")})
-    return entries, bool(data.get("log_unmatched", True)), context
+    spawn = []
+    for s in data.get("spawn_context", []):
+        if not s.get("enabled", True):
+            continue
+        co = s.get("co_name")
+        if not co:
+            continue
+        spawn.append({"co_name": co, "factor": float(s.get("factor", 3.0)),
+                      "group": s.get("group", "?")})
+    return entries, bool(data.get("log_unmatched", True)), context, spawn
 
 
 def readiness(syms):
@@ -186,6 +211,7 @@ rpc.exports = {
         imType:     rt(p.instancemethod_type),
         cell:       rt(p.tstate_cell),
         interp_off: p.interp_off, modules_off: p.modules_off,
+        frame_off:  p.frame_off, fcode_off: p.fcode_off, coname_off: p.coname_off,
         tmod: p.tmod, tcls: p.tcls, tmeth: p.tmeth,
         done:false, keep:[],
         // WRAP-AROUND CONTEXT (context-scaling). ctx is null except while a wrapped context
@@ -221,6 +247,23 @@ rpc.exports = {
         var t = ST.cell.readPointer(); if (t.isNull()) return ptr(0);
         var interp = t.add(ST.interp_off).readPointer(); if (interp.isNull()) return ptr(0);
         return interp.add(ST.modules_off).readPointer();
+      };
+      // co_name of the CURRENT Python frame = tstate->frame->f_code->co_name (approach-2 spawn
+      // context). Read from inside the wrap-after start() trampoline, where the current frame is the
+      // CALLER of start() (our native start trampoline pushes no Python frame), i.e. the function
+      // that spawned the interval -- the hashed handleTunnelOut/handleTunnelIn for the tunnel walk.
+      // Pure pointer reads + one PyUnicode_AsUTF8; returns a JS string or null (never leaves an exc).
+      ST.spawnCoName = function(){
+        try {
+          if (!ST.AsUTF8) return null;
+          var t = ST.cell.readPointer(); if (t.isNull()) return null;
+          var fr = t.add(ST.frame_off).readPointer(); if (fr.isNull()) return null;
+          var code = fr.add(ST.fcode_off).readPointer(); if (code.isNull()) return null;
+          var nameObj = code.add(ST.coname_off).readPointer(); if (nameObj.isNull()) return null;
+          var s = null; try { s = ST.AsUTF8(nameObj).readCString(); } catch(e){ s = null; }
+          if (s === null) ST.clearExc();
+          return s;
+        } catch(e){ ST.clearExc(); return null; }
       };
       // CRITICAL: a failed C-API call (esp. PyObject_GetAttrString on a missing attr) leaves a
       // pending Python exception on the tstate; if we detach without clearing it, the game's next
@@ -368,6 +411,31 @@ rpc.exports = {
               } catch(e){} }
               ST.clearExc(); return okc ? 1 : 0;
             }
+            // SPAWN-CONTEXT SCALING (approach 2; takes priority over the name table, after ctx):
+            // read the co_name of the frame that CALLED start() -- for a fire-and-forget/auto-named
+            // interval (the tunnel walk) this is the hashed name of the spawning method
+            // (handleTunnelOut/handleTunnelIn). If it EXACTLY matches a configured spawn_context
+            // entry, scale by that entry's factor regardless of the interval's own (unmatchable)
+            // name. Exact match => ONLY intervals spawned by a named function are touched (a hashed
+            // co_name is unique to its source, so nothing unrelated collides). Read once per start
+            // when spawn entries exist OR logging is on; the read is pure pointer derefs (no getattr,
+            // no exception risk). Every miss clears the tstate (same crash-guard discipline).
+            var spawnList = spec.spawn || [];
+            var coName = (spawnList.length || spec.log) ? ST.spawnCoName() : null;
+            if (spawnList.length && coName !== null){
+              var smatch = null;
+              for (var sp=0; sp<spawnList.length; sp++){ if (spawnList[sp] && spawnList[sp].co_name === coName){ smatch = spawnList[sp]; break; } }
+              if (smatch){
+                var oks = ST.setPlayRate(inst, smatch.factor);
+                if (oks){ try {
+                  ST.scaledNames = ST.scaledNames || {}; var firstSeenS = (ST.scaledNames[nms4] === undefined);
+                  ST.scaledNames[nms4] = (ST.scaledNames[nms4]||0) + 1;
+                  ST.scaledGroups = ST.scaledGroups || {}; ST.scaledGroups[smatch.group] = (ST.scaledGroups[smatch.group]||0) + 1;
+                  if (firstSeenS) send({t:'scaled', name:nms4, factor:smatch.factor, group:smatch.group, co:coName});
+                } catch(e){} }
+                ST.clearExc(); return oks ? 1 : 0;
+              }
+            }
             var entries = spec.entries || [], matched = null;
             for (var mi=0; mi<entries.length; mi++){
               var en = entries[mi]; if (!en || !en.match) continue;
@@ -384,10 +452,20 @@ rpc.exports = {
               } catch(e){} }
               ST.clearExc(); return okm ? 1 : 0;
             }
-            // unmatched: log it once (deduped, capped) so the operator can see what's available.
+            // unmatched: log its NAME once (deduped, capped) so the operator sees what's available,
+            // AND log its spawning co_name once per DISTINCT co_name -- so a single street-tunnel
+            // walk reveals the hashed handleTunnelOut/handleTunnelIn co_names to paste into
+            // spawn_context. (Deduping by co_name, not by interval name, is what makes the tunnel
+            // handler stand out: the ~1240 ambient sequences share a handful of spawner co_names, and
+            // the walk's auto-named interval name changes every counter so name-dedup would never
+            // surface it.)
             if (spec.log){
               ST.seenNames = ST.seenNames || {}; ST.nameCount = ST.nameCount || 0;
               if (ST.seenNames[nms4] === undefined && ST.nameCount < 400){ ST.seenNames[nms4] = 1; ST.nameCount++; try { send({t:'ivalname', name:nms4}); } catch(e){} }
+              if (coName !== null){
+                ST.spawnSeen = ST.spawnSeen || {}; ST.spawnCount = ST.spawnCount || 0;
+                if (ST.spawnSeen[coName] === undefined && ST.spawnCount < 200){ ST.spawnSeen[coName] = 1; ST.spawnCount++; try { send({t:'spawnco', co:coName, sample:nms4}); } catch(e){} }
+              }
             }
             ST.clearExc(); return 0;
           }
@@ -1085,7 +1163,7 @@ def main():
     # clearing both would fall back to the signature scan (META_INTERVAL_SIG).
     if mode == "modset":
         tbl_path = os.environ.get("TTRMOD_MODSET", os.path.join(ROOT, "modset.json"))
-        entries, log_unmatched, context = load_modset(tbl_path)
+        entries, log_unmatched, context, spawn_context = load_modset(tbl_path)
         if not (ovr_mod and ovr_cls):
             MOD1["override"] = {"module": META_INTERVAL_MODULE, "cls": META_INTERVAL_CLASS}
         MOD1["methods"] = list(META_INTERVAL_SIG)   # signature fallback if the override is cleared
@@ -1095,7 +1173,7 @@ def main():
         env_log = os.environ.get("TTRMOD_LOGNAMES", "")
         if env_log != "":
             want_log = env_log in ("1", "true", "yes")
-        MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log}
+        MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log, "spawn": spawn_context}
         # wrap-around CONTEXT targets (resolve owning class by the method signature; wrap wrap-around).
         MOD1["context"] = context
         print("[tramp-live] modset: %d active entries; groups=%s; log_unmatched=%s; table=%s" % (
@@ -1103,6 +1181,9 @@ def main():
         if context:
             print("[tramp-live] modset context: %d wrap-around target(s) -> %s" % (
                 len(context), ", ".join("%s(x%g,%s)" % (c["method"], c["factor"], c["group"]) for c in context)))
+        if spawn_context:
+            print("[tramp-live] modset spawn_context: %d co_name target(s) -> %s" % (
+                len(spawn_context), ", ".join("%s(x%g,%s)" % (s["co_name"], s["factor"], s["group"]) for s in spawn_context)))
 
     pid = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()[0].decode()
     if mode == "findcls":
@@ -1132,12 +1213,16 @@ def main():
                 box.setdefault("names", []).append(pl.get("name"))
                 _ctx = pl.get("ctx")
                 print("[IVALNAME]", pl.get("name"), ("ctx=%s" % _ctx) if _ctx else "")
+            elif pl.get("t") == "spawnco":
+                box.setdefault("spawncos", []).append(pl.get("co"))
+                print("[SPAWNCO]", pl.get("co"), "(e.g. interval %s)" % pl.get("sample"))
             elif pl.get("t") == "scaled":
                 box.setdefault("scaled", []).append(pl.get("name"))
-                _ctx = pl.get("ctx")
+                _ctx = pl.get("ctx"); _co = pl.get("co")
                 print("[SCALED]", pl.get("name"), "x", pl.get("factor"),
                       ("(%s)" % pl.get("group")) if pl.get("group") else "",
-                      ("ctx=%s" % _ctx) if _ctx else "")
+                      ("ctx=%s" % _ctx) if _ctx else "",
+                      ("co=%s" % _co) if _co else "")
             elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
@@ -1149,6 +1234,7 @@ def main():
                     "syms": {k: {"vmaddr": v["vmaddr"], "prologue16": v["prologue16"]} for k, v in syms.items()},
                     "instancemethod_type": INSTANCEMETHOD_TYPE, "tstate_cell": TSTATE_CELL,
                     "interp_off": INTERP_OFF, "modules_off": MODULES_OFF,
+                    "frame_off": FRAME_OFF, "fcode_off": FCODE_OFF, "coname_off": CONAME_OFF,
                     "tmod": T_MODULE, "tcls": T_CLASS, "tmeth": T_METHOD, "methods": methods,
                     "method_groups": method_groups, "substrs": substrs, "list_classes": list_classes,
                     "floatv": {"type": FLOAT_TYPE, "freelist": FLOAT_FREELIST, "numfree": FLOAT_NUMFREE,
@@ -1223,6 +1309,11 @@ def main():
                 print("[tramp-live] UNMATCHED interval names seen (%d):" % len(box["names"]))
                 for nm in box["names"]:
                     print("    -", nm)
+            if box.get("spawncos"):
+                print("[tramp-live] DISTINCT spawning co_names of unmatched intervals (%d) -- "
+                      "paste a tunnel one into modset.json spawn_context:" % len(box["spawncos"]))
+                for co in box["spawncos"]:
+                    print("    co_name:", co)
         except Exception:
             pass
     alive = subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0

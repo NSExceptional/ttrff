@@ -64,8 +64,8 @@ be near a cog battle) to see them speed up. The tool reverts and detaches on its
 | book | Shticker Book open/close | confirmed live |
 | transitions | the screen iris on any zone change | confirmed live |
 | door | building door swing + toon walk in/out | confirmed live |
-| battle | cog-battle faceoff, attack/reward movie, run-in | names captured live; scales on the next in-zone battle |
-| tunnel | the street-tunnel walk | in the table; only fires on your own tunnel entry |
+| battle | cog-battle faceoff, attack/reward movie, run-in | names captured live; scales on the next in-zone battle (cosmetic only — round pacing stays server-gated) |
+| tunnel | the street-tunnel walk (in and out) | scaled by the spawning handler's frame co_name (`spawn_context` in `modset.json`); fires on your own tunnel entry only — one live walk reveals the two hashed handler co_names via `[SPAWNCO]` |
 
 Factors are conservative (teleport ~4×, everything else ~3×) and easy to tune in
 `modset.json`.
