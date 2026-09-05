@@ -56,15 +56,16 @@ PYMALLOC_CTX    = 0x101a7a660       # _PyObject allocator .ctx
 # mod1 -- the FIRST live target: the street tunnel walk, triggerable with pure keyboard movement
 # (walk the toon into/out of any street tunnel; no mouse). From inproc/payload.py's `tunnel` group:
 #   class LocalToon; methods handleTunnelIn/handleTunnelOut; wrap-after; interval attr 'tunnelTrack';
-#   factor 5.0. The vault namespaces game modules (e.g. vlt24ab6c6d.<hash>.LocalToon), so we resolve
-#   the module by exact candidates first, then by scanning sys.modules keys for a '.LocalToon' suffix.
+#   factor 5.0. The vault loads LocalToon under a fully HASHED module name (vlt24ab6c6d.<hash>.<hash>),
+#   so name-based resolution FAILS. mod1 now SELF-DISCOVERS the target class by its method signature
+#   (the shared read-only scan), preferring the class where both methods are defined directly. A
+#   TTRMOD_TMOD/TTRMOD_TCLS pair (both set) forces name-based resolution instead. `methods` is filled
+#   from TTRMOD_METHODS at startup (default handleTunnelIn,handleTunnelOut).
 MOD1 = {
-    "modules": ["LocalToon", "toontown.toon.LocalToon"],
-    "suffix":  ".LocalToon",
-    "cls":     "LocalToon",
-    "methods": ["handleTunnelIn", "handleTunnelOut"],
-    "spec":    {"mode": "attr", "attr": "tunnelTrack"},
-    "factor":  5.0,
+    "methods":  ["handleTunnelIn", "handleTunnelOut"],   # overwritten from TTRMOD_METHODS in main()
+    "spec":     {"mode": "attr", "attr": "tunnelTrack"},
+    "factor":   5.0,
+    "override": None,                                    # {"module":..,"cls":..} if TTRMOD_TMOD+TCLS set
 }
 
 # C-API needed for milestone 1 (pass-through install). vmaddr+prologue pulled from the JSONs.
@@ -153,11 +154,16 @@ rpc.exports = {
         ST.TuplePack = new NativeFunction(F['PyTuple_Pack'], 'pointer', ['long','...','pointer']);
         ST.pack1 = function(o){ return ST.TuplePack(1, o); };
       } else { out.notes.push('no tuple builder'); }
-      // read-only module-listing helpers (present in capi-symbols2)
+      // read-only module-listing / signature-scan helpers (present in capi-symbols2)
       if (F['PyObject_GetIter']) ST.GetIter = new NativeFunction(F['PyObject_GetIter'], 'pointer', ['pointer']);
       if (F['PyIter_Next'])      ST.IterNext = new NativeFunction(F['PyIter_Next'], 'pointer', ['pointer']);
       if (F['PyUnicode_AsUTF8']) ST.AsUTF8   = new NativeFunction(F['PyUnicode_AsUTF8'], 'pointer', ['pointer']);
       if (F['PyObject_GetItem']) ST.GetItem  = new NativeFunction(F['PyObject_GetItem'], 'pointer', ['pointer','pointer']);
+      if (F['PyDict_GetItem'])   ST.DictGetItem = new NativeFunction(F['PyDict_GetItem'], 'pointer', ['pointer','pointer']);
+      ST.methods = p.methods || [];          // requested method-signature for findcls/mod1 self-discovery
+      ST.methodGroups = p.method_groups || []; // findmeth: N exact all-present group scans
+      ST.substrs = p.substrs || [];          // findmeth: method-name substring discovery
+      ST.listClasses = p.list_classes || []; // findmeth: dump these classes' own method names
       ST.tpname = function(o){ try { return o.add(8).readPointer().add(0x18).readPointer().readCString(); } catch(e){ return '?'; } };
       ST.mode = p.mode || 'install';
       // sys.modules = *(*(*cell + interp_off) + modules_off)
@@ -188,6 +194,7 @@ rpc.exports = {
         ST.Malloc = null; ST.mallocCtx = null;
       }
       ST.mod1 = p.mod1 || null;
+      ST.probeAttrs = !!(ST.mod1 && ST.mod1.probe_attrs);   // mod1 first-fire __dict__ diagnostic
       // build a float by hand (STATUS.md recipe): pop the free-list head (relink via +8, numfree--),
       // else pymalloc(24); then ob_refcnt=1 @+0, ob_type=&PyFloat_Type @+8, ob_fval @+0x10.
       ST.makeFloat = function(v){
@@ -270,7 +277,63 @@ rpc.exports = {
           try {
             var inst = ptr(0);
             try { if (args.add(0x10).readS64().toNumber() >= 1) inst = args.add(0x18).readPointer(); } catch(e){}
-            if (!inst.isNull()) ST.applyAfter(inst, spec, factorVal);
+            var _applied = 0;
+            if (!inst.isNull()) _applied = ST.applyAfter(inst, spec, factorVal);   // # intervals setPlayRate'd
+            try { if ((ST.fires||0) <= 3) send({t:'applied', fire:(ST.fires||0), n:_applied, attr:spec.attr, factor:factorVal}); } catch(e){}
+            // OPTIONAL first-fire diagnostic: dump the instance's track-like __dict__ keys so we can
+            // see the REAL interval attr if `spec.attr` was hashed/renamed (read-only; heavily guarded).
+            if (ST.probeAttrs && !inst.isNull() && (ST.fires||0) <= 2){
+              try {
+                var pinfo = { fire:(ST.fires||0) };
+                // (a) instance __dict__ keys that look interval/animation-ish
+                var idict = ST.GetAttrStr(inst, Memory.allocUtf8String('__dict__'));
+                if (!idict.isNull() && ST.GetIter && ST.IterNext && ST.AsUTF8){
+                  var iit = ST.GetIter(idict), ik, hits = [], tot = 0;
+                  while (!(ik = ST.IterNext(iit)).isNull()){ tot++;
+                    var kn = null; try { kn = ST.AsUTF8(ik).readCString(); } catch(e){ kn = null; }
+                    if (kn && /track|tunnel|ival|interval|seq|walk|anim|move|lerp/i.test(kn) && hits.length < 40) hits.push(kn);
+                  }
+                  pinfo.dict_size = tot; pinfo.dict_ival_like = hits;
+                }
+                ST.clearExc();
+                // (b) the TYPE of self.track (None? an Interval/Sequence?)
+                var tk = ST.GetAttrStr(inst, Memory.allocUtf8String('track'));
+                pinfo.track_type = tk.isNull() ? 'ABSENT' : ST.tpname(tk);
+                ST.clearExc();
+                // (b2) scan ALL __dict__ VALUES by TYPE for an Interval/Sequence (finds the walk interval
+                // even under a hashed attr name). Uses getattr per key then tp_name of the value.
+                if (!idict.isNull() && ST.GetIter && ST.IterNext && ST.AsUTF8 && ST.tpname){
+                  var jit = ST.GetIter(idict), jk, ivalAttrs = [];
+                  while (!(jk = ST.IterNext(jit)).isNull()){
+                    var jn = null; try { jn = ST.AsUTF8(jk).readCString(); } catch(e){ jn = null; }
+                    if (!jn) continue;
+                    var jv = ST.GetAttrStr(inst, Memory.allocUtf8String(jn));
+                    if (!jv.isNull()){
+                      var tn = ST.tpname(jv);
+                      if (tn && /Interval|Sequence|Parallel|Ival|Lerp|MopathInterval|CInterval|Track|Func/i.test(tn) && ivalAttrs.length < 30)
+                        ivalAttrs.push({attr:jn, type:tn});
+                    } else { ST.clearExc(); }
+                  }
+                  pinfo.interval_typed_attrs = ivalAttrs;
+                }
+                ST.clearExc();
+                // (c) self.activeIntervals registry -> the live interval NAMES right after the walk starts
+                var ai = ST.GetAttrStr(inst, Memory.allocUtf8String('activeIntervals'));
+                if (!ai.isNull() && ST.GetIter && ST.IterNext && ST.AsUTF8){
+                  var ait = ST.GetIter(ai), ak2, ivn = [], c = 0;
+                  if (!ait.isNull()){
+                    while (!(ak2 = ST.IterNext(ait)).isNull()){ c++;
+                      var an = null; try { an = ST.AsUTF8(ak2).readCString(); } catch(e){ an = null; }
+                      if (an && ivn.length < 40) ivn.push(an);
+                    }
+                  }
+                  pinfo.activeIntervals_count = c; pinfo.activeIntervals = ivn;
+                } else { pinfo.activeIntervals = 'ABSENT'; }
+                ST.clearExc();
+                send({t:'probe', p:pinfo});
+              } catch(e){}
+              ST.clearExc();
+            }
           } catch(e){ ST.clearExc(); }
           ST.clearExc();                                       // nothing of OURS pending on return
           return result;                                       // pass the original result through
@@ -284,6 +347,153 @@ rpc.exports = {
         var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
         ST.keep.push(im); return im;
       };
+
+      // ===================== SHARED with localtest/findcls_test.py (verbatim) =====================
+      // Find a target class by the METHODS it defines (the robust replacement for resolving a
+      // vault-HASHED class by module/name -- LocalToon loads under vlt24ab6c6d.<hash>.<hash>).
+      // classSignature(cls, methods, methCStrs): walk cls's MRO (tp_mro @ +0x158; a tuple, ob_size @
+      // +0x10, items @ +0x18) and record, per requested method, whether it is defined DIRECTLY on cls
+      // (MRO[0]) or INHERITED (and from which base). Membership tested against each base's tp_dict
+      // (@ +0x108) via PyDict_GetItemString (borrowed, clears-on-miss). class __name__ = tp_name @
+      // +0x18. Returns a record, or null on a hard read error.
+      ST.classSignature = function(cls, methods, methCStrs){
+        try {
+          var className = '?'; try { className = cls.add(0x18).readPointer().readCString(); } catch(e){ className = '?'; }
+          var mro = [];
+          try {
+            var mroTup = cls.add(0x158).readPointer();
+            if (!mroTup.isNull()){
+              var n = mroTup.add(0x10).readS64().toNumber();
+              if (n > 0 && n < 512){ for (var i=0;i<n;i++){ mro.push(mroTup.add(0x18 + 8*i).readPointer()); } }
+            }
+          } catch(e){ mro = []; }
+          if (mro.length === 0) mro = [cls];
+          var rec = { class_name: className, clsPtr: cls, methods: {}, match_count: 0,
+                      full: false, all_direct: true, bindings: [] };
+          for (var mi=0; mi<methods.length; mi++){
+            var where = 'absent', baseName = null;
+            for (var bi=0; bi<mro.length; bi++){
+              var B = mro[bi]; if (B.isNull()) continue;
+              var bdict = ptr(0); try { bdict = B.add(0x108).readPointer(); } catch(e){ bdict = ptr(0); }
+              if (bdict.isNull()) continue;
+              var hit = ST.DictGetStr(bdict, methCStrs[mi]);   // borrowed; clears lookup error on miss
+              if (!hit.isNull()){
+                if (bi === 0){ where = 'direct'; }
+                else { where = 'inherited'; try { baseName = B.add(0x18).readPointer().readCString(); } catch(e){ baseName = '?'; } }
+                break;
+              }
+            }
+            rec.methods[methods[mi]] = { where: where, base: baseName };
+            if (where === 'direct'){ rec.match_count++; }
+            else if (where === 'inherited'){ rec.match_count++; rec.all_direct = false; }
+            else { rec.all_direct = false; }
+          }
+          rec.full = (rec.match_count === methods.length);
+          return rec;
+        } catch(e){ return null; }
+      };
+      // scanBySignature(md, methods): iterate sys.modules (md); for each module iterate its __dict__;
+      // for each value that IS a type (PyType_Check: Py_TYPE(v).tp_flags TYPE_SUBCLASS bit == byte @
+      // tp+0xab bit7), compute its signature ONCE (cached by class pointer) and, if ALL methods are
+      // present, record this (module,attr) binding. Returns the list of full-match classes (deduped
+      // by class pointer). Pure reads + borrowed lookups; clears the tstate exception on exit.
+      ST.scanBySignature = function(md, methods){
+        var byCls = {}, order = [];
+        try {
+          if (md.isNull() || !(ST.GetIter && ST.IterNext && ST.AsUTF8 && ST.DictGetStr && ST.DictGetItem && ST.GetAttrStr)){ ST.clearExc(); return []; }
+          var methCStrs = []; for (var mi=0; mi<methods.length; mi++){ methCStrs.push(Memory.allocUtf8String(methods[mi])); }
+          var dictStr = Memory.allocUtf8String('__dict__');
+          var mit = ST.GetIter(md); if (mit.isNull()){ ST.clearExc(); return []; }
+          var mk;
+          while (!(mk = ST.IterNext(mit)).isNull()){
+            var modObj = ST.DictGetItem(md, mk);              // borrowed module object (no re-encode)
+            if (modObj.isNull()){ ST.clearExc(); continue; }
+            var mdict = ST.GetAttrStr(modObj, dictStr);       // module namespace (real dict); getset, no bytecode
+            if (mdict.isNull()){ ST.clearExc(); continue; }
+            var dit = ST.GetIter(mdict); if (dit.isNull()){ ST.clearExc(); continue; }
+            var modName = null, ak;
+            while (!(ak = ST.IterNext(dit)).isNull()){
+              var val = ST.DictGetItem(mdict, ak);            // borrowed value (no re-encode)
+              if (val.isNull()){ ST.clearExc(); continue; }
+              var isType = false;
+              try { isType = (val.add(8).readPointer().add(0xab).readU8() & 0x80) !== 0; } catch(e){ isType = false; }
+              if (!isType) continue;                          // skip ints/functions/modules/C objects/etc.
+              var clsKey = val.toString();
+              var rec = byCls[clsKey];
+              if (rec === undefined){ rec = ST.classSignature(val, methods, methCStrs); byCls[clsKey] = rec; if (rec) order.push(clsKey); }
+              if (rec && rec.full){
+                if (modName === null){ try { modName = ST.AsUTF8(mk).readCString(); } catch(e){ modName = '?'; } }
+                var attr = '?'; try { attr = ST.AsUTF8(ak).readCString(); } catch(e){ attr = '?'; }
+                rec.bindings.push({ module: modName, attr: attr });
+              }
+            }
+          }
+        } catch(e){ /* fall through to clear */ }
+        ST.clearExc();
+        var outl = [];
+        for (var i=0;i<order.length;i++){ var r = byCls[order[i]]; if (r && r.full) outl.push(r); }
+        return outl;
+      };
+      // scanBySubstr(md, substrs): DISCOVERY tool for when the exact method names are hashed away.
+      // Iterate sys.modules -> modules -> __dict__; for each type value (dedup by class ptr), iterate
+      // its OWN tp_dict (MRO[0] @ +0x108) method-name KEYS and record any name containing ANY of the
+      // substrs. Returns classes with >=1 hit: {class_name, clsPtr, hits:[names], own_method_count,
+      // bindings:[{module,attr}]}. Own-dict only (the DEFINING class), so a subclass that merely
+      // inherits the method is not re-reported. Read-only; clears the tstate exc on exit.
+      ST.scanBySubstr = function(md, substrs){
+        var byCls = {}, order = [];
+        try {
+          if (md.isNull() || !(ST.GetIter && ST.IterNext && ST.AsUTF8 && ST.DictGetItem && ST.GetAttrStr)){ ST.clearExc(); return []; }
+          var dictStr = Memory.allocUtf8String('__dict__');
+          var mit = ST.GetIter(md); if (mit.isNull()){ ST.clearExc(); return []; }
+          var mk;
+          while (!(mk = ST.IterNext(mit)).isNull()){
+            var modObj = ST.DictGetItem(md, mk); if (modObj.isNull()){ ST.clearExc(); continue; }
+            var mdict = ST.GetAttrStr(modObj, dictStr); if (mdict.isNull()){ ST.clearExc(); continue; }
+            var dit = ST.GetIter(mdict); if (dit.isNull()){ ST.clearExc(); continue; }
+            var modName = null, ak;
+            while (!(ak = ST.IterNext(dit)).isNull()){
+              var val = ST.DictGetItem(mdict, ak); if (val.isNull()){ ST.clearExc(); continue; }
+              var isType = false;
+              try { isType = (val.add(8).readPointer().add(0xab).readU8() & 0x80) !== 0; } catch(e){ isType = false; }
+              if (!isType) continue;
+              var clsKey = val.toString();
+              var rec = byCls[clsKey];
+              if (rec === undefined){
+                rec = null;
+                try {
+                  var className = '?'; try { className = val.add(0x18).readPointer().readCString(); } catch(e){ className = '?'; }
+                  var owndict = ptr(0); try { owndict = val.add(0x108).readPointer(); } catch(e){ owndict = ptr(0); }
+                  var hits = [], cnt = 0;
+                  if (!owndict.isNull()){
+                    var kit = ST.GetIter(owndict);
+                    if (!kit.isNull()){
+                      var kk;
+                      while (!(kk = ST.IterNext(kit)).isNull()){
+                        cnt++;
+                        var nm = null; try { nm = ST.AsUTF8(kk).readCString(); } catch(e){ nm = null; }
+                        if (nm){ for (var si=0; si<substrs.length; si++){ if (nm.indexOf(substrs[si]) >= 0){ if (hits.indexOf(nm) < 0 && hits.length < 40) hits.push(nm); break; } } }
+                      }
+                    }
+                  }
+                  rec = { class_name: className, clsPtr: val, hits: hits, own_method_count: cnt, bindings: [] };
+                } catch(e){ rec = null; }
+                byCls[clsKey] = rec; if (rec) order.push(clsKey);
+              }
+              if (rec && rec.hits.length){
+                if (modName === null){ try { modName = ST.AsUTF8(mk).readCString(); } catch(e){ modName = '?'; } }
+                var attr = '?'; try { attr = ST.AsUTF8(ak).readCString(); } catch(e){ attr = '?'; }
+                rec.bindings.push({ module: modName, attr: attr });
+              }
+            }
+          }
+        } catch(e){}
+        ST.clearExc();
+        var outl = [];
+        for (var i=0;i<order.length;i++){ var r = byCls[order[i]]; if (r && r.hits.length) outl.push(r); }
+        return outl;
+      };
+      // ================================ end shared block ================================
 
       out.ok = !!ST.pack1; return out;
     } catch(e){ out.notes.push('init ex: '+e); return out; }
@@ -311,6 +521,77 @@ rpc.exports = {
               send({t:'done', r:{ok:true, stage:'listmods', total:total,
                                  wrote:'/tmp/ttrmod-modules.txt', matched_count:matched.length, sample:matched.slice(0,50)}});
             } catch(e){ send({t:'done', r:{ok:false, stage:'list ex', e:String(e)}}); }
+            return;
+          }
+          // read-only DIAGNOSTIC: find the class(es) that define ALL requested methods, by SIGNATURE
+          // (sidesteps the vault-hashed module/class names). Reports module key + bound attr name +
+          // class __name__ + direct-vs-inherited (and base) per method, deduped by class pointer.
+          if (ST.mode === 'findcls') {
+            try {
+              var mdF = ST.sysmodules();
+              if (mdF.isNull()){ send({t:'done', r:{ok:false, stage:'no sys.modules'}}); return; }
+              var methodsF = ST.methods || [];
+              if (!methodsF.length){ ST.fin({ok:false, stage:'no TTRMOD_METHODS given'}); return; }
+              var foundF = ST.scanBySignature(mdF, methodsF);
+              var serF = foundF.map(function(r){
+                return { class_name:r.class_name, cls_ptr:r.clsPtr.toString(), match_count:r.match_count,
+                         all_direct:r.all_direct, methods:r.methods, bindings:r.bindings };
+              });
+              ST.clearExc();
+              try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){}
+              send({t:'done', r:{ok:(serF.length>0), stage:'findcls', methods:methodsF,
+                                 match_count:serF.length, matches:serF}});
+            } catch(e){ send({t:'done', r:{ok:false, stage:'findcls ex', e:String(e)}}); }
+            return;
+          }
+          // read-only DISCOVERY: when exact method names are hashed, (a) run N exact all-present
+          // signature scans (TTRMOD_METHODS, ';'-separated groups) and (b) a method-name SUBSTRING
+          // scan (TTRMOD_SUBSTR) to reveal what the tunnel-ish methods are ACTUALLY called.
+          if (ST.mode === 'findmeth') {
+            try {
+              var mdM = ST.sysmodules();
+              if (mdM.isNull()){ send({t:'done', r:{ok:false, stage:'no sys.modules'}}); return; }
+              var exact = [], groups = ST.methodGroups || [];
+              for (var gi=0; gi<groups.length; gi++){
+                var g = groups[gi];
+                var fnd = ST.scanBySignature(mdM, g);
+                exact.push({ methods:g, count:fnd.length,
+                             sample: fnd.slice(0,12).map(function(r){ return {class_name:r.class_name, all_direct:r.all_direct,
+                                       module:(r.bindings[0]?r.bindings[0].module:'?'), attr:(r.bindings[0]?r.bindings[0].attr:'?'),
+                                       methods:r.methods}; }) });
+              }
+              var substr = [], subs = ST.substrs || [];
+              if (subs.length){
+                var sr = ST.scanBySubstr(mdM, subs);
+                substr = sr.slice(0,80).map(function(r){ return {class_name:r.class_name, hits:r.hits, own_method_count:r.own_method_count,
+                           module:(r.bindings[0]?r.bindings[0].module:'?'), attr:(r.bindings[0]?r.bindings[0].attr:'?')}; });
+              }
+              // optional: dump the OWN (non-dunder) method names of named classes (identify hashed classes)
+              var listcls = [], lc = ST.listClasses || [];
+              for (var li=0; li<lc.length; li++){
+                var lcMod = ST.DictGetStr(mdM, Memory.allocUtf8String(lc[li].module));
+                if (lcMod.isNull()){ ST.clearExc(); listcls.push({module:lc[li].module, cls:lc[li].cls, error:'module not loaded'}); continue; }
+                var lcCls = ST.GetAttrStr(lcMod, Memory.allocUtf8String(lc[li].cls));
+                if (lcCls.isNull()){ ST.clearExc(); listcls.push({module:lc[li].module, cls:lc[li].cls, error:'class not found'}); continue; }
+                var dct = ptr(0); try { dct = lcCls.add(0x108).readPointer(); } catch(e){ dct = ptr(0); }
+                var keys = [];
+                if (!dct.isNull()){
+                  var kit2 = ST.GetIter(dct);
+                  if (!kit2.isNull()){ var kk2;
+                    while (!(kk2 = ST.IterNext(kit2)).isNull()){
+                      var s2 = null; try { s2 = ST.AsUTF8(kk2).readCString(); } catch(e){ s2 = null; }
+                      if (s2 && s2[0] !== '_') keys.push(s2);
+                    }
+                  }
+                }
+                var cn = '?'; try { cn = lcCls.add(0x18).readPointer().readCString(); } catch(e){ cn = '?'; }
+                listcls.push({module:lc[li].module, cls:lc[li].cls, class_name:cn, method_count:keys.length, methods:keys.sort()});
+              }
+              ST.clearExc();
+              try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){}
+              send({t:'done', r:{ok:true, stage:'findmeth', exact:exact,
+                                 substr_query:subs, substr_count:substr.length, substr:substr, listcls:listcls}});
+            } catch(e){ send({t:'done', r:{ok:false, stage:'findmeth ex', e:String(e)}}); }
             return;
           }
           // read-only: list a loaded class's own (non-dunder) attribute names
@@ -391,51 +672,61 @@ rpc.exports = {
             } catch(e){ ST.fin({ok:false, stage:'selftest ex', e:String(e)}); }
             return;
           }
-          // MILESTONE-2 first live target: wrap-after on the street-tunnel walk (LocalToon).
+          // MILESTONE-2 first live target: wrap-after on the street-tunnel walk. The target class
+          // (LocalToon) lives under a fully vault-HASHED module name, so we DO NOT resolve it by
+          // name -- we SELF-DISCOVER it by its method signature (handleTunnelIn+handleTunnelOut) with
+          // the shared read-only scan, then wrap those methods on the discovered class object. A
+          // TTRMOD_TMOD/TTRMOD_TCLS pair forces name-based resolution as a fallback.
           if (ST.mode === 'mod1') {
             try {
               var m = ST.mod1;
               var mods0 = ST.sysmodules();
               if (mods0.isNull()){ ST.fin({ok:false, stage:'no sys.modules'}); return; }
-              // resolve the LocalToon module: exact candidate names first...
-              var modObj = ptr(0), modName0 = null, ci;
-              for (ci = 0; ci < m.modules.length; ci++){
-                var mm0 = ST.DictGetStr(mods0, Memory.allocUtf8String(m.modules[ci]));
-                if (!mm0.isNull()){ modObj = mm0; modName0 = m.modules[ci]; break; }
-              }
-              // ...else scan sys.modules for a key that IS or ENDS WITH '.LocalToon' (vault-hashed).
-              if (modObj.isNull() && ST.GetIter && ST.IterNext && ST.AsUTF8){
-                var it0 = ST.GetIter(mods0), k0;
-                while (!(k0 = ST.IterNext(it0)).isNull()){
-                  var s0 = null; try { s0 = ST.AsUTF8(k0).readCString(); } catch(e){ s0 = null; }
-                  if (s0 && (s0 === m.cls || (s0.length >= m.suffix.length && s0.slice(-m.suffix.length) === m.suffix))){
-                    var cand = ST.DictGetStr(mods0, Memory.allocUtf8String(s0));
-                    if (!cand.isNull()){ modObj = cand; modName0 = s0; break; }
-                  }
+              var targets = [];   // [{clsPtr, module, attr, class_name, all_direct, via}]
+              if (m.override && m.override.module && m.override.cls){
+                // fallback: sys.modules[override.module].<override.cls>
+                var mmO = ST.DictGetStr(mods0, Memory.allocUtf8String(m.override.module));
+                if (mmO.isNull()){ ST.fin({ok:false, stage:'override module not loaded: '+m.override.module}); return; }
+                var ccO = ST.GetAttrStr(mmO, Memory.allocUtf8String(m.override.cls));
+                if (ccO.isNull()){ ST.fin({ok:false, stage:'no class '+m.override.cls+' in '+m.override.module}); return; }
+                targets.push({clsPtr:ccO, module:m.override.module, attr:m.override.cls, class_name:m.override.cls, all_direct:null, via:'override'});
+              } else {
+                // SELF-DISCOVER by method signature (sidesteps the vault-hashed name).
+                var found = ST.scanBySignature(mods0, m.methods);
+                // prefer classes where ALL methods are DIRECT (the defining class -> clean revert via
+                // setattr); fall back to any full match if none are all-direct.
+                var direct = found.filter(function(r){ return r.all_direct; });
+                var chosen = direct.length ? direct : found;
+                for (var ci = 0; ci < chosen.length; ci++){
+                  var r = chosen[ci];
+                  targets.push({clsPtr:r.clsPtr, module:(r.bindings[0]?r.bindings[0].module:'?'),
+                                attr:(r.bindings[0]?r.bindings[0].attr:'?'), class_name:r.class_name,
+                                all_direct:r.all_direct, via:'signature'});
                 }
-                ST.clearExc();
               }
-              if (modObj.isNull()){ ST.fin({ok:false, stage:'LocalToon module not loaded (walk in-world first)'}); return; }
-              var cls0 = ST.GetAttrStr(modObj, Memory.allocUtf8String(m.cls));
-              if (cls0.isNull()){ ST.fin({ok:false, stage:'no class '+m.cls+' in '+modName0}); return; }
-              ST.keep.push(cls0);
+              if (!targets.length){ ST.fin({ok:false, stage:'no class matched signature '+m.methods.join('+')+' (walk in-world first?)'}); return; }
               ST.installed = [];
-              var wired = [], anyOk = false, mi;
-              for (mi = 0; mi < m.methods.length; mi++){
-                var meth0 = m.methods[mi];
-                var mn0 = Memory.allocUtf8String(meth0);
-                var orig0 = ST.GetAttrStr(cls0, mn0);
-                if (orig0.isNull()){ ST.clearExc(); wired.push({method:meth0, ok:false, reason:'method absent'}); continue; }
-                ST.keep.push(orig0); ST.keep.push(mn0);
-                var im0 = ST.makeWrapAfter(orig0, m.spec, m.factor);
-                if (im0.isNull()){ wired.push({method:meth0, ok:false, reason:'wrap build NULL'}); continue; }
-                var rc0 = ST.SetAttrStr(cls0, mn0, im0);
-                ST.installed.push({cls:cls0, mn:mn0, orig:orig0});
-                if (rc0 === 0) anyOk = true;
-                wired.push({method:meth0, ok:(rc0===0), setattr_rc:rc0});
+              var wired = [], anyOk = false, ti, mi;
+              for (ti = 0; ti < targets.length; ti++){
+                var cls0 = targets[ti].clsPtr; ST.keep.push(cls0);
+                for (mi = 0; mi < m.methods.length; mi++){
+                  var meth0 = m.methods[mi];
+                  var mn0 = Memory.allocUtf8String(meth0);
+                  var orig0 = ST.GetAttrStr(cls0, mn0);
+                  if (orig0.isNull()){ ST.clearExc(); wired.push({cls:targets[ti].class_name, method:meth0, ok:false, reason:'method absent'}); continue; }
+                  ST.keep.push(orig0); ST.keep.push(mn0);
+                  var im0 = ST.makeWrapAfter(orig0, m.spec, m.factor);
+                  if (im0.isNull()){ wired.push({cls:targets[ti].class_name, method:meth0, ok:false, reason:'wrap build NULL'}); continue; }
+                  var rc0 = ST.SetAttrStr(cls0, mn0, im0);
+                  ST.installed.push({cls:cls0, mn:mn0, orig:orig0});
+                  if (rc0 === 0) anyOk = true;
+                  wired.push({cls:targets[ti].class_name, method:meth0, ok:(rc0===0), setattr_rc:rc0});
+                }
               }
-              ST.fin({ok:anyOk, stage:'mod1_installed', module:modName0,
-                      target: m.cls+'.'+m.methods.join('/'), attr: m.spec.attr, factor: m.factor,
+              ST.fin({ok:anyOk, stage:'mod1_installed',
+                      resolved_by: (m.override && m.override.module ? 'override' : 'signature-scan'),
+                      targets: targets.map(function(t){ return {module:t.module, attr:t.attr, class_name:t.class_name, all_direct:t.all_direct}; }),
+                      methods: m.methods, attr: m.spec.attr, factor: m.factor,
                       wired: wired,
                       note:'wrap-after live; walk into a street tunnel to see it fire + speed the walk'});
             } catch(e){ ST.fin({ok:false, stage:'mod1 ex', e:String(e)}); }
@@ -537,8 +828,37 @@ def main():
     ent = off[next(k for k in off if k not in ("_comment",))]
     hook_va = ent["addrs"]["eval_frame_default"]
 
+    # method signature for findcls / mod1 self-discovery (default = the tunnel pair). TTRMOD_METHODS
+    # is a flat comma list for findcls/mod1; for findmeth it may hold ';'-separated groups. TTRMOD_SUBSTR
+    # (comma list) drives findmeth's method-name substring discovery.
+    raw_methods = os.environ.get("TTRMOD_METHODS", "handleTunnelIn,handleTunnelOut")
+    methods = [s.strip() for s in raw_methods.replace(";", ",").split(",") if s.strip()]
+    method_groups = [[s.strip() for s in grp.split(",") if s.strip()] for grp in raw_methods.split(";") if grp.strip()]
+    substrs = [s.strip() for s in os.environ.get("TTRMOD_SUBSTR", "").split(",") if s.strip()]
+    list_classes = []
+    for pair in os.environ.get("TTRMOD_LISTCLS", "").split(","):
+        pair = pair.strip()
+        if "::" in pair:
+            mm, cc = pair.split("::", 1); list_classes.append({"module": mm.strip(), "cls": cc.strip()})
+    MOD1["methods"] = methods
+    ovr_mod = os.environ.get("TTRMOD_TMOD"); ovr_cls = os.environ.get("TTRMOD_TCLS")
+    MOD1["override"] = ({"module": ovr_mod, "cls": ovr_cls} if (ovr_mod and ovr_cls) else None)
+    MOD1["probe_attrs"] = os.environ.get("TTRMOD_PROBE_ATTRS", "") in ("1", "true", "yes")
+    if os.environ.get("TTRMOD_ATTR"):
+        MOD1["spec"] = {"mode": "attr", "attr": os.environ["TTRMOD_ATTR"]}   # override the interval attr
+
+    mode = os.environ.get("TTRMOD_MODE", "install")
     pid = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()[0].decode()
-    print("[tramp-live] attaching pid=%s target=%s.%s.%s" % (pid, T_MODULE, T_CLASS, T_METHOD))
+    if mode == "findcls":
+        print("[tramp-live] attaching pid=%s mode=findcls methods=%s" % (pid, "+".join(methods)))
+    elif mode == "findmeth":
+        print("[tramp-live] attaching pid=%s mode=findmeth groups=%s substr=%s" % (
+            pid, " | ".join("+".join(g) for g in method_groups), ",".join(substrs) or "(none)"))
+    elif mode == "mod1":
+        print("[tramp-live] attaching pid=%s mode=mod1 discover-by=%s methods=%s" % (
+            pid, ("override %s.%s" % (ovr_mod, ovr_cls)) if MOD1["override"] else "signature", "+".join(methods)))
+    else:
+        print("[tramp-live] attaching pid=%s target=%s.%s.%s" % (pid, T_MODULE, T_CLASS, T_METHOD))
     session = frida.attach(int(pid))
     import threading
     done = threading.Event(); rev = threading.Event(); box = {}
@@ -548,6 +868,8 @@ def main():
             if pl.get("t") == "done": box["r"] = pl.get("r"); done.set()
             elif pl.get("t") == "stage": print("[stage]", json.dumps(pl))
             elif pl.get("t") == "fired": print("[FIRED]", json.dumps(pl))
+            elif pl.get("t") == "probe": print("[PROBE]", json.dumps(pl))
+            elif pl.get("t") == "applied": print("[APPLIED]", json.dumps(pl))
             elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
@@ -555,12 +877,12 @@ def main():
     sc = session.create_script(AGENT); sc.on("message", on_msg); sc.load()
     ex = sc.exports_sync
     # stash hook addr into ST via init, then set ST.hook (agent reads it in rpcHook)
-    mode = os.environ.get("TTRMOD_MODE", "install")
     init = ex.init({"image_base": hex(IMAGE_BASE), "hook_va": hook_va, "mode": mode,
                     "syms": {k: {"vmaddr": v["vmaddr"], "prologue16": v["prologue16"]} for k, v in syms.items()},
                     "instancemethod_type": INSTANCEMETHOD_TYPE, "tstate_cell": TSTATE_CELL,
                     "interp_off": INTERP_OFF, "modules_off": MODULES_OFF,
-                    "tmod": T_MODULE, "tcls": T_CLASS, "tmeth": T_METHOD,
+                    "tmod": T_MODULE, "tcls": T_CLASS, "tmeth": T_METHOD, "methods": methods,
+                    "method_groups": method_groups, "substrs": substrs, "list_classes": list_classes,
                     "floatv": {"type": FLOAT_TYPE, "freelist": FLOAT_FREELIST, "numfree": FLOAT_NUMFREE,
                                "malloc_fn": PYMALLOC_FN, "malloc_ctx": PYMALLOC_CTX},
                     "mod1": MOD1})
@@ -573,21 +895,22 @@ def main():
     if box.get("detached"):
         print("[tramp-live] !! DETACHED (%s) -- game crashed during install" % box["detached"]); return
     print("[tramp-live] result:", json.dumps(box.get("r"), indent=2))
-    if mode in ("list", "listcls", "selftest"):
-        session.detach(); return   # listing/selftest handled everything in-hook (selftest also reverted)
+    if mode in ("list", "listcls", "selftest", "findcls", "findmeth"):
+        session.detach(); return   # read-only/selftest handled everything in-hook (selftest also reverted)
     if not box.get("r", {}).get("ok"):
         session.detach(); return
     # trampoline is live; poll fire count while the user triggers the target in-game.
     import time
     if mode == "mod1":
-        target_label = "%s.%s" % (MOD1["cls"], "/".join(MOD1["methods"]))
+        target_label = "/".join(MOD1["methods"])
         trigger_hint = "WALK the toon into (or out of) any street tunnel — no mouse needed"
     else:
         target_label = T_METHOD
         trigger_hint = "trigger '%s' in-game (e.g. walk through a door for a screen wipe)" % T_METHOD
-    print("[tramp-live] %s. Polling 30s..." % trigger_hint)
+    poll_s = float(os.environ.get("TTRMOD_POLL", "30"))
+    print("[tramp-live] %s. Polling %gs..." % (trigger_hint, poll_s))
     t = time.time(); last = 0
-    while time.time() - t < 30 and not box.get("detached"):
+    while time.time() - t < poll_s and not box.get("detached"):
         time.sleep(2.0)
         try: f = ex.fires()
         except Exception: break

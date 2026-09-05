@@ -1,0 +1,177 @@
+{
+  "_meta": {
+    "engine": "TTREngine.arm64 (Toontown Rewritten), embedded CPython 3.8.17, hardened + whole-program LTO, fully symbol-stripped",
+    "image_base": "0x100000000",
+    "file_offset_rule": "fileoff = vmaddr - 0x100000000 (verified)",
+    "reference": "stock CPython 3.8.14 arm64 dylib WITH symbols (/opt/homebrew/Cellar/python@3.8/3.8.14/.../Python)",
+    "method": "structural + string/type-xref match of stripped engine funcs vs the symbol-ful stock reference; identities cross-checked with IDA (re) decompilation. Every 'found' entry is confirmed by full-body structure (slot offsets, error strings, source-line immediates, and/or being called by an already-verified caller).",
+    "verify_field": "prologue16 = the function's first 16 bytes (4 arm64 instrs) as raw little-endian bytes, space-separated hex, for a runtime memcmp guard at the vmaddr. Shared frame-setup bytes across funcs are expected and harmless (the guard checks bytes AT the known vmaddr; it does not search by them).",
+    "prior_pass_correction": "The prior pass's 'PyUnicode_AsUTF8 @ 0x100a07a38' is actually PyUnicode_AsUTF8AndSize (2-arg: str,size*). The thin PyUnicode_AsUTF8 wrapper is 0x100a14074 ('mov x1,#0; b 0x100a07a38'). AsUTF8(s) == AsUTF8AndSize(s, NULL).",
+
+    "type_objects": {
+      "PyTuple_Type": "0x101aa7b30",
+      "PyFloat_Type": "0x101aae5c8 (flags byte @ 0x101aae671)",
+      "PyUnicode_Type": "0x101aa77c0 (NEW this pass, from PyDict_GetItem's unicode-key fast path)",
+      "PyLong_Type": "0x101aade08 (NEW, from _PyFloat_Init building sys.float_info ints)",
+      "PyComplex_Type": "0x101a858b8 (NEW)",
+      "PyCFunction_Type": "0x101a940b0 (prior)",
+      "PyInstanceMethod_Type": "0x101a79c20 (prior)"
+    },
+    "typeobject_slot_offsets_confirmed": {
+      "tp_flags_byte": "+0xab (DICT_SUBCLASS=bit5=0x20, LIST_SUBCLASS=bit1, TUPLE_SUBCLASS=bit2, UNICODE_SUBCLASS=bit4, LONG_SUBCLASS=bit0)",
+      "tp_as_sequence": "+0x68 (sq_item @ +0x18)",
+      "tp_as_mapping": "+0x70 (mp_subscript @ +0x8)",
+      "tp_hash": "+0x78",
+      "tp_iter": "+0xd8",
+      "tp_iternext": "+0xe0",
+      "tp_as_number.nb_float": "tp_as_number(+0x60) -> +0x90"
+    },
+    "object_layouts": {
+      "PyTupleObject": "ob_size @ +0x10, ob_item[] @ +0x18",
+      "PyFloatObject": "ob_refcnt @ +0x0, ob_type @ +0x8, ob_fval(double) @ +0x10 (basicsize 0x18)",
+      "PyDictObject": "ob_type @ +0x8, ma_used @ +0x10, ma_version_tag @ +0x18, ma_keys @ +0x20, ma_values @ +0x28; PyUnicode cached-hash @ key+0x18"
+    },
+    "supporting_helpers": {
+      "PyDict_GetItem": "0x10098da6c (the getter under GetItemString; borrowed ref, no exception on miss)",
+      "PyNumber_Float": "0x10096e65c (new float ref from any number; increfs if already exact float)",
+      "PyComplex_FromDoubles": "0x10097f6ac",
+      "_Py_HashDouble": "0x100a1d6e8",
+      "PyUnicode_FromStringAndSize/unicode_decode_utf8(char*,len,...)": "0x1009ee48c (prior pass called this 'DecodeUTF8'; decodes char*+len -> str)",
+      "_PyErr_Format": "0x100a47b10 (prior)",
+      "err_format_helper (inline BadInternalCall target: fmt+file+line -> raise)": "0x100a46704",
+      "PyErr_SetString-like (obj_exc, const char*)": "0x100a46b2c",
+      "PyErr_ExceptionMatches-like": "0x100a46bf4",
+      "raise-with-tstate (_PyErr_SetObject-ish)": "0x100a461d4",
+      "gc_new_allocator (_PyObject_GC_New/NewVar family)": "0x10095d6f8 (prior; PyTuple_New's large-alloc path calls it)",
+      "pymalloc allocator": "call ((void*(*)(void*,size_t)) *(void**)0x101a7a668)(*(void**)0x101a7a660, size)",
+      "float_free_list": "head @ 0x101be9588, count(int32) @ 0x101be9590 (PyFloat_MAXFREELIST=100)",
+      "tuple_free_list": "size-indexed array base @ 0x101bec788, count array base @ 0x101bec738",
+      "sys.modules": "*(*(*(void**)0x101c0acd8 + 0x10) + 0x38)  (tstate cell -> interp+0x10 -> modules+0x38; re-confirmed in importlib helper sub_100019250)"
+    }
+  },
+
+  "PyDict_GetItemString": {
+    "found": "yes",
+    "vmaddr": "0x10098e890",
+    "prologue16": "f4 4f be a9 fd 7b 01 a9 fd 43 00 91 f3 03 01 aa",
+    "confidence": "high",
+    "tier": 1,
+    "evidence": "sub_10098E890(PyObject *dict, const char *key). strlen(key); if <0 -> BadInternalCall(\"input too long\"); else make temp unicode key via sub_1009EE48C(key,len,0,0,0) (UTF8 decode), call PyDict_GetItem(dict,key)=sub_10098DA6C, Py_DECREF(temp key), return the borrowed value. Fail path INLINES PyErr_Clear (zeroes tstate->curexc_type/value/traceback @ +0x58/+0x60/+0x68 with XDECREF). Matches stock 0x46338 exactly. CROSS-VERIFIED: the engine's own importlib helper sub_100019250 calls this as sub_10098E890(sys.modules, \"_frozen_importlib\").",
+    "semantics": "Returns a BORROWED reference into the dict; returns NULL if absent; swallows/clears any lookup error. Exactly the semantics needed for sys.modules[name]. Signature: (PyObject* dict, const char* utf8_name)."
+  },
+
+  "PyDict_GetItem": {
+    "found": "yes",
+    "vmaddr": "0x10098da6c",
+    "prologue16": null,
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "sub_10098DA6C(PyObject *dict, PyObject *key). The borrowed-ref getter under PyDict_GetItemString (which cross-references it: 'call PyDict_GetItem(dict,key)=sub_10098DA6C'). Returns a BORROWED reference; NULL if absent; swallows/clears any lookup error (never raises). Used by the read-only findcls/mod1 signature scan to fetch a dict value by key OBJECT without re-encoding the key (keeps the main-thread freeze budget low). NOTE: prologue16 verify intentionally omitted (address is RE-cross-referenced via GetItemString's tail call, not independently prologue-fingerprinted); the guarded symbols still gate the run and refuse a changed binary.",
+    "semantics": "(PyObject* dict, PyObject* key) -> borrowed value or NULL, no exception on miss."
+  },
+
+  "PyTuple_New": {
+    "found": "yes",
+    "vmaddr": "0x1009d6e68",
+    "prologue16": "ff 03 01 d1 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
+    "confidence": "high",
+    "tier": 1,
+    "evidence": "sub_10096D6E68... i.e. sub_1009D6E68(Py_ssize_t size). tbnz x0,#0x3f -> BadInternalCall with source line 0x55(=85, stock PyTuple_New line) + tupleobject.c; size==0 empty-tuple singleton at free_list[0]; cmp x20,#0x13 free-list cutoff; free_list array @ 0x101bec788, count array @ 0x101bec738; large path: overflow const 'mov x8,#-0x5; movk x8,#0xfff,lsl#48', reads PyTuple_Type basicsize/itemsize @ 0x101aa7b50, bl gc alloc 0x10095d6f8, sets ob_type=&PyTuple_Type(0x101aa7b30) + ob_size @ +0x10, bzeroes items @ +0x18. Textbook match to stock 0x5e4f0. ~450 out-of-line callers.",
+    "usage": "PyTuple_New(n) then fill with PyTuple_SetItem, or write items directly at tuple+0x18+8*i (with your own INCREF) since the slots start NULL."
+  },
+
+  "PyTuple_SetItem": {
+    "found": "yes",
+    "vmaddr": "0x1009d7a38",
+    "prologue16": "ff 83 00 d1 fd 7b 01 a9 fd 43 00 91 08 04 40 f9",
+    "confidence": "high",
+    "tier": 1,
+    "evidence": "sub_1009D7A38(PyObject *op, Py_ssize_t i, PyObject *newitem). ldrb tp_flags@+0xab, tbz bit2 (exact-tuple) -> err; refcount==1 check (ldr [op]; cmp #1); index sign + bounds vs ob_size@+0x10; old=item@(op+0x18+8*i), store newitem there, Py_XDECREF(old) (tail-calls tp_dealloc). err: Py_XDECREF(newitem)+BadInternalCall line 0xa9(=169, stock SetItem line); err2: 'tuple assignment index out of range'. Matches stock 0x5e6e8. NOTE: steals a reference to newitem (standard PyTuple_SetItem contract).",
+    "note": "Only valid on a freshly-created tuple with refcount==1 (as PyTuple_New returns). Steals newitem's ref."
+  },
+
+  "PyTuple_GetItem": {
+    "found": "yes",
+    "vmaddr": "0x1009d79b0",
+    "prologue16": "ff 83 00 d1 fd 7b 01 a9 fd 43 00 91 08 04 40 f9",
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "sub_1009D79B0(PyObject *op, Py_ssize_t i). tbz tp_flags@+0xab bit2 -> BadInternalCall line 0x99(=153); index sign + bounds vs ob_size@+0x10; returns item @ op+0x18+8*i (BORROWED); out-of-range -> PyErr_SetString(IndexError,'tuple index out of range'). Matches stock 0x5e680. Sits immediately after PyTuple_Size and before PyTuple_SetItem in the tupleobject.c cluster."
+  },
+
+  "PyTuple_Size": {
+    "found": "yes",
+    "vmaddr": "0x1009d7954",
+    "prologue16": "ff 83 00 d1 fd 7b 01 a9 fd 43 00 91 08 04 40 f9",
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "sub_1009D7954(PyObject *op). tbnz tp_flags@+0xab bit2 -> return ob_size@+0x10; else BadInternalCall line 0x8e(=142) + return -1. Matches stock 0x5e648."
+  },
+
+  "PyObject_GetItem": {
+    "found": "yes",
+    "vmaddr": "0x10096c1dc",
+    "prologue16": "ff 43 01 d1 f6 57 02 a9 f4 4f 03 a9 fd 7b 04 a9",
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "sub_10096C1DC(PyObject *o, PyObject *key). Stack canary (___stack_chk_guard @ 0x101934000); NULL args -> 'null argument to internal routine'; tp_as_mapping@+0x70 -> mp_subscript@+0x8, tail-call; else tp_as_sequence@+0x68 path (PyNumber_AsSsize_t on int key). Returns a NEW ref; raises KeyError/TypeError on failure. Matches stock 0x8110.",
+    "note": "Alternative dict indexer: PyObject_GetItem(sys.modules, unicode_name) works via dict mp_subscript, but returns a NEW ref and raises KeyError if absent (clear via inlined PyErr_Clear). Prefer PyDict_GetItemString for the borrowed-ref/NULL semantics."
+  },
+
+  "PyObject_GetIter": {
+    "found": "yes",
+    "vmaddr": "0x10096ef98",
+    "prologue16": "ff c3 00 d1 f4 4f 01 a9 fd 7b 02 a9 fd 83 00 91",
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "sub_10096EF98(PyObject *o). Loads tp_iter@+0xd8; if present calls it and verifies the result's tp_iternext@+0xe0 is set and != _PyObject_NextNotImplemented(0x1009c65a0), else 'iter() returned non-iterator of type '%.100s''; if no tp_iter, tries tp_as_sequence sq_item -> builds a seqiterobject (type PySeqIter_Type @ 0x101a7a100, alloc via 0x10095d6f8), else the '%.200s object is not iterable' error. Uses _PyErr_Format 0x100a47b10. Matches stock 0xb188."
+  },
+
+  "PyIter_Next": {
+    "found": "yes",
+    "vmaddr": "0x10096f104",
+    "prologue16": "f6 57 bd a9 f4 4f 01 a9 fd 7b 02 a9 fd 83 00 91",
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "sub_10096F104(PyObject *iter). Calls tp_iternext@+0xe0; if it returns non-NULL, return it (NEW ref); if NULL, PyErr_Occurred (inline: tstate cell 0x101c0acd8, curexc_type@+0x58); if StopIteration (matched via 0x100a46bf4 against 0x101a6dd48) then PyErr_Clear + return NULL. Matches stock 0xb268."
+  },
+
+  "PyUnicode_AsUTF8": {
+    "found": "yes",
+    "vmaddr": "0x100a14074",
+    "prologue16": "01 00 80 d2 70 ce ff 17",
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "The thin wrapper: 'mov x1,#0; b 0x100a07a38' -> PyUnicode_AsUTF8AndSize(str, NULL). Only 8 bytes (2 instrs); preceded by a ret. Returns the cached/encoded UTF-8 char* (internal buffer, do not free).",
+    "also": "PyUnicode_AsUTF8AndSize = 0x100a07a38 (prologue 'f6 57 bd a9 f4 4f 01 a9 fd 7b 02 a9 fd 83 00 91'; the prior pass mislabeled THIS as AsUTF8). Call AsUTF8AndSize(str, NULL) for the same result if you prefer the 2-arg form."
+  },
+
+  "PyFloat_FromDouble": {
+    "found": "no",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "INLINED at every call site (verified in marshal r_object sub_100A76E4C, _PyFloat_Init sub_100994E7C, float_add/float___float__ sub_100996018, etc.) - LTO dead-stripped the standalone. It stores the double bits as an integer store (v[2]=bits), which is why the standalone resisted 'str d' scans. PyFloat is a non-GC 24-byte object with a dedicated free-list.",
+    "recipe": "PyObject* make_float(double v): op=*(void**)0x101be9588; if(op){ *(void**)0x101be9588=*(void**)(op+8); (*(int32*)0x101be9590)--; } else { op=((void*(*)(void*,size_t))*(void**)0x101a7a668)(*(void**)0x101a7a660,24); if(!op) return 0; } *(void**)(op+8)=(void*)0x101aae5c8 /*&PyFloat_Type*/; *(intptr_t*)op=1 /*refcnt*/; *(double*)(op+0x10)=v; return op;  // (skip the flags&2 type-refcount and the 0x101c0a51c tracemalloc hook - they are debug paths, off in production)",
+    "fallback": "For passing a float to setPlayRate(double), the recipe above is the cleanest. PyFloat_Type is present at 0x101aae5c8; PyNumber_Float (0x10096e65c) can normalize an existing number to a new float if you already hold a Python number."
+  },
+
+  "PyFloat_AsDouble": {
+    "found": "no",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "high",
+    "tier": 2,
+    "evidence": "INLINED (the PyFloat_AS_DOUBLE fast path is used directly throughout: bare 'ldr d,[obj,#0x10]' after a Py_TYPE==&PyFloat_Type check). No standalone out-of-line copy survives.",
+    "equivalent": "double as_double(PyObject* op): if (*(void**)(op+8)==(void*)0x101aae5c8) return *(double*)(op+0x10); else { PyObject* f=((PyObject*(*)(PyObject*))0x10096e65c)(op) /*PyNumber_Float*/; if(!f) return -1.0; double d=*(double*)(f+0x10); /*Py_DECREF(f)*/ return d; }"
+  },
+
+  "PyTuple_Pack": {
+    "found": "not_pinned_this_pass",
+    "vmaddr": null,
+    "confidence": "n/a",
+    "tier": 1,
+    "evidence": "Not needed: PyTuple_New (0x1009d6e68) + PyTuple_SetItem (0x1009d7a38) already cover building the 1-tuple. PyTuple_Pack survives out-of-line as a small va_list caller of PyTuple_New (it is among PyTuple_New's ~450 callers in the tupleobject.c cluster ~0x1009d74xx) if a single-primitive variant is ever wanted; left unpinned since SetItem is confirmed."
+  }
+}

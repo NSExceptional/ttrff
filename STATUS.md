@@ -39,15 +39,26 @@ trampoline on a real game method → the game's own call runs OUR native `Native
 wrapper calls the original → game survives → clean revert. Zero injected bytecode, so all three
 anti-injection layers are bypassed. Details below.
 
-**Milestone-2 step 1 IN PROGRESS (2026-09-05) — the real `setPlayRate` machinery, offline-validated.**
-The two primitives the mods need are built and PASS on stock 3.8: (a) the **manual PyFloat builder**
-and (b) the **generic wrap-after trampoline** (native port of `payload.py`'s
-`_make_wrap_after`/`_apply_after`, all three discovery modes, with the exception-clear discipline).
-(c) The **first live target is wired** into `frida/trampoline_inject.py` behind `TTRMOD_MODE=mod1`:
-the street-tunnel walk (`LocalToon.handleTunnelIn`/`handleTunnelOut`, interval attr `tunnelTrack`,
-factor 5.0) — chosen because it is triggerable with **pure keyboard movement** (walk into a tunnel),
-no menus/clicks. Ready to run but **NOT yet run live** (awaiting one careful session). See
-"What's PROVEN" and "Next steps".
+**Milestone-2 step 1 DONE + LIVE-PROVEN (2026-09-05) — self-discovering wrap-after, incl. class
+resolution by method signature.** The two primitives PASS on stock 3.8: (a) the **manual PyFloat
+builder** and (b) the **generic wrap-after trampoline** (native port of `payload.py`'s
+`_make_wrap_after`/`_apply_after`, with the exception-clear discipline). (c) The vault loads the
+target classes under **fully HASHED module names**, so resolving them by name FAILS. Fixed by a
+read-only **"find class by METHOD SIGNATURE" scan** (`ST.scanBySignature`/`classSignature`, shared
+verbatim between `frida/trampoline_inject.py` and `localtest/findcls_test.py`, offline PASS) plus a
+method-name **substring discovery** scan (`ST.scanBySubstr`) for when method names are hashed too.
+New read-only modes: `TTRMOD_MODE=findcls` (classes defining ALL of `TTRMOD_METHODS`) and `findmeth`
+(N exact group scans via `;`-separated `TTRMOD_METHODS` + a `TTRMOD_SUBSTR` method-name sweep +
+`TTRMOD_LISTCLS` class dumps). **mod1 now self-discovers its class by signature** (env override
+`TTRMOD_TMOD`/`TTRMOD_TCLS`; interval attr override `TTRMOD_ATTR`; first-fire `__dict__` probe via
+`TTRMOD_PROBE_ATTRS=1`).
+
+**Live result (2026-09-05, ~5 careful runs, ZERO crashes, every run reverted rc:0, game always
+alive):** mod1 self-discovery + wrap-after is PROVEN end-to-end — but the tunnel TARGET in
+`payload.py`/old notes is WRONG for TTR (it was copied from open-toontown). See "The tunnel target,
+re-derived live" below. Net: `fires=1` on the real self-discovered method (`LocalToon.tunnelOut`),
+clean revert, no crash — but `setPlayRate` never lands because the walk interval is NOT stored on the
+toon instance. The speedup itself is **still blocked** pending a different hook for the walk interval.
 
 ---
 
@@ -272,12 +283,12 @@ dead-stripped — no source→code path exists in the binary (see Dead ends).
    implemented as native C-API and PASS on stock 3.8 (`localtest/pyfloat_test.py`,
    `localtest/wrapafter_test.py`). (c) the first live target is wired as `TTRMOD_MODE=mod1`
    (`LocalToon.handleTunnelIn`/`Out`, attr `tunnelTrack`, ×5.0). See "What's PROVEN".
-1. **RUN mod1 LIVE (next):** walk into a street tunnel; watch `fires` climb and the walk speed up;
-   confirm clean revert + game alive. **Before the run**, sanity-check the target names with the
-   read-only modes — `TTRMOD_MODE=list` (find the vault-hashed `…LocalToon` module) and
-   `TTRMOD_MODE=listcls TTRMOD_TMOD=<that> TTRMOD_TCLS=LocalToon` (confirm `handleTunnelIn`/`Out`
-   are NOT hashed away). If a method name is hashed, mod1 installs nothing (clean no-op, no crash);
-   if `tunnelTrack` is hashed, the wrapper cleanly skips (no speedup, no crash).
+1. **mod1 LIVE — DONE (self-discovery + fire proven; speedup still blocked).** The signature scan +
+   wrap-after fire on the real `LocalToon.tunnelOut` (`fires=1`, clean revert, no crash). The walk
+   interval is NOT on `self` (see "The tunnel target, re-derived live"), so the tunnel speedup needs
+   a **different interval hook** (Panda `CInterval::set_play_rate` / `Sequence` ctor scaling during
+   the walk window, or the concrete Place builder method) — that is now the next real task for this
+   group. The class-resolution problem is fully solved (signature scan).
 2. **Then the remaining `setPlayRate` groups** from `inproc/payload.py`, each as a native wrap-after
    trampoline (the machinery is generic and validated): battle/faceoff/runin/teleport/book, plus the
    `transitions` (divide-`t`) scaler which is a **separate** native op (no interval discovery) still
@@ -408,9 +419,12 @@ NOT dispatch).
 - **`PyTypeObject`:** `tp_name` +0x18, `tp_getattr` +0x40, `tp_setattr` +0x48, `tp_as_number` +0x60
   (`nb_float` +0x90), `tp_as_sequence` +0x68 (`sq_item` +0x18), `tp_as_mapping` +0x70 (`mp_subscript`
   +0x8), `tp_hash` +0x78, `tp_call` +0x80, `tp_getattro` +0x90, `tp_setattro` +0x98, `tp_flags`
-  +0xa8 (HAVE_VECTORCALL = byte @ +0xa9 bit3), subclass-flags byte @ **+0xab** (DICT bit5=0x20, LIST
-  bit1, TUPLE bit2, UNICODE bit4, LONG bit0), `tp_iter` +0xd8, `tp_iternext` +0xe0, `tp_descr_get`
-  +0x110, `tp_new` +0x138.
+  +0xa8 (HAVE_VECTORCALL = byte @ +0xa9 bit3), subclass-flags byte @ **+0xab** (**TYPE_SUBCLASS
+  bit7=0x80** — the `PyType_Check` test used by the signature scan; DICT bit5=0x20, LIST bit1, TUPLE
+  bit2, UNICODE bit4, LONG bit0), `tp_iter` +0xd8, `tp_iternext` +0xe0, **`tp_dict` +0x108**,
+  `tp_descr_get` +0x110, `tp_new` +0x138, **`tp_mro` +0x158** (a tuple; ob_size +0x10, items +0x18).
+  All confirmed on stock 3.8 in `localtest/findcls_test.py` and live in the engine (findcls/findmeth
+  scans returned correct classes). Layout is 3.8-ABI-stable, identical stock-vs-engine.
 - **`PyTupleObject`:** `ob_size` +0x10, `ob_item[]` +0x18 (+24).
 - **`PyLongObject`:** `ob_size` +0x10, `ob_digit` +0x18/+24 (30-bit digits).
 - **`PyFloatObject`:** `ob_fval`(double) +0x10 (basicsize 0x18).
@@ -442,6 +456,53 @@ NOT dispatch).
   `Emote.isEnabled`, `Avatar.loop` were bad-target picks, not mechanism failures.)
 - **Lazy modules:** battle/transition modules aren't loaded until first battle/transition → need the
   `sys.modules` poll to bind their patches when they appear.
+- **Resolve classes by SIGNATURE, not name (the general fix).** Vault modules AND many class/method
+  names are hashed (`vlt…`), so name lookups fail. The signature scan (findcls) is the robust
+  primitive for ALL 7 mod groups: give it the readable methods a target class defines and it returns
+  the (hashed) class object to wrap. When the methods themselves are hashed, the substring sweep
+  (findmeth `TTRMOD_SUBSTR`) reveals the readable ones on the target class, and `findmeth
+  TTRMOD_LISTCLS=<mod>::<cls>` dumps a hashed class's own method names to identify it.
+
+### The tunnel target, re-derived live (2026-09-05) — the old target was WRONG
+
+The `tunnel` group in `inproc/payload.py` (and the old mod1 wiring) assumed open-toontown names:
+`LocalToon.handleTunnelIn`/`handleTunnelOut`, interval attr `tunnelTrack`. **None of that exists in
+TTR.** Discovered empirically with findcls/findmeth (all read-only, in-world Toontown Central):
+
+- **`handleTunnelIn`/`handleTunnelOut` DO NOT EXIST** — exact signature scans returned 0 (both, and
+  each alone). A `TTRMOD_SUBSTR="unnel"` sweep found the REAL tunnel machinery instead.
+- **LocalToon = hashed** module **`vlt24ab6c6d.vlt7892fa9a.vlt725d40df`**, class **`vlt725d40df`**
+  (identified via a `findmeth TTRMOD_LISTCLS` dump: readable methods incl. `isLocal`,
+  `enableAvatarControls`/`disableAvatarControls`, `neverDisable`, `setName`, `getZoneId`, plus a
+  readable **`tunnelOut`**; ~179 own methods, the rest hashed `vlt…` incl. `tunnelIn`).
+- **The tunnel walk = `LocalToon.tunnelOut`** (readable; `tunnelIn` is hashed away). It's a
+  NORMAL-dispatch method (not FSM enter/exit) → wrapping the class attr fires. **`tunnelOut` alone
+  is a unique signature** (exact scan count 1) → mod1 self-discovers LocalToon with
+  `TTRMOD_METHODS="tunnelOut"`.
+- **The Place FSM = hashed** module **`vlt24ab6c6d.hood.vlta74f0161`**, class **`vlta74f0161`** — the
+  base Place with `enterWalk`/`enterDoorIn`/`enterTeleportIn`/`enterTunnelIn`/`enterTunnelOut`/
+  `exitTunnelIn`/`exitTunnelOut` etc. These are ClassicFSM **capture-bound** enter/exit handlers →
+  **bad wrap targets** (wrapping the class attr misses; the FSM captured the bound method at build).
+- **LIVE PROOF (`TTRMOD_MODE=mod1 TTRMOD_METHODS="tunnelOut"`):** self-discovery resolved
+  `vlt725d40df` by signature (`all_direct:true`), wrapped `tunnelOut` (`setattr_rc:0`); walking
+  Mr. Beanwhip through a Punchline Place tunnel fired the wrapper (`fires=1`), the walk-through
+  played, game survived, clean revert (`rc:0`). The native-trampoline + self-discovery route is fully
+  proven on a real, self-found, hashed target.
+- **BUT the speedup does NOT land — the walk interval is not on the toon.** The first-fire `__dict__`
+  probe (right after `tunnelOut` returns) shows: `self.track` is **`NoneType`**; there is **no**
+  `tunnelTrack`; **no** `activeIntervals` attr at all; and a scan of all 620 instance attrs by VALUE
+  TYPE finds **no** `Interval`/`Sequence`/`Parallel`/`Lerp` (only two `CollisionHandlerPusher`s). So
+  `tunnelOut`'s walk is a **fire-and-forget interval** (started without being stored on `self`, or
+  built async / on the Place), which the wrap-after-then-`getattr(self, attr)` pattern cannot reach.
+  `_apply_after` returned 0 (clean no-op) every run — hence no crash, but no speed change.
+- **Exact NEXT STEP to actually speed the tunnel walk:** don't look on `self`. Options, in order:
+  (1) hook Panda **`CInterval::set_play_rate`** / the `Sequence`/`Interval` **constructor** natively
+  (Panda C++ symbols are far less stripped) and scale any interval created during the walk window;
+  (2) wrap the Place's tunnel path instead (but its FSM enter/exit are capture-bound — would need to
+  target the concrete builder method it calls, discoverable by another substring sweep like
+  `"tunnel"`/`"walk"` on `vlta74f0161`); (3) if the interval is stored under a hashed attr set a
+  frame or two later, poll `self.__dict__` for a newly-appearing `Interval`-typed value instead of a
+  fixed attr. Whichever wins, the class resolution is already solved by the signature scan.
 
 ---
 
@@ -449,7 +510,7 @@ NOT dispatch).
 
 | path | role |
 |---|---|
-| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`mod1`** (milestone-2 first live mod: wrap-after `setPlayRate` on the street tunnel). Env: `TTRMOD_TMOD` / `TTRMOD_TCLS` / `TTRMOD_TMETH`. Carries the manual-PyFloat builder + generic wrap-after (attr/iname_attr/iname_sub) helpers. |
+| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup). Env: `TTRMOD_METHODS` (signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_ATTR` (interval attr), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL` (poll secs). Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub), and the shared read-only signature/substring scans. |
 | `frida/inject.py` | legacy eval path (marshal.loads + `PyCode_NewWithPosOnlyArgs` + `PyEval_EvalCode`); diagnostic modes `--hello` (+`TTRMOD_HELLOSRC`), `TTRMOD_NOEVAL`, `TTRMOD_TESTOBJ`+`TTRMOD_TESTSRC`, `TTRMOD_LOADONLY`. `Process.setExceptionHandler`→`/tmp/ttrmod-crash.json`; hang → thread `sample()`→`/tmp/ttrmod-sample.json`; self-exits (no 120s hangs). |
 | `frida/ftest.py` | proven bare-attach sanity check |
 | `frida/diag.py` | attach diagnostics |
@@ -463,6 +524,7 @@ NOT dispatch).
 | `localtest/trampoline_test.py` | **offline PROOF of the trampoline route** (PASS) |
 | `localtest/pyfloat_test.py` | **offline PROOF of the manual PyFloat builder** (milestone-2a, PASS) — free-list + pymalloc branches, round-trip via `ob_fval`/`PyFloat_AsDouble`/arithmetic/function-call; free-list addrs discovered by disassembling `PyFloat_FromDouble` |
 | `localtest/wrapafter_test.py` | **offline PROOF of the wrap-after trampoline** (milestone-2b, PASS) — orig-once + pass-through + `setPlayRate(factor)` + `iname_sub` selectivity + clean-miss-with-exception-cleared, against mocks |
+| `localtest/findcls_test.py` | **offline PROOF of the signature/substring class scan** (PASS) — registers a real target class under a hashed-looking `sys.modules` key + decoys (one-method / none), inheritance/mixed cases, attr!=`__name__`, and a junk module (ints/funcs/str/bytes/module/list); asserts the scan finds EXACTLY the all-methods classes with correct direct-vs-inherited attribution, no false-positives, junk-safe; widen surfaces single-method decoys; substring scan (own-dict) matches by method-name substring; and the mod1 self-discover→wrap path (HIT setPlayRate(5.0) + MISS clean-tstate). Carries the scan helpers **verbatim** from `trampoline_inject.py`. |
 | `localtest/abortleak_test.py` | offline A/B proving the exception-clear discipline |
 | `lldb/attach.py` | dead lldb path (kept for reference; do not use) |
 | `driver.py` | lldb-era host driver (legacy) |
