@@ -1,0 +1,156 @@
+# tt-lib — shared helpers for the TTR window-driver scripts (source this).
+#
+# Drives the LIVE Toontown Rewritten macOS client purely through `winctl`
+# (out-of-process capture + input, no injection). Provides: process/window
+# resolution, screenshotting, pixel probes (via ImageMagick `magick`), OCR (via
+# `tesseract`), and the launcher GO-press. All other tt-* scripts source this so
+# window/pid parsing lives in exactly one place.
+#
+# Deps: winctl, magick (ImageMagick), tesseract, jq, awk, pgrep. All present on
+# this box. No Python needed.
+#
+# Vocabulary:
+#   - "launcher"  = /Applications/Toontown Launcher.app (proc "Toontown Launcher")
+#   - "engine"    = TTREngine (the Panda3D render process; child of the launcher)
+#   Both report app name "Toontown Rewritten" to the window server, so we key off
+#   the COMMAND (TTREngine vs Toontown Launcher), never the app column.
+
+# ---- constants -------------------------------------------------------------
+TT_LAUNCHER_APP="/Applications/Toontown Launcher.app"
+TT_ENGINE_PAT="MacOS/TTREngine"                 # pgrep -f pattern: the engine
+TT_LAUNCHER_PAT="Toontown Launcher.app/Contents/MacOS/Toontown Launcher"
+TT_RENDER_TITLE="Toontown Rewritten"            # the real render window's title
+TT_LAUNCHER_TITLE="Toontown Launcher"           # the launcher window's title
+TT_ENGINE_BID="com.toontownrewritten.engine"    # engine bundle id (for `open -b`)
+TT_LAUNCHER_BID="com.toontownrewritten.Toontown-Launcher"
+TT_ENGINE_PROC="TTREngine"                      # process name (System Events)
+TT_LAUNCHER_PROC="Toontown Launcher"
+
+# scratch dir for OCR intermediates, cleaned on exit
+TT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/ttdrv.XXXXXX")"
+trap 'rm -rf "$TT_TMP"' EXIT
+
+tt_log() { printf '[tt] %s\n' "$*" >&2; }
+
+# ---- process resolution ----------------------------------------------------
+# Echo space-separated pids (may be empty).
+tt_engine_pids()   { pgrep -f "$TT_ENGINE_PAT"   2>/dev/null | tr '\n' ' '; }
+tt_launcher_pids() { pgrep -f "$TT_LAUNCHER_PAT" 2>/dev/null | tr '\n' ' '; }
+
+# ---- window resolution -----------------------------------------------------
+# One JSON snapshot of every window; callers filter it with jq.
+tt_winlist() { winctl list --all --json 2>/dev/null; }
+_tt_arr() { jq 'if type=="array" then . else (.windows // .) end'; }   # normalize shape
+
+# Echo the render window id (title == "Toontown Rewritten", real size), else "".
+# The render surface is uniquely title=="Toontown Rewritten" with w>=400,h>=300;
+# the junk siblings are 1280x33 / 0x0 and the launcher window has a different title.
+tt_game_win() {
+    tt_winlist | _tt_arr | jq -r --arg t "$TT_RENDER_TITLE" '
+        map(select(.title==$t and .w>=400 and .h>=300))
+        | (.[0].windowId // empty)'
+}
+
+# Echo the launcher window id (title == "Toontown Launcher"), else "".
+tt_launcher_win() {
+    tt_winlist | _tt_arr | jq -r --arg t "$TT_LAUNCHER_TITLE" '
+        map(select(.title==$t and .w>=400 and .h>=300))
+        | (.[0].windowId // empty)'
+}
+
+# Echo "w h" (window points) of a window id.
+tt_win_geom() {
+    tt_winlist | _tt_arr | jq -r --argjson id "$1" '
+        map(select(.windowId==$id)) | (.[0] | "\(.w) \(.h)") // empty'
+}
+
+# ---- capture ---------------------------------------------------------------
+# tt_shot <winid> <out.png> -> writes png, echoes nonblack fraction (0..1).
+tt_shot() {
+    winctl shot "win:$1" "$2" --json 2>/dev/null \
+        | jq -r '.nonblack // 0' 2>/dev/null
+}
+
+# ---- pixel probe -----------------------------------------------------------
+# tt_px <img> <xfrac> <yfrac> [patch] [imgW] [imgH] -> "R G B" (0-255, patch mean)
+# Fractions are 0..1 of the image, so this is retina/size independent.
+tt_px() {
+    local img="$1" xf="$2" yf="$3" patch="${4:-24}" W="${5:-}" H="${6:-}"
+    if [ -z "$W" ]; then read -r W H < <(magick identify -format '%w %h\n' "$img"); fi
+    local x y
+    x=$(awk -v f="$xf" -v W="$W" -v p="$patch" 'BEGIN{v=int(f*W-p/2); if(v>W-p)v=W-p; if(v<0)v=0; print v}')
+    y=$(awk -v f="$yf" -v H="$H" -v p="$patch" 'BEGIN{v=int(f*H-p/2); if(v>H-p)v=H-p; if(v<0)v=0; print v}')
+    magick "$img" -crop "${patch}x${patch}+${x}+${y}" +repage -resize 1x1! \
+        -format '%[fx:int(255*u.r+0.5)] %[fx:int(255*u.g+0.5)] %[fx:int(255*u.b+0.5)]' info:
+}
+
+# tt_maxsat <img> <cropgeom WxH+X+Y> -> peak saturation (0..1) in the region.
+# The muted 3D world floor is low-sat; the saturated laff-meter / book HUD spikes it.
+tt_maxsat() {
+    magick "$1" -crop "$2" +repage -colorspace HSB -channel G -separate +channel \
+        -format '%[fx:maxima]' info:
+}
+
+# tt_near <R G B> <r> <g> <b> [tol] -> exit 0 if the probed color is within tol of target
+tt_near() {
+    awk -v R="$1" -v G="$2" -v B="$3" -v r="$4" -v g="$5" -v b="$6" -v t="${7:-38}" \
+        'BEGIN{exit !( (R-r)^2+(G-g)^2+(B-b)^2 <= 3*t*t )}'
+}
+
+# ---- OCR -------------------------------------------------------------------
+# tt_ocr <img> [xf yf wf hf] -> lowercased single-line text of the (sub)region
+tt_ocr() {
+    local img="$1" reg=""
+    if [ -n "${2:-}" ]; then
+        local W H; read -r W H < <(magick identify -format '%w %h\n' "$img")
+        local x y w h
+        x=$(awk -v f="$2" -v W="$W" 'BEGIN{print int(f*W)}')
+        y=$(awk -v f="$3" -v H="$H" 'BEGIN{print int(f*H)}')
+        w=$(awk -v f="$4" -v W="$W" 'BEGIN{print int(f*W)}')
+        h=$(awk -v f="$5" -v H="$H" 'BEGIN{print int(f*H)}')
+        reg="-crop ${w}x${h}+${x}+${y} +repage"
+    fi
+    magick "$img" $reg -colorspace Gray -resize 200% "$TT_TMP/ocr.png" 2>/dev/null
+    tesseract "$TT_TMP/ocr.png" - 2>/dev/null | tr 'A-Z' 'a-z' | tr -s ' \t\n' ' '
+}
+
+# ---- input helpers ---------------------------------------------------------
+# Bring an app to the front so its Panda3D DirectButtons will accept clicks.
+# `open -b <bundleid>` is the reliable raiser (LaunchServices); the System Events
+# name form is a fallback. NOTE: neither works while the screen is password-locked
+# — loginwindow holds the front and WindowServer drops synthetic input entirely.
+# ($1 = bundle id, $2 = process name)
+tt_activate() {
+    open -b "$1" >/dev/null 2>&1 && return 0
+    osascript -e "tell application \"System Events\" to set frontmost of process \"$2\" to true" >/dev/null 2>&1
+}
+tt_activate_game()     { tt_activate "$TT_ENGINE_BID"   "$TT_ENGINE_PROC"; }
+tt_activate_launcher() { tt_activate "$TT_LAUNCHER_BID" "$TT_LAUNCHER_PROC"; }
+
+# Click a window-local fraction (xf,yf) of the game window (image px / 2 == points).
+# tt_click_frac <winid> <xf> <yf>
+tt_click_frac() {
+    local win="$1" xf="$2" yf="$3" W H x y
+    read -r W H < <(tt_win_geom "$win")
+    [ -n "$W" ] || return 1
+    x=$(awk -v f="$xf" -v W="$W" 'BEGIN{print int(f*W)}')
+    y=$(awk -v f="$yf" -v H="$H" 'BEGIN{print int(f*H)}')
+    winctl click "win:$win" "$x" "$y" >/dev/null 2>&1
+}
+
+# Press the launcher's red GO button. Try the known AX id, then any AXButton,
+# then a geometry click at its usual spot. Best-effort; caller polls for the engine.
+tt_press_go() {
+    local lw="$1"
+    winctl click "win:$lw" --id _NS:222 --press >/dev/null 2>&1 && return 0
+    local bid
+    bid=$(winctl describe "win:$lw" --actionable --json 2>/dev/null | _tt_arr \
+          | jq -r 'map(select(.role=="AXButton" and ((.label//"")|ascii_downcase|test("go|play|log")))) | (.[0].id // empty)' 2>/dev/null)
+    [ -n "$bid" ] && winctl click "win:$lw" --id "$bid" --press >/dev/null 2>&1 && return 0
+    # geometry fallback: the GO button sits at ~0.86 x, ~0.56 y of the launcher window
+    tt_activate_launcher; sleep 0.3
+    tt_click_frac "$lw" 0.86 0.56
+}
+
+# Launch the launcher app fresh (cold start from `dead`).
+tt_open_launcher() { open -a "$TT_LAUNCHER_APP" >/dev/null 2>&1; }

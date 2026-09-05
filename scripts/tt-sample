@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# tt-sample — burst-capture timestamped screenshots of the game render window,
+# for measuring animation/transition durations frame-by-frame.
+#   tt-sample <interval_ms> <count> <outdir>
+# Frames are named frame_<elapsed_ms>.png where elapsed is REAL ms since the
+# first capture (winctl shot itself costs time, so nominal != real).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tt-lib
+source "$HERE/tt-lib"
+
+interval_ms="${1:?usage: tt-sample <interval_ms> <count> <outdir>}"
+count="${2:?usage: tt-sample <interval_ms> <count> <outdir>}"
+outdir="${3:?usage: tt-sample <interval_ms> <count> <outdir>}"
+
+gw="$(tt_game_win)"
+[ -n "$gw" ] || { tt_log "no game render window — is the engine running?"; exit 1; }
+mkdir -p "$outdir"
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
+start="$(now_ms)"
+sleep_s="$(awk -v ms="$interval_ms" 'BEGIN{printf "%.3f", ms/1000.0}')"
+
+tt_log "sampling $count frames every ${interval_ms}ms from win:$gw -> $outdir"
+for i in $(seq 1 "$count"); do
+    el=$(( $(now_ms) - start ))
+    f=$(printf '%s/frame_%07d.png' "$outdir" "$el")
+    winctl shot "win:$gw" "$f" >/dev/null 2>&1 || tt_log "frame $i capture failed"
+    [ "$i" -lt "$count" ] && sleep "$sleep_s"
+done
+tt_log "wrote $count frames to $outdir (span $(( $(now_ms) - start ))ms)"

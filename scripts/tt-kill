@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# tt-kill — cleanly stop the TTR game ENGINE (TTREngine): SIGTERM, then SIGKILL
+# if it lingers. Leaves the launcher app running by default.
+#   tt-kill          kill the engine only
+#   tt-kill --all    also kill the launcher (full shutdown)
+# Engine vs launcher are told apart by COMMAND (both share the app name).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tt-lib
+source "$HERE/tt-lib"
+
+ALL=0; [ "${1:-}" = "--all" ] && ALL=1
+
+_kill_set() {   # <label> <pids...>
+    local label="$1"; shift
+    [ "$#" -gt 0 ] || { tt_log "$label: none running"; return 0; }
+    tt_log "$label: SIGTERM $*"
+    kill -TERM "$@" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        local alive=""; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive+=" $p"; done
+        [ -z "$alive" ] && { tt_log "$label: stopped"; return 0; }
+        sleep 0.5
+    done
+    tt_log "$label: still up, SIGKILL"
+    kill -KILL "$@" 2>/dev/null || true
+    sleep 0.5
+}
+
+# shellcheck disable=SC2046
+_kill_set engine $(tt_engine_pids)
+if [ "$ALL" = 1 ]; then
+    # shellcheck disable=SC2046
+    _kill_set launcher $(tt_launcher_pids)
+fi
+tt_log "done (engine pids now: '$(tt_engine_pids)')"

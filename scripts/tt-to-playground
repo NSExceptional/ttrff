@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# tt-to-playground — from WHEREVER the client is, drive it into the playground.
+# Reads tt-state each tick and resumes from the right step:
+#   dead        -> open the launcher app
+#   launcher    -> press GO, wait for the engine
+#   title       -> tap RETURN ("press any key")
+#   connecting  -> just wait
+#   toonselect  -> pick Mr. Beanwhip (bottom-right slot) + PLAY THIS TOON
+#   disconnected-> dismiss the modal (RETURN / click OK), then re-navigate
+#   sleep       -> tap a key to wake
+#   playground  -> done (a wake tap first, so we end AWAKE + idle)
+# Timed polling, not fixed long sleeps. Exit 0 once state==playground.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tt-lib
+source "$HERE/tt-lib"
+
+# ---- calibration (window-local fractions) ----------------------------------
+TOON_SLOT_X=0.77 ; TOON_SLOT_Y=0.70     # Mr. Beanwhip: bottom-right yellow slot (verified)
+PLAY_BTN_X=0.77  ; PLAY_BTN_Y=0.70      # same slot (single click enters; 2nd click is insurance)
+OK_X=0.50        ; OK_Y=0.64            # modal OK button (centered dialog)
+
+OVERALL_TIMEOUT="${TT_TIMEOUT:-260}"    # seconds, whole journey
+st() { "$HERE/tt-state"; }
+
+pick_toon() {
+    local gw="$1"
+    tt_log "toonselect: selecting Mr. Beanwhip + PLAY THIS TOON"
+    tt_activate_game; sleep 0.4
+    tt_click_frac "$gw" "$TOON_SLOT_X" "$TOON_SLOT_Y"   # select slot
+    sleep 1.0
+    tt_activate_game
+    tt_click_frac "$gw" "$PLAY_BTN_X" "$PLAY_BTN_Y"     # PLAY THIS TOON overlay
+}
+
+dismiss_modal() {
+    local gw="$1"
+    tt_log "disconnected: dismissing modal"
+    winctl key "win:$gw" return >/dev/null 2>&1 || true   # dialog default button
+    sleep 0.8
+    if [ "$(st)" = disconnected ]; then                   # still up: click OK
+        tt_activate_game; sleep 0.3
+        tt_click_frac "$gw" "$OK_X" "$OK_Y"
+        sleep 0.8
+    fi
+}
+
+start=$(date +%s)
+last=""; same=0
+while :; do
+    now=$(date +%s)
+    if [ $(( now - start )) -ge "$OVERALL_TIMEOUT" ]; then
+        tt_log "TIMEOUT after ${OVERALL_TIMEOUT}s (last state: $last)"; exit 1
+    fi
+    s="$(st || echo unknown)"
+    if [ "$s" = "$last" ]; then same=$(( same + 1 )); else same=0; last="$s"; fi
+    # `connecting` is a legit wait (cold loads are slow) — don't let it trip the
+    # stall guard; the overall timeout still bounds it.
+    [ "$s" = connecting ] && same=0
+    tt_log "state=$s (${same} repeats, $(( now - start ))s)"
+    gw="$(tt_game_win)"
+
+    case "$s" in
+        playground)
+            # Confirm it's STABLE before declaring success: a fading toonselect/title
+            # can flash saturated corners that momentarily look like the HUD. Re-read
+            # ~1.3s later; a real playground is still playground, a transient isn't.
+            sleep 1.3
+            if [ "$(st)" != playground ]; then tt_log "playground was transient; re-evaluating"; continue; fi
+            [ -n "$gw" ] && winctl key "win:$gw" up >/dev/null 2>&1 || true   # wake tap
+            sleep 0.6
+            tt_log "PLAYGROUND reached (stable)."; exit 0 ;;
+        sleep)
+            [ -n "$gw" ] && winctl key "win:$gw" up >/dev/null 2>&1 || true
+            sleep 1 ;;
+        disconnected)
+            [ -n "$gw" ] && dismiss_modal "$gw"; sleep 1 ;;
+        toonselect)
+            [ -n "$gw" ] && pick_toon "$gw"
+            # give the world time to load
+            for _ in $(seq 1 20); do sleep 1; [ "$(st)" != toonselect ] && break; done ;;
+        title)
+            [ -n "$gw" ] && winctl key "win:$gw" return >/dev/null 2>&1 || true
+            sleep 1.5 ;;
+        connecting)
+            sleep 2 ;;
+        launcher)
+            lw="$(tt_launcher_win)"
+            if [ -n "$lw" ]; then
+                tt_log "launcher: pressing GO"
+                tt_press_go "$lw"
+                # wait (up to 90s) for the engine to take over before touching GO again
+                for _ in $(seq 1 45); do
+                    sleep 2
+                    ns="$(st)"
+                    [ "$ns" != launcher ] && { tt_log "engine took over: $ns"; break; }
+                done
+            else
+                tt_log "launcher proc up but no window yet"; sleep 2
+            fi ;;
+        dead)
+            tt_log "dead: launching the launcher app"
+            tt_open_launcher
+            for _ in $(seq 1 30); do sleep 1; [ "$(st)" != dead ] && break; done ;;
+        *)
+            tt_log "unknown state '$s'"; sleep 2 ;;
+    esac
+
+    # stall guard: something is stuck non-productively
+    if [ "$same" -ge 30 ]; then
+        tt_log "STALL: '$s' x$same — giving up (caller may tt-kill and retry)"; exit 2
+    fi
+done

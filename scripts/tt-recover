@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# tt-recover — overnight crash/hang recovery: get back into the playground,
+# preferring the SOFTEST fix.
+#   * sleep / disconnected / toonselect / title / connecting / launcher
+#       -> tt-to-playground handles it with no kill (wake, dismiss, re-nav).
+#   * if that stalls/fails, OR the engine is hung -> tt-kill (engine only) then
+#     tt-to-playground for a clean relaunch.
+#   * dead -> straight to tt-to-playground (it opens the launcher).
+# End condition: state==playground.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tt-lib
+source "$HERE/tt-lib"
+
+s="$("$HERE/tt-state")"
+tt_log "recover: starting from state=$s"
+
+if [ "$s" = playground ]; then
+    tt_log "already in playground; nudging awake"
+    gw="$(tt_game_win)"; [ -n "$gw" ] && winctl key "win:$gw" up >/dev/null 2>&1 || true
+    exit 0
+fi
+
+# 1) soft attempt (no kill) — tt-to-playground resumes from wherever we are.
+if "$HERE/tt-to-playground"; then
+    tt_log "recovered softly (no kill)"; exit 0
+fi
+
+# 2) hard attempt — the engine hung or the soft path stalled. Kill engine, relaunch.
+tt_log "soft recovery failed; killing engine and retrying"
+"$HERE/tt-kill"
+sleep 1
+if "$HERE/tt-to-playground"; then
+    tt_log "recovered after engine kill"; exit 0
+fi
+
+# 3) last resort — full shutdown (launcher too) and cold start.
+tt_log "still stuck; full shutdown + cold start"
+"$HERE/tt-kill" --all
+sleep 2
+exec "$HERE/tt-to-playground"

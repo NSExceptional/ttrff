@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# tt-state — classify the live TTR client's current screen as ONE token:
+#   launcher | title | connecting | toonselect | playground | sleep
+#   | disconnected | dead
+#
+# Signals (cheap -> strong):
+#   * window/pid topology: is the engine render window present? the launcher?
+#   * `winctl shot --json` nonblack fraction (free with the capture)
+#   * a few ImageMagick pixel probes (retina-independent, by image fraction)
+#   * one tesseract OCR pass of the render surface (the decisive signal for the
+#     text screens: PRESS ANY KEY / CONNECTING / PICK A TOON / went-to-bed)
+# "Rough but reliable" by design. Prints the token to stdout; -v adds reasoning
+# on stderr.  Exit 0 always (token is on stdout).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tt-lib
+source "$HERE/tt-lib"
+
+VERBOSE=0; [ "${1:-}" = "-v" ] && VERBOSE=1
+dbg() { [ "$VERBOSE" = 1 ] && tt_log "$*" || true; }
+
+emit() { echo "$1"; exit 0; }
+# Never exit empty: on any UNEXPECTED failure, fall back to a safe, non-destructive
+# token (callers just keep waiting; the overall timeout still bounds them).
+# `if`/`&&`/`||`/`!` conditions don't trigger this, so normal grep-miss is fine.
+trap 'tt_log "tt-state: internal error, falling back to connecting"; echo connecting; exit 0' ERR
+
+gw="$(tt_game_win)"
+
+# --- no render window: launcher / dead / (engine still mapping its window) ---
+if [ -z "$gw" ]; then
+    if [ -n "$(tt_engine_pids)" ]; then dbg "engine proc up, no window yet"; emit connecting; fi
+    if [ -n "$(tt_launcher_win)" ] || [ -n "$(tt_launcher_pids)" ]; then emit launcher; fi
+    emit dead
+fi
+
+# --- render window present: capture + probe ---------------------------------
+img="$TT_TMP/state.png"
+nonblack="$(tt_shot "$gw" "$img")"
+read -r W H < <(magick identify -format '%w %h\n' "$img")
+dbg "game win=$gw img=${W}x${H} nonblack=$nonblack"
+
+txt="$(tt_ocr "$img")"
+dbg "ocr='$txt'"
+
+# center probe: the went-to-bed / disconnect dialog is a pale-yellow panel
+center="$(tt_px "$img" 0.50 0.52 44 "$W" "$H")"
+dbg "center=$center"
+
+# 1) blocking modal (went to bed / disconnected / login problem) -> disconnected
+if echo "$txt" | grep -Eq 'went to bed|got sleepy|sleepy and|disconnect|connection.*(lost|interrupt)|lost.*connection|too many|already logged|different (place|computer)|unexpected|couldn.?t|could not|unable to|logged out|periodic|maintenance'; then
+    emit disconnected
+fi
+# pale-yellow dialog body + an OK/yes button word = a modal even if text was noisy
+if tt_near $center 205 205 155 34 && echo "$txt" | grep -Eq '\bok\b|okay|yes|no\b|cancel|nevermind|make a|try again'; then
+    emit disconnected
+fi
+
+# 2) toon picker
+if echo "$txt" | grep -Eq 'pick a toon|choose a toon|play this toon|toon to play|create a toon|make a toon'; then
+    emit toonselect
+fi
+
+# 3) title / press any key
+if echo "$txt" | grep -Eq 'press any key|any key to|to enter|toontown rewritten .*(enter|key)'; then
+    emit title
+fi
+
+# 4) connecting / loading transitions
+if echo "$txt" | grep -Eq 'connecting|retrieving|establish|received|entering|please wait|loading|logging in|creating|heading'; then
+    emit connecting
+fi
+
+# 5) in-world HUD? The laff meter (bottom-left) and book button (bottom-right) are
+# saturated blue against the muted 3D floor; peak corner saturation detects them.
+# (Reached only after OCR ruled out toonselect/title/connecting, which are also
+# colorful — so a saturated in-world frame here means playground/sleep.)
+cw=$(awk -v W="$W" 'BEGIN{print int(W*0.11)}')
+ch=$(awk -v H="$H" 'BEGIN{print int(H*0.15)}')
+by=$(awk -v H="$H" -v ch="$ch" 'BEGIN{print H-ch}')
+rx=$(awk -v W="$W" -v cw="$cw" 'BEGIN{print W-cw}')
+blsat="$(tt_maxsat "$img" "${cw}x${ch}+0+${by}")"
+brsat="$(tt_maxsat "$img" "${cw}x${ch}+${rx}+${by}")"
+dbg "corner sat: bottomL=$blsat bottomR=$brsat"
+if awk -v a="$blsat" -v b="$brsat" 'BEGIN{exit !(a>0.5 || b>0.5)}'; then
+    # HUD present. sleep (ZZZ) is best-effort: floating Zs above the centered toon.
+    zt="$(tt_ocr "$img" 0.35 0.12 0.30 0.30)"
+    dbg "sleep-probe ocr='$zt'"
+    if echo "$zt" | grep -Eq '(z ?){2,}|zzz'; then emit sleep; fi
+    emit playground
+fi
+
+# 6) fallback by darkness: a near-black surface is a load/transition screen
+if awk -v n="$nonblack" 'BEGIN{exit !(n<0.06)}'; then emit connecting; fi
+
+# in-world but unrecognized chrome — treat as playground (usable)
+emit playground
