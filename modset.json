@@ -1,0 +1,29 @@
+{
+  "_comment": "MODSET name->factor table for the production general-interval hook (frida/trampoline_inject.py, TTRMOD_MODE=modset). ONE install of the Python MetaInterval.start wrapper reads each started interval's getName() and setPlayRate's it with the factor of the FIRST matching entry -- so all cosmetic animation groups speed up at once, and nothing else is touched. factor = speed multiplier (3.0 = 3x faster / ~1/3 the duration). match = substring of the interval name (set prefix:true to anchor at the start instead). Entries are tried IN ORDER; put specific matches before broad ones. enabled:false stubs an entry out. Names matching NO entry are logged (log_unmatched) but never scaled, so gameplay-timing intervals stay intact. The interval NAMES are TTR's real ones (observed live via TTRMOD_LOGNAMES); the class is pinned per-build in trampoline_inject.py (META_INTERVAL_MODULE/CLASS) -- re-derive on an engine auto-patch.",
+  "log_unmatched": true,
+  "entries": [
+    { "match": "teleportOut", "factor": 4.0, "group": "teleport",    "_note": "teleportOut-<doId>; confirmed live (first measured speedup ~4.9x at 5.0)" },
+    { "match": "teleportIn",  "factor": 4.0, "group": "teleport",    "_note": "teleportIn-<doId>; confirmed live" },
+    { "match": "openBook",    "factor": 3.0, "group": "book",        "_note": "openBook-<doId>; confirmed live (scales; too fast to frame-measure)" },
+    { "match": "closeBook",   "factor": 3.0, "group": "book",        "_note": "closeBook-<doId>; confirmed live" },
+    { "match": "irisTask",    "factor": 3.0, "group": "transitions", "_note": "the screen IRIS -- confirmed live to be the zone/tunnel/door transition (the circular iris that closes on every zone change; captured frame-by-frame on a tunnel entry). Intact literal name." },
+    { "match": "tunnel",      "factor": 4.0, "group": "tunnel",      "_note": "substring for the street-tunnel walk Sequence (LocalToon.tunnelOut/tunnelIn per STATUS -> name should contain 'tunnel'); confirm/refine the exact name from the live TTRMOD_LOGNAMES log" },
+
+    { "match": "leftDoorOpen",   "factor": 3.0, "group": "door", "_note": "building/shop door swing (left leaf) opening; interval name discovered live: leftDoorOpen-<doorId>" },
+    { "match": "leftDoorClose",  "factor": 3.0, "group": "door", "_note": "leftDoorClose-<doorId> (discovered live)" },
+    { "match": "rightDoorOpen",  "factor": 3.0, "group": "door", "_note": "rightDoorOpen-<doorId> (discovered live)" },
+    { "match": "rightDoorClose", "factor": 3.0, "group": "door", "_note": "rightDoorClose-<doorId> (discovered live)" },
+    { "match": "avatarEnterDoor","factor": 3.0, "group": "door", "_note": "toon stepping into a building door: avatarEnterDoor-<doorId>-<toonId> (discovered live). Cosmetic walk-in; the server DistributedDoor hold is untouched (STATUS)." },
+    { "match": "avatarExitDoor", "factor": 3.0, "group": "door", "_note": "toon stepping out of a building door: avatarExitDoor-<doorId>-<toonId> (discovered live)" },
+
+    { "match": "faceoff-battle",   "factor": 3.0, "group": "battle", "_note": "cog-battle FACEOFF (taunt-stare + walk-to-spots): faceoff-battle<id>. Discovered live from other players' fights via the global hook -- CLIENT-side movie visual only; damage/timers stay server-authoritative." },
+    { "match": "movie-track",      "factor": 3.0, "group": "battle", "_note": "whole-round attack MOVIE (every attack + cog-death + dodge): movie-track. Discovered live. Client visual only." },
+    { "match": "movie-reward-track","factor": 3.0, "group": "battle", "_note": "post-battle REWARD movie (gags/laff/jellybeans tally): movie-reward-track. Discovered live." },
+    { "match": "to-pending",       "factor": 3.0, "group": "battle", "_note": "RUN-IN join walk (client-driven first round -> AI advances on d_joinDone, server timers are upper-bound fallbacks per STATUS): to-pending-toon. Discovered live. Matches open-toontown's iname_sub 'to-pending'." }
+  ],
+  "pending": {
+    "_comment": "NOT applied by the loader -- names still to confirm. Move a row up into `entries` once its real interval name is seen in the [IVALNAME] log.",
+    "tunnel_exact": { "match": "tunnel", "factor": 4.0, "group": "tunnel", "_note": "the street-tunnel walk only fires on the LOCAL toon's own entry (it is not broadcast, unlike teleport/book/door which the global hook catches from every player), so it was not seen in the log this session -- tunnel entry via blind window automation was unreliable. STATUS names it LocalToon.tunnelOut/tunnelIn, so the active 'tunnel' substring entry above should match; confirm the exact name on a clean own-toon tunnel walk with TTRMOD_LOGNAMES=1." },
+    "unknown_seen": { "_note": "other live interval names seen but NOT scaled (unknown purpose / not cosmetic-speed targets): bellicose (x15), trackName (x6), treasureFlyTrack, ripples-track (pond), Floater (floating text), stareAt-ToonEyes (NPC gaze), vlt8e0d5a85 (dominant auto-named ambient sequences), vlt2eae0fcc. Left untouched on purpose." }
+  }
+}

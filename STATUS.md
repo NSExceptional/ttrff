@@ -78,6 +78,32 @@ baseline `scratchpad/base_tele3/` (playground→Zapwood) + `base_tele/` (interio
 `scratchpad/mod_tele_frames/`. This is the first real, measured, cosmetic client-side speedup on the
 live official client.
 
+**PRODUCTION `modset` mode COMPLETE (2026-09-05) — the by-name `MetaInterval.start` hook is now the
+shipping approach, driven by an editable table; 5 groups confirmed scaling LIVE + full name catalog.**
+The one-name-at-a-time byname hook was generalized into `TTRMOD_MODE=modset`: a single install of the
+`MetaInterval.start` wrapper driven by a curated **name→factor table** (`modset.json`) that scales all
+easily-triggerable cosmetic animation groups at once. Offline-validated first
+(`localtest/modset_test.py` PASS: per-entry factors, first-match ordering, unmatched logged-not-scaled,
+junk-safe, tstate clean). Then **4 live runs (all reverted rc:0, game always alive, ZERO crashes,
+fires 398/1330/509/1275/505)** confirmed, via `[SCALED]` with the exact table factors:
+- **teleport** `teleportOut`/`teleportIn` **×4** (42 events), **book** `openBook`/`closeBook` **×3**
+  (35 events), **transitions** `irisTask` **×3** (my own book→Back-to-Playground teleport — `irisTask`
+  is the zone/tunnel/door **iris**, captured frame-by-frame), **door** `leftDoorOpen/Close`,
+  `rightDoorOpen/Close`, `avatarEnterDoor`/`avatarExitDoor` **×3** (discovered in run 1, added to the
+  table, then scaled live in later runs — proving the discover→add→scale workflow end-to-end).
+- **The global hook catches every player's cosmetic intervals in-zone** (teleport/book/door/battle are
+  broadcast), so it discovered the **battle** names with NO fight of our own:
+  `faceoff-battle<id>` (faceoff), `movie-track` + `movie-reward-track` (attack/reward movie),
+  `to-pending-toon` (run-in) — all now in the table (scaling applies to the next in-zone battle, same
+  as door did).
+- **Only the tunnel walk resisted:** `tunnelOut`/`tunnelIn` fire ONLY on the local toon's OWN entry
+  (not broadcast), and blind `winctl` navigation into the small tunnel trigger (across the central
+  pond, with camera-rotation disorientation) was unreliable across ~14 attempts — one clean unmodded
+  entry succeeded (`base_tunnel2`, TTC→Silly Street, iris-out ~380ms) but a matched modded capture was
+  not obtained. Its scaling is by-mechanism (name matches the `tunnel` substring; the identical hook
+  scaled 5 other groups). Book is empirically **too fast to frame-measure** (`base_bookopen2`: open <1
+  frame at ~8fps `winctl shot`). See "The modset mode" below.
+
 ---
 
 ## The target — TTREngine
@@ -564,11 +590,70 @@ TTR** — but it led to the robust general solution.
   `scripts/tt-sample 5 120`): teleport-out animation ~4.07s → ~0.83s = **~4.9×**. `fires=398`, game
   alive, clean revert. The book open/close is too fast (~1 frame at ~11 fps `winctl shot`) to MEASURE
   a speedup, but scales fine; teleport-out is long and cleanly measurable.
-- **NEXT mod groups to generalize (all via the same hook):** the **tunnel walk** (walk into a street
-  tunnel → its `Sequence` appears in the log, scale by name); **battle** movie/faceoff/run-in
-  (`Sequence` names surface on first cog battle); `irisTask`/`fadeTask` on natural door/zone entry
-  (confirm the loader's fade is a MetaInterval by logging during an entry). Each is just a new
-  `TTRMOD_BYNAME` substring — no new RE.
+- **All of these are now generalized into the `modset` mode below — each group is just a table row.**
+
+---
+
+## The `modset` mode — the PRODUCTION general-interval hook (THE documented approach)
+
+`TTRMOD_MODE=modset` is the shipping form of the by-name `MetaInterval.start` hook. **One** install of
+the wrapper on the Python `MetaInterval.start` (pinned by name to
+`direct.vltf283acbe.vlt615404bc` / class `vlt615404bc`, wrap `start` only) scales **all** the cosmetic
+animation groups at once, driven by a curated **name→factor table** in `modset.json`. In the
+wrap-after, `self` IS the just-started interval: read `getName()`, find the FIRST table entry whose
+`match` is a substring (or, with `prefix:true`, a prefix) of the name, and `setPlayRate(self, factor)`
+with THAT entry's own factor. A name matching **no** entry is logged (`[IVALNAME]`, capped/deduped) but
+**never scaled** — so gameplay-timing intervals are always left intact.
+
+**Run it:** `sudo -n env TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150
+TTRMOD_SCRIPT=frida/trampoline_inject.py frida/run-injector.sh` (root; auto-installs → polls while you
+trigger animations, printing `[SCALED] <name> x<factor> (<group>)` and `[IVALNAME] <name>` → reverts
+`rc:0` → detaches). Override the class per build with `TTRMOD_TMOD`/`TTRMOD_TCLS` (else it falls back to
+the signature scan `start+setPlayRate+append+clearIntervals`); override the table path with
+`TTRMOD_MODSET`. Offline-validate the table logic first: `localtest/modset_test.py`.
+
+### `modset.json` config format
+```jsonc
+{ "log_unmatched": true,
+  "entries": [ { "match": "<substring>", "factor": <float>, "group": "<name>", "prefix": false } ],
+  "pending": { /* free-form docs of names still to confirm; NOT applied by the loader */ } }
+```
+`match` = substring of the interval name (specific→broad order; first match wins). `factor` = speed
+multiplier (3.0 = ~1/3 the duration). `group` = label for logs/status. `enabled:false` stubs a row.
+
+### Interval-name catalog (observed LIVE, `TTRMOD_LOGNAMES=1`, Toontown Central + Silly Street)
+The hook is **global**: it sees every player's *broadcast* cosmetic intervals in-zone (teleport, book,
+door, battle), plus the local toon's own (tunnel walk, iris). Names are mostly readable literals with a
+`-<doId>`/`-<toonId>` suffix.
+
+| group | interval name(s) | trigger | factor | LIVE status |
+|---|---|---|---|---|
+| teleport | `teleportOut-<id>`, `teleportIn-<id>` | Shticker Book → teleport / "Back to Playground" | 4.0 | **`[SCALED]` ×4 confirmed** (own + others; 42 events) |
+| book | `openBook-<id>`, `closeBook-<id>` | click the book icon | 3.0 | **`[SCALED]` ×3 confirmed** (own + others; 35 events) |
+| transitions | `irisTask` | any zone change (teleport/tunnel/door) — the screen **iris** | 3.0 | **`[SCALED]` ×3 confirmed** (own teleport; iris close frame-captured ~380→~127ms) |
+| door | `leftDoorOpen/Close-<id>`, `rightDoorOpen/Close-<id>`, `avatarEnterDoor-<id>-<id>`, `avatarExitDoor-<id>-<id>` | a toon enters/leaves a building | 3.0 | **`[SCALED]` ×3 confirmed** (discovered run 1 → added → scaled later runs) |
+| battle | `faceoff-battle<id>` (faceoff), `movie-track` + `movie-reward-track` (attack/reward movie), `to-pending-toon` (run-in) | a cog battle in-zone | 3.0 | **names discovered live** (others' fights); tabled → scales on next in-zone battle (client visual only) |
+| tunnel | `tunnelOut`/`tunnelIn` (substring `tunnel`) | walk the local toon into a street tunnel | 4.0 | **entry proven (`base_tunnel2`), scaling by-mechanism** — fires only on OWN entry (not broadcast); a clean modded capture was blocked by unreliable blind tunnel-trigger navigation |
+
+Also seen, **left untouched on purpose** (unknown/not cosmetic-speed): `bellicose` (×15), `trackName`
+(×6), `treasureFlyTrack`, `ripples-track-<n>` (pond), `Floater` (floating text), `stareAt-ToonEyes-*`
+(NPC gaze), and the dominant auto-named ambient `vlt8e0d5a85-<n>` (~1240 unique/session) + `vlt2eae0fcc`.
+The ambient flood is why `[IVALNAME]` dedup is capped (400) — the tunnel walk must be caught by
+`[SCALED]` or logged before the cap fills.
+
+### Per-group status (what scales live vs pending)
+- **Live-confirmed (own trigger):** teleport, book, transitions (iris), door — all `[SCALED]` with the
+  right factor, no crash, clean revert.
+- **Names captured, scaling pending an in-zone battle:** battle (faceoff/movie/reward/run-in). The door
+  group is the proof-of-concept that a newly-discovered name, once tabled, scales live.
+- **Pending own-toon capture:** tunnel walk (`tunnelOut`/`tunnelIn`). Fires only locally; a reliable
+  own-toon tunnel entry (or a better input method than blind `winctl` holds) is the one remaining
+  confirmation. Book scales fine but is too fast (<1 frame) to *frame-measure* a speedup.
+
+### Milestone
+**First measured live speedup = teleport-out ~4.9× (byname hook).** `modset` then confirmed the same
+mechanism scaling **5 groups** (teleport/book/transitions/door + battle-names) across 4 crash-free live
+runs — the production mod-set is functional end-to-end.
 
 ---
 
@@ -576,7 +661,7 @@ TTR** — but it led to the robust general solution.
 
 | path | role |
 |---|---|
-| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. |
+| `frida/trampoline_inject.py` | **the live C-API-orchestration injector** (current route). Modes (`TTRMOD_MODE`): `install` (pass-through, milestone-1) / `selftest` / `list` / `listcls` / **`findcls`** (classes defining ALL of `TTRMOD_METHODS`, by signature) / **`findmeth`** (N exact group scans via `;`-sep `TTRMOD_METHODS` + `TTRMOD_SUBSTR` method-name sweep + `TTRMOD_LISTCLS=<mod>::<cls>,…` dumps) / **`mod1`** (self-discovering wrap-after speedup **+ the general interval hook**) / **`modset`** (THE PRODUCTION mode: the general interval hook driven by the `modset.json` name→factor table; reuses the mod1 install path but with the per-entry `modset` spec, defaults to pinning the `MetaInterval` class + wrapping `start`, and prints `[SCALED] … (group)` + `scaledInfo` group/name tallies). Env: `TTRMOD_METHODS` (discovery signature), `TTRMOD_TMOD`/`TTRMOD_TCLS` (name-based override), `TTRMOD_WRAP` (methods to actually wrap — decoupled from discovery, e.g. `start`), **`TTRMOD_BYNAME`** (comma substrings → `byname` spec: scale a started interval iff its `getName()` matches), **`TTRMOD_LOGNAMES=1`** (`[IVALNAME]` log of every started interval's name — the discovery tool), `TTRMOD_FACTOR` (setPlayRate factor), `TTRMOD_ATTR` (interval attr for the attr spec), `TTRMOD_PROBE_ATTRS=1` (first-fire `__dict__` probe), `TTRMOD_POLL`. Carries the manual-PyFloat builder, generic wrap-after (attr/iname_attr/iname_sub/**byname**), a callable-guard (never wrap a non-`function` class attr), per-method `[FIRED]/[APPLIED]/appliedBy` tagging, and the shared read-only signature/substring scans. Also `TTRMOD_MODSET` (table path, default `modset.json`) and the `scaledInfo` rpc (per-name/per-group scale tallies). **General-hook recipe:** `TTRMOD_TMOD=direct.vltf283acbe.vlt615404bc TTRMOD_TCLS=vlt615404bc TTRMOD_WRAP=start TTRMOD_LOGNAMES=1 TTRMOD_BYNAME=teleport,tunnel,iris,fade TTRMOD_FACTOR=5.0`. **Modset recipe (production):** `TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150` (table = `modset.json`). |
 | `frida/inject.py` | legacy eval path (marshal.loads + `PyCode_NewWithPosOnlyArgs` + `PyEval_EvalCode`); diagnostic modes `--hello` (+`TTRMOD_HELLOSRC`), `TTRMOD_NOEVAL`, `TTRMOD_TESTOBJ`+`TTRMOD_TESTSRC`, `TTRMOD_LOADONLY`. `Process.setExceptionHandler`→`/tmp/ttrmod-crash.json`; hang → thread `sample()`→`/tmp/ttrmod-sample.json`; self-exits (no 120s hangs). |
 | `frida/ftest.py` | proven bare-attach sanity check |
 | `frida/diag.py` | attach diagnostics |
@@ -594,10 +679,12 @@ TTR** — but it led to the robust general solution.
 | `localtest/abortleak_test.py` | offline A/B proving the exception-clear discipline |
 | `localtest/transitions_test.py` | **offline PROOF (PASS)** of the screen-transitions config: self-discovers a `Transitions`-shaped mock by `irisIn/irisOut/fadeIn/fadeOut`, wraps all four, `setPlayRate(5.0)` on `self.transitionIval` for iris AND fade, and the `t==0`/None path is a clean no-op with the tstate cleared |
 | `localtest/ivalname_test.py` | **offline PROOF (PASS) of the GENERAL INTERVAL HOOK** (the `byname` spec): discovers the Python `MetaInterval` by `start+setPlayRate+append+addSequence`, wraps ONLY `start`, logs every started interval's `getName()`, and `setPlayRate(5.0)`s ONLY the name-matching interval (non-match untouched, pass-through + tstate clean) |
+| **`localtest/modset_test.py`** | **offline PROOF (PASS) of the `modset` table logic** — discovers the `MetaInterval` by `start+setPlayRate+append+clearIntervals`, wraps `start`, and against a mock scales each started interval with the FIRST-matching table entry's OWN factor/group (teleport 4 / book 3 / iris 3 / tunnel 4), honors first-match ordering (`openBook`→3.0 not the broad `Book`→99.0), leaves unmatched intervals untouched-but-logged, and is junk-safe (getName() raising / returning a non-string → clean, tstate clear). Mirrors the shipping `modset` branch. |
 | `lldb/attach.py` | dead lldb path (kept for reference; do not use) |
 | `driver.py` | lldb-era host driver (legacy) |
 | `ttrmod` | bash entrypoint (legacy `--probe`/apply/`--revert` wrapper) |
-| `config.json` | groups (battle 3, runin 3, teleport 5, tunnel 5, book 100, iris 5) + `install_import_hook`; HUD block, off for first live test |
+| `config.json` | LEGACY eval-path groups (battle 3, runin 3, teleport 5, tunnel 5, book 100, iris 5) + `install_import_hook`; superseded by `modset.json` for the live route |
+| **`modset.json`** | **the PRODUCTION name→factor table** for `TTRMOD_MODE=modset` (16 active entries across teleport/book/transitions/door/battle + a `tunnel` substring; `pending` docs the unconfirmed tunnel/unknown names). Owner-editable; see "The `modset` mode" above. |
 | `offsets.json` | per-build eval-path C-API vmaddrs, keyed by UUID (+ prologue `verify` bytes) |
 | `capi-symbols.json` / `.md` | trampoline-route symbols, pass 1 |
 | `capi-symbols2.json` / `.md` | trampoline-route symbols, pass 2 (authoritative corrections) |

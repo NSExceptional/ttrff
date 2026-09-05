@@ -68,6 +68,17 @@ MOD1 = {
     "override": None,                                    # {"module":..,"cls":..} if TTRMOD_TMOD+TCLS set
 }
 
+# GENERAL INTERVAL HOOK target (the proven-live modset class). Every Panda Sequence/Parallel/Track
+# is one Python MetaInterval whose .start() we wrap; reading self.getName() then setPlayRate(self,..)
+# scales it on-the-fly. This is the class the first measured live speedup (teleport ~4.9x) went
+# through. Names are per-build (hashed) -> re-derive on an engine auto-patch (signature scan below).
+META_INTERVAL_MODULE = "direct.vltf283acbe.vlt615404bc"
+META_INTERVAL_CLASS  = "vlt615404bc"
+# discovery signature (only used if the pinned override is cleared): the Python MetaInterval is the
+# class defining start+setPlayRate+append+clearIntervals (the C++ CInterval base lacks the list
+# builders; NB addSequence from vanilla Panda is renamed away here -> use clearIntervals).
+META_INTERVAL_SIG    = ["start", "setPlayRate", "append", "clearIntervals"]
+
 # C-API needed for milestone 1 (pass-through install). vmaddr+prologue pulled from the JSONs.
 NEED = ["PyObject_Call", "PyObject_GetAttrString", "PyObject_SetAttrString",
         "PyCFunction_NewEx", "PyDict_GetItemString"]
@@ -90,6 +101,23 @@ def load_symbols():
                 syms[name] = {"vmaddr": int(str(va), 16),
                               "prologue16": ent.get("prologue16") or ent.get("verify")}
     return syms
+
+
+def load_modset(path):
+    """Load the modset name->factor table. Each active entry -> {match, factor, group, prefix}.
+    Entries with enabled:false (the stubbed/pending groups, e.g. battle) are skipped. `pending`
+    is a free-form list ignored by the loader (documentation of names still to confirm live)."""
+    data = json.load(open(path))
+    entries = []
+    for e in data.get("entries", []):
+        if not e.get("enabled", True):
+            continue
+        m = e.get("match")
+        if not m:
+            continue
+        entries.append({"match": m, "factor": float(e.get("factor", 3.0)),
+                        "group": e.get("group", "?"), "prefix": bool(e.get("prefix", False))})
+    return entries, bool(data.get("log_unmatched", True))
 
 
 def readiness(syms):
@@ -283,6 +311,41 @@ rpc.exports = {
               var ok = ST.setPlayRate(inst, factorVal);
               if (ok){ try { ST.scaledNames = ST.scaledNames || {}; ST.scaledNames[nms] = (ST.scaledNames[nms]||0)+1; send({t:'scaled', name:nms, factor:factorVal}); } catch(e){} }
               ST.clearExc(); return ok ? 1 : 0;
+            }
+            ST.clearExc(); return 0;
+          } else if (spec.mode === 'modset'){
+            // MODSET (the production mode): the GENERAL INTERVAL HOOK driven by a curated
+            // name->factor TABLE instead of one substring+factor. `inst` IS the interval (we
+            // wrapped its start()). Read getName(); find the FIRST table entry whose `match` is a
+            // substring (or, with entry.prefix, a prefix) of the name; setPlayRate with THAT
+            // entry's own factor. A name matching NO entry is LOGGED (spec.log) but NEVER scaled --
+            // so gameplay-timing intervals are always left untouched. Every miss clears the tstate.
+            var gm2 = ST.GetAttrStr(inst, Memory.allocUtf8String('getName'));
+            if (gm2.isNull()){ ST.clearExc(); return 0; }
+            var nm4 = ST.TupleNew ? ST.Call(gm2, ST.TupleNew(0), ptr(0)) : ptr(0);
+            if (nm4.isNull()){ ST.clearExc(); return 0; }
+            var nms4 = null; try { nms4 = ST.AsUTF8(nm4).readCString(); } catch(e){ nms4 = null; }
+            if (nms4 === null){ ST.clearExc(); return 0; }
+            var entries = spec.entries || [], matched = null;
+            for (var mi=0; mi<entries.length; mi++){
+              var en = entries[mi]; if (!en || !en.match) continue;
+              var isHit = en.prefix ? (nms4.lastIndexOf(en.match, 0) === 0) : (nms4.indexOf(en.match) >= 0);
+              if (isHit){ matched = en; break; }              // FIRST match wins -> order specific->broad
+            }
+            if (matched){
+              var okm = ST.setPlayRate(inst, matched.factor);
+              if (okm){ try {
+                ST.scaledNames = ST.scaledNames || {}; var firstSeen = (ST.scaledNames[nms4] === undefined);
+                ST.scaledNames[nms4] = (ST.scaledNames[nms4]||0) + 1;
+                ST.scaledGroups = ST.scaledGroups || {}; ST.scaledGroups[matched.group] = (ST.scaledGroups[matched.group]||0) + 1;
+                if (firstSeen) send({t:'scaled', name:nms4, factor:matched.factor, group:matched.group});
+              } catch(e){} }
+              ST.clearExc(); return okm ? 1 : 0;
+            }
+            // unmatched: log it once (deduped, capped) so the operator can see what's available.
+            if (spec.log){
+              ST.seenNames = ST.seenNames || {}; ST.nameCount = ST.nameCount || 0;
+              if (ST.seenNames[nms4] === undefined && ST.nameCount < 400){ ST.seenNames[nms4] = 1; ST.nameCount++; try { send({t:'ivalname', name:nms4}); } catch(e){} }
             }
             ST.clearExc(); return 0;
           }
@@ -708,7 +771,7 @@ rpc.exports = {
           // name -- we SELF-DISCOVER it by its method signature (handleTunnelIn+handleTunnelOut) with
           // the shared read-only scan, then wrap those methods on the discovered class object. A
           // TTRMOD_TMOD/TTRMOD_TCLS pair forces name-based resolution as a fallback.
-          if (ST.mode === 'mod1') {
+          if (ST.mode === 'mod1' || ST.mode === 'modset') {
             try {
               var m = ST.mod1;
               var mods0 = ST.sysmodules();
@@ -827,6 +890,9 @@ rpc.exports = {
   // per-method count of intervals actually setPlayRate'd (identifies which hashed method is a
   // transition-starter and confirms the interval attr resolved). {} until something lands.
   appliedBy: function () { return (ST && ST.appliedBy) ? ST.appliedBy : {}; },
+  // modset: how many intervals were setPlayRate'd, tallied by interval NAME and by GROUP.
+  // {names:{}, groups:{}} until something scales. The report's evidence of which groups landed.
+  scaledInfo: function () { return (ST) ? {names: ST.scaledNames || {}, groups: ST.scaledGroups || {}} : {}; },
 
   // REVERT: restore the original method (must run before session detach, on a GIL thread).
   // Re-arm a one-shot frame-eval hook that setattrs the original back, then detaches.
@@ -901,15 +967,40 @@ def main():
         MOD1["factor"] = float(os.environ["TTRMOD_FACTOR"])
 
     mode = os.environ.get("TTRMOD_MODE", "install")
+
+    # MODSET (production): ONE install of the MetaInterval.start hook driven by the curated
+    # name->factor table (modset.json). Reuses the mod1 code path (discover the interval class,
+    # wrap `start`, wrap-after) but with the per-entry `modset` spec instead of a single factor.
+    # Defaults: pin the proven-live Python MetaInterval class by NAME (override) and wrap only
+    # `start`. Setting TTRMOD_TMOD+TTRMOD_TCLS re-pins a different class (e.g. after an auto-patch);
+    # clearing both would fall back to the signature scan (META_INTERVAL_SIG).
+    if mode == "modset":
+        tbl_path = os.environ.get("TTRMOD_MODSET", os.path.join(ROOT, "modset.json"))
+        entries, log_unmatched = load_modset(tbl_path)
+        if not (ovr_mod and ovr_cls):
+            MOD1["override"] = {"module": META_INTERVAL_MODULE, "cls": META_INTERVAL_CLASS}
+        MOD1["methods"] = list(META_INTERVAL_SIG)   # signature fallback if the override is cleared
+        if not MOD1["wrapMethods"]:
+            MOD1["wrapMethods"] = ["start"]
+        want_log = log_unmatched
+        env_log = os.environ.get("TTRMOD_LOGNAMES", "")
+        if env_log != "":
+            want_log = env_log in ("1", "true", "yes")
+        MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log}
+        print("[tramp-live] modset: %d active entries; groups=%s; log_unmatched=%s; table=%s" % (
+            len(entries), sorted(set(e["group"] for e in entries)), want_log, tbl_path))
+
     pid = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()[0].decode()
     if mode == "findcls":
         print("[tramp-live] attaching pid=%s mode=findcls methods=%s" % (pid, "+".join(methods)))
     elif mode == "findmeth":
         print("[tramp-live] attaching pid=%s mode=findmeth groups=%s substr=%s" % (
             pid, " | ".join("+".join(g) for g in method_groups), ",".join(substrs) or "(none)"))
-    elif mode == "mod1":
-        print("[tramp-live] attaching pid=%s mode=mod1 discover-by=%s methods=%s" % (
-            pid, ("override %s.%s" % (ovr_mod, ovr_cls)) if MOD1["override"] else "signature", "+".join(methods)))
+    elif mode in ("mod1", "modset"):
+        print("[tramp-live] attaching pid=%s mode=%s resolve-by=%s wrap=%s" % (
+            pid, mode,
+            ("override %s.%s" % (MOD1["override"]["module"], MOD1["override"]["cls"])) if MOD1["override"] else ("signature " + "+".join(MOD1["methods"])),
+            "/".join(MOD1["wrapMethods"] or MOD1["methods"])))
     else:
         print("[tramp-live] attaching pid=%s target=%s.%s.%s" % (pid, T_MODULE, T_CLASS, T_METHOD))
     session = frida.attach(int(pid))
@@ -926,7 +1017,9 @@ def main():
             elif pl.get("t") == "ivalname":
                 box.setdefault("names", []).append(pl.get("name")); print("[IVALNAME]", pl.get("name"))
             elif pl.get("t") == "scaled":
-                box.setdefault("scaled", []).append(pl.get("name")); print("[SCALED]", pl.get("name"), "x", pl.get("factor"))
+                box.setdefault("scaled", []).append(pl.get("name"))
+                print("[SCALED]", pl.get("name"), "x", pl.get("factor"),
+                      ("(%s)" % pl.get("group")) if pl.get("group") else "")
             elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
@@ -958,7 +1051,11 @@ def main():
         session.detach(); return
     # trampoline is live; poll fire count while the user triggers the target in-game.
     import time
-    if mode == "mod1":
+    if mode == "modset":
+        target_label = "/".join(MOD1["wrapMethods"] or MOD1["methods"])
+        trigger_hint = ("trigger cosmetic animations to see [SCALED] / [IVALNAME] "
+                        "(teleport via the book, open/close the book, walk a street tunnel, enter a shop)")
+    elif mode == "mod1":
         target_label = "/".join(MOD1["methods"])
         trigger_hint = "WALK the toon into (or out of) any street tunnel — no mouse needed"
     else:
@@ -977,6 +1074,17 @@ def main():
         if ab: print("[tramp-live] appliedBy (method -> #intervals scaled):", json.dumps(ab))
     except Exception:
         pass
+    if mode == "modset":
+        try:
+            si = ex.scaledInfo() or {}
+            print("[tramp-live] modset scaled by GROUP:", json.dumps(si.get("groups", {})))
+            print("[tramp-live] modset scaled by NAME :", json.dumps(si.get("names", {})))
+            if box.get("names"):
+                print("[tramp-live] UNMATCHED interval names seen (%d):" % len(box["names"]))
+                for nm in box["names"]:
+                    print("    -", nm)
+        except Exception:
+            pass
     alive = subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
     print("[tramp-live] final fires=%d  game_alive=%s" % (last, alive))
     # MUST revert before detaching: the trampoline's native code dies with the session, so a
