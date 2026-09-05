@@ -1,16 +1,18 @@
 {
-  "_comment": "Cosmetic battle-animation speedups for the owner's own TTR client. factor = speed multiplier (2.0 = twice as fast / roughly half the duration). Set enabled:false to leave a group untouched. Combat run-in scales client walk speed, which brings the client-driven d_joinDone forward (see README).",
+  "_comment": "Cosmetic animation speedups for the owner's own TTR client. factor = speed multiplier (3.0 = 3x faster / ~1/3 the duration). enabled:false leaves a group untouched. Every patch wraps a method and setPlayRate's the track AFTER it starts (setPlayRate-before-start is a no-op). Factors mirror the values that tested well in the open-toontown port. See README / PROJECT-NOTES 'Porting to the live TTR client'.",
   "revert": false,
   "install_import_hook": true,
   "groups": {
-    "cog_death": { "enabled": true, "factor": 2.5 },
-    "dodge":     { "enabled": true, "factor": 2.0 },
-    "door":      { "enabled": true, "factor": 2.0 },
-    "runin":     { "enabled": true, "factor": 2.0 }
+    "battle":   { "enabled": true, "factor": 3.0 },
+    "runin":    { "enabled": true, "factor": 3.0 },
+    "teleport": { "enabled": true, "factor": 5.0 },
+    "tunnel":   { "enabled": true, "factor": 5.0 },
+    "book":     { "enabled": true, "factor": 100.0 },
+    "iris":     { "enabled": true, "factor": 5.0 }
   },
   "hud": {
-    "enabled": true,
-    "_comment": "Always-on street-view overlay: current tasks, gag inventory, and street name. Shown only while on a street (hidden in playgrounds/interiors) unless always_show is set.",
+    "enabled": false,
+    "_comment": "Street HUD (tasks/gags/street name). Disabled for the first live animation smoke test; re-enable once the animation patches are confirmed.",
     "show_tasks": true,
     "show_inventory": true,
     "show_street_name": true,

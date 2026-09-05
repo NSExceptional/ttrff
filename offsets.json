@@ -1,5 +1,5 @@
 {
-  "_comment": "CPython C-API addresses per TTREngine build, keyed by the arm64 Mach-O UUID (as-linked vmaddrs, image base 0x100000000; driver adds the runtime ASLR slide). TTR auto-patches the engine; when the UUID changes, re-derive with the `re` skill and add a new entry. `verify` holds each function's prologue bytes so the driver aborts on a changed binary. IMPORTANT: this hardened LTO CPython 3.7 deploy build dead-strips PyRun_* AND the bytecode compiler, and exec/eval are code-object-only, so the runnable primitive is `marshal_evalcode` (inject a host-marshalled code object -> marshal.loads -> PyEval_EvalCode with f_globals read off the live frame), NOT exec_builtins. PyModule_GetDict / PyImport_AddModule / PyBytes_FromStringAndSize are all inlined away by whole-program LTO (no standalone), hence the frame-globals read and the PyByteArray bytes-like constructor. The driver marshals the payload with a real host CPython 3.7 (marshal/code-object format is version-locked; TTRMOD_PY37 or python.org 3.7). See STATUS.md. Driver rework to the marshal_evalcode recipe is COMPLETE; only a live attach smoke test remains.",
+  "_comment": "CPython C-API addresses per TTREngine build, keyed by the arm64 Mach-O UUID (as-linked vmaddrs, image base 0x100000000; driver adds the runtime ASLR slide). TTR auto-patches the engine; when the UUID changes, re-derive with the `re` skill and add a new entry. `verify` holds each function's prologue bytes so the driver aborts on a changed binary. IMPORTANT: this hardened LTO CPython 3.8.17 deploy build dead-strips PyRun_* AND the bytecode compiler, and exec/eval are code-object-only, so the runnable primitive is `marshal_evalcode` (inject a host-marshalled code object -> marshal.loads -> PyEval_EvalCode with f_globals read off the live frame), NOT exec_builtins. PyModule_GetDict / PyImport_AddModule / PyBytes_FromStringAndSize are all inlined away by whole-program LTO (no standalone), hence the frame-globals read and the PyByteArray bytes-like constructor. The driver marshals the payload with a real host CPython 3.8 (marshal/code-object format is version-locked to 3.8 by co_posonlyargcount/PEP570; TTRMOD_PY38 or homebrew python@3.8) -- a 3.7 blob under this 3.8 engine hard-crashes. See STATUS.md. Driver rework to the marshal_evalcode recipe is COMPLETE; only a live attach smoke test remains.",
   "4C4C44C3-5555-3144-A136-F2D2B4A39415": {
     "arch": "arm64",
     "image_base_vmaddr": 4294967296,
@@ -10,19 +10,23 @@
       "gil_ensure": 4305952272,
       "gil_release": 4305952596,
       "eval_code": 4305685828,
+      "eval_frame_default": 4305690412,
       "err_printex": 4305953480,
       "marshal_loads": 4305938976,
       "r_object": 4305930556,
-      "bytes_from_string_and_size": 4304900532
+      "bytes_from_string_and_size": 4304900532,
+      "pycode_new": 4304917272
     },
     "vmaddrs_hex": {
       "gil_ensure": "0x100a79e10",
       "gil_release": "0x100a79f54",
       "eval_code": "0x100a38d44",
+      "eval_frame_default": "0x100a39f2c",
       "err_printex": "0x100a7a2c8",
       "marshal_loads": "0x100a76a20",
       "r_object": "0x100a7493c",
-      "bytes_from_string_and_size": "0x1009791b4"
+      "bytes_from_string_and_size": "0x1009791b4",
+      "pycode_new": "0x10097d318"
     },
     "globals_from_frame": {
       "_comment": "PyModule_GetDict/AddModule are inlined; read f_globals off the live frame instead.",
@@ -34,10 +38,12 @@
       "gil_ensure": "f8 5f bc a9 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
       "gil_release": "f4 4f be a9 fd 7b 01 a9 fd 43 00 91 f3 03 00 aa",
       "eval_code": "ff 43 01 d1 fd 7b 04 a9 fd 03 01 91 00 e4 00 6f",
+      "eval_frame_default": "ff 83 05 d1 e9 23 0f 6d fc 6f 10 a9 fa 67 11 a9",
       "err_printex": "ff 43 03 d1 fc 6f 07 a9 fa 67 08 a9 f8 5f 09 a9",
       "marshal_loads": "ff 43 03 d1 f4 4f 0b a9 fd 7b 0c a9 fd 03 03 91",
       "r_object": "ff c3 04 d1 e9 23 0c 6d fc 6f 0d a9 fa 67 0e a9",
-      "bytes_from_string_and_size": "f8 5f bc a9 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9"
+      "bytes_from_string_and_size": "f8 5f bc a9 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
+      "pycode_new": "ff 43 04 d1 fc 6f 0b a9 fa 67 0c a9 f8 5f 0d a9"
     }
   }
 }

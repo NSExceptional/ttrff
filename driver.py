@@ -47,6 +47,27 @@ PY37_CANDIDATES = [
     "python3.7",
 ]
 
+
+def find_lldb():
+    """Return (lldb_path, developer_dir). A debugserver from a *beta* Xcode
+    (e.g. Xcode 26.x on macOS 15) SEGFAULTs in __ptrace on attach ("lost
+    connection"), so prefer an OS-matched toolchain: env override, then a stable
+    Xcode 16.x, then the Command Line Tools, then whatever is on PATH."""
+    import glob
+    env_lldb = os.environ.get("TTRMOD_LLDB", "")
+    if env_lldb and os.path.exists(env_lldb):
+        return env_lldb, os.environ.get("TTRMOD_DEVELOPER_DIR") or None
+    # stable Xcode 16.x (highest first), then CLT
+    xcodes = sorted(glob.glob("/Applications/Xcode-16*.app"), reverse=True)
+    for x in xcodes:
+        p = os.path.join(x, "Contents/Developer/usr/bin/lldb")
+        if os.path.exists(p):
+            return p, os.path.join(x, "Contents/Developer")
+    clt = "/Library/Developer/CommandLineTools/usr/bin/lldb"
+    if os.path.exists(clt):
+        return clt, "/Library/Developer/CommandLineTools"
+    return shutil.which("lldb"), None
+
 # stdin: payload source (utf-8); stdout: marshalled 3.7 code object (raw bytes).
 _MARSHAL_HELPER = (
     "import sys, marshal\n"
@@ -287,11 +308,19 @@ def main():
 
     env = dict(os.environ)
     env["TTRMOD_JOB"] = job_path
+    lldb_path, dev_dir = find_lldb()
+    if not lldb_path:
+        print("ERROR: no lldb found. Install Xcode or the Command Line Tools.",
+              file=sys.stderr)
+        return 8
+    if dev_dir:
+        env["DEVELOPER_DIR"] = dev_dir   # make lldb launch the matching debugserver
     print("[ttrmod] %s pid=%d uuid=%s" % (
         "PROBING (read-only)" if cfg.get("probe")
         else "REVERTING" if cfg.get("revert") else "applying", pid, uuid))
+    print("[ttrmod] lldb=%s%s" % (lldb_path, " (DEVELOPER_DIR=%s)" % dev_dir if dev_dir else ""))
     proc = subprocess.run(
-        ["lldb", "--batch", "-o", "command script import %s" % ATTACH, "-o", "quit"],
+        [lldb_path, "--batch", "-o", "command script import %s" % ATTACH, "-o", "quit"],
         env=env, capture_output=True, text=True, timeout=120)
 
     lldb_res = {}

@@ -1,17 +1,28 @@
 # payload.py -- runs INSIDE the live TTREngine CPython interpreter.
 #
-# Injected by driver.py via lldb using the marshal_evalcode primitive
-# (host-marshalled code object -> marshal.loads -> PyEval_EvalCode); see STATUS.md.
-# It monkeypatches the already-loaded Toontown game modules to shorten a few
-# COSMETIC battle animations. Everything here is:
-#   - idempotent   (re-running never double-wraps; it always re-wraps the true original)
-#   - reversible   ({"revert": true} in the config restores every original)
-#   - defensive    (unknown/absent names are logged and skipped, never fatal)
+# Injected by driver.py via the marshal_evalcode primitive (host-marshalled code
+# object -> marshal.loads -> PyEval_EvalCode; see STATUS.md). Monkeypatches the
+# already-loaded (decrypted-in-RAM) Toontown modules to speed up a set of COSMETIC
+# animations. Everything here is:
+#   - idempotent  (re-running never double-wraps; always re-wraps the true original)
+#   - reversible  ({"revert": true} in the config restores every original)
+#   - defensive   (unknown/absent names are logged and skipped, never fatal)
 #
-# Config path comes in via env TTRMOD_CFG; a JSON result is written to TTRMOD_STATUS.
+# COSMETIC ONLY: no movement/turn/aim/damage logic is touched.
 #
-# NOTE: This is cosmetic playback-rate scaling in a Panda3D game the owner owns.
-# No movement/turn/aim/damage logic is touched.
+# --------------------------------------------------------------------------
+# CRITICAL TECHNIQUE (learned the hard way in the open-toontown port):
+#   Panda's `Interval.start(startT, endT, playRate=1.0)` RESETS the play rate every
+#   call, so `ival.setPlayRate(f)` BEFORE `.start()` is a SILENT NO-OP (this is what
+#   the old version of this file did -- it never actually sped anything up). But
+#   `setPlayRate` AFTER the interval is already playing changes its speed on the fly.
+#   So every speed patch here wraps the method that builds+starts a track, lets the
+#   original run (which starts the track), then setPlayRate's the now-playing track.
+#   The track is retrieved from a known `self.<attr>` or from `self.activeIntervals`.
+#
+#   The book (open/close) uses the same mechanism with a huge factor -> effectively
+#   instant. The iris/fade transitions are scaled directly in the Transitions methods.
+# --------------------------------------------------------------------------
 
 import os
 import sys
@@ -24,12 +35,12 @@ STATUS_PATH = os.environ.get("TTRMOD_STATUS", "/tmp/ttrmod-status.json")
 report = {
     "ok": False,
     "revert": False,
-    "probe": [],        # [{"id","target","value"}] read-only smoke-test output
-    "applied": [],     # [{"id","target","detail"}]
-    "skipped": [],      # [{"id","reason"}]
+    "probe": [],
+    "applied": [],
+    "skipped": [],
     "reverted": [],
     "errors": [],
-    "modules_seen": {}, # modname -> [candidate attrs present] for diagnostics
+    "modules_seen": {},
 }
 
 
@@ -45,193 +56,205 @@ import builtins
 
 reg = getattr(builtins, "_ttrmod", None)
 if reg is None:
-    reg = {"orig": {}, "wrapped": set(), "orig_import": None, "hook_installed": False}
+    reg = {"orig": {}, "orig_import": None, "hook_installed": False}
     builtins._ttrmod = reg
 
 
 # --------------------------------------------------------------------------
-# Patch table.  Each patch names its group (whose factor/enable comes from the
-# config) and a list of candidate module names -- TTR's frozen build imports
-# these by BARE name ("MovieUtil"), open-toontown by dotted name; we try both.
+# Patch table.
+#
+# Each speed patch wraps `cls.method`; after the original runs it locates the track
+# it started and `setPlayRate`s it. `after` selects HOW to find the track:
+#   {"attr": "track"}            -> setPlayRate(self.track)
+#   {"iname_attr": "faceOffName"}-> setPlayRate(self.activeIntervals[self.faceOffName])
+#   {"iname_sub": "to-pending"}  -> setPlayRate every self.activeIntervals[k] with sub in k
+#
+# TTR's frozen build imports modules by BARE name ("MovieUtil"); open-toontown by
+# dotted name. We try both. `group` selects the factor/enable from the config.
 # --------------------------------------------------------------------------
 PATCHES = [
-    # ---- Cog-death explosion (cosmetic) --------------------------------
-    {"id": "cog_death_duration", "group": "cog_death", "kind": "const", "op": "div",
-     "modules": ["MovieUtil", "toontown.battle.MovieUtil"], "target": "SUIT_LOSE_DURATION"},
-    {"id": "cog_death_track", "group": "cog_death", "kind": "wrap_func",
-     "modules": ["MovieUtil", "toontown.battle.MovieUtil"], "target": "createSuitDeathTrack"},
-    {"id": "cog_revive_track", "group": "cog_death", "kind": "wrap_func",
-     "modules": ["MovieUtil", "toontown.battle.MovieUtil"], "target": "createSuitReviveTrack"},
+    # ---- whole battle round movie: every attack + nested cog-death + dodge --------
+    {"id": "battle_movie", "group": "battle", "kind": "wrap_after",
+     "modules": ["Movie", "toontown.battle.Movie"], "cls": "Movie",
+     "methods": ["play"], "after": {"attr": "track"}},
 
-    # ---- Dodge "step back" (cosmetic playback) -------------------------
-    {"id": "toon_dodge", "group": "dodge", "kind": "wrap_func",
-     "modules": ["MovieUtil", "toontown.battle.MovieUtil"], "target": "createToonDodgeMultitrack"},
-    {"id": "suit_dodge", "group": "dodge", "kind": "wrap_func",
-     "modules": ["MovieUtil", "toontown.battle.MovieUtil"], "target": "createSuitDodgeMultitrack"},
+    # ---- combat intro (FaceOff): taunt-stare + walk-to-spots ----------------------
+    {"id": "faceoff", "group": "battle", "kind": "wrap_after",
+     "modules": ["DistributedBattle", "toontown.battle.DistributedBattle"],
+     "cls": "DistributedBattle", "methods": ["enterFaceOff"],
+     "after": {"iname_attr": "faceOffName"}},
 
-    # ---- Door client-side animation (client half only) -----------------
-    {"id": "door_enter", "group": "door", "kind": "wrap_method",
-     "modules": ["DistributedDoor", "toontown.building.DistributedDoor"],
-     "cls": "DistributedDoor", "target": "avatarEnterDoorTrack"},
-    {"id": "door_exit", "group": "door", "kind": "wrap_method",
-     "modules": ["DistributedDoor", "toontown.building.DistributedDoor"],
-     "cls": "DistributedDoor", "target": "avatarExitDoorTrack"},
+    # ---- run-in (join walk) -> earlier client-driven d_joinDone -------------------
+    {"id": "runin", "group": "runin", "kind": "wrap_after",
+     "modules": ["DistributedBattleBase", "toontown.battle.DistributedBattleBase"],
+     "cls": "DistributedBattleBase", "methods": ["makeSuitJoin", "_DistributedBattleBase__makeToonJoin"],
+     "after": {"iname_sub": "to-pending"}},
 
-    # ---- Combat run-in (client run-in => earlier client-driven d_joinDone)
-    {"id": "runin_suit", "group": "runin", "kind": "attr", "op": "mul",
-     "modules": ["BattleBase", "toontown.battle.BattleBase"],
-     "cls": "BattleBase", "target": "suitSpeed"},
-    {"id": "runin_toon", "group": "runin", "kind": "attr", "op": "mul",
-     "modules": ["BattleBase", "toontown.battle.BattleBase"],
-     "cls": "BattleBase", "target": "toonSpeed"},
+    # ---- teleport out/in ----------------------------------------------------------
+    {"id": "teleport", "group": "teleport", "kind": "wrap_after",
+     "modules": ["Toon", "toontown.toon.Toon"], "cls": "Toon",
+     "methods": ["enterTeleportOut", "enterTeleportIn"], "after": {"attr": "track"}},
+
+    # ---- street tunnel walk-in / walk-out -----------------------------------------
+    {"id": "tunnel", "group": "tunnel", "kind": "wrap_after",
+     "modules": ["LocalToon", "toontown.toon.LocalToon"], "cls": "LocalToon",
+     "methods": ["handleTunnelIn", "handleTunnelOut"], "after": {"attr": "tunnelTrack"}},
+
+    # ---- Shticker Book open/close (huge factor => effectively instant) -------------
+    {"id": "book", "group": "book", "kind": "wrap_after",
+     "modules": ["Toon", "toontown.toon.Toon"], "cls": "Toon",
+     "methods": ["enterOpenBook", "enterCloseBook"], "after": {"attr": "track"}},
+
+    # ---- iris + fade screen wipes (door/street/teleport/playground) ----------------
+    # Scaled directly in the transition methods (dividing `t`), not via a track.
+    {"id": "transitions", "group": "iris", "kind": "transitions",
+     "modules": ["direct.showbase.Transitions"], "cls": "Transitions",
+     "methods": ["fadeIn", "fadeOut", "irisIn", "irisOut"]},
 ]
 
 
 def resolve_module(modnames):
-    """Return an already-imported module from the candidate names, or try to
-    import it.  Returns (module, name) or (None, None)."""
+    # ONLY look at already-imported modules. Do NOT __import__ here: this code runs
+    # inside an injected frame while HOLDING the GIL, and importing a game module can
+    # transitively wait on the main thread (which is blocked on that same GIL) ->
+    # deadlock -> frozen game. Modules that load later are handled by the import hook,
+    # which runs on the main thread (GIL already held by it) where importing is safe.
     for name in modnames:
         m = sys.modules.get(name)
         if m is not None:
             return m, name
-    for name in modnames:
-        try:
-            __import__(name)
-            m = sys.modules.get(name)
-            if m is not None:
-                return m, name
-        except Exception:
-            continue
     return None, None
 
 
-def _holder_and_attr(patch):
-    """Return (holder_object, attr_name, module_name) for a patch, or (None,...).
-    holder is the module for const/wrap_func, or the class for attr/wrap_method."""
+def _get_class(patch):
     mod, name = resolve_module(patch["modules"])
     if mod is None:
-        return None, None, None
-    if patch.get("cls"):
-        cls = getattr(mod, patch["cls"], None)
-        if cls is None:
-            # diagnostics
-            report["modules_seen"].setdefault(name, [])
-            return None, None, name
-        return cls, patch["target"], name
-    return mod, patch["target"], name
+        return None, None
+    cls = getattr(mod, patch["cls"], None)
+    return cls, name
 
 
-def _make_playrate_wrapper(true_orig, factor, is_method):
-    if is_method:
-        def wrapped(self, *a, **k):
-            ival = true_orig(self, *a, **k)
-            try:
-                ival.setPlayRate(factor)
-            except Exception:
-                pass
-            return ival
-    else:
-        def wrapped(*a, **k):
-            ival = true_orig(*a, **k)
-            try:
-                ival.setPlayRate(factor)
-            except Exception:
-                pass
-            return ival
-    wrapped._ttrmod_wrapped = True
+def _apply_after(self, spec, factor):
+    """Locate the just-started track on `self` and setPlayRate it (on-the-fly)."""
+    try:
+        if "attr" in spec:
+            iv = getattr(self, spec["attr"], None)
+            if iv is not None:
+                iv.setPlayRate(factor)
+        elif "iname_attr" in spec:
+            nm = getattr(self, spec["iname_attr"], None)
+            ivals = getattr(self, "activeIntervals", {}) or {}
+            iv = ivals.get(nm)
+            if iv is not None:
+                iv.setPlayRate(factor)
+        elif "iname_sub" in spec:
+            sub = spec["iname_sub"]
+            ivals = getattr(self, "activeIntervals", {}) or {}
+            for k, iv in list(ivals.items()):
+                if sub in k:
+                    iv.setPlayRate(factor)
+    except Exception:
+        pass
+
+
+def _make_wrap_after(true_orig, factor, after_spec):
+    def wrapped(self, *a, **k):
+        result = true_orig(self, *a, **k)   # builds + starts the track
+        _apply_after(self, after_spec, factor)   # setPlayRate the now-playing track
+        return result
     wrapped._ttrmod_orig = true_orig
     return wrapped
+
+
+def _make_transition_scaler(true_orig, factor):
+    # fadeIn/Out/irisIn/Out(self, t=0.5, ...): divide t (keep the t==0 instant path).
+    def wrapped(self, t=0.5, *a, **k):
+        if t:
+            t = t / factor
+        return true_orig(self, t, *a, **k)
+    wrapped._ttrmod_orig = true_orig
+    return wrapped
+
+
+def _patch_one(holder, attr, key, make_wrapper):
+    if not hasattr(holder, attr):
+        return False, "attr %r absent" % attr
+    if key not in reg["orig"]:
+        reg["orig"][key] = getattr(holder, attr)
+    true_orig = reg["orig"][key]
+    setattr(holder, attr, make_wrapper(true_orig))
+    return True, None
 
 
 def apply_patch(patch, group_cfg):
     pid = patch["id"]
     factor = float(group_cfg.get("factor", 2.0))
-    holder, attr, modname = _holder_and_attr(patch)
-    if holder is None:
+    cls, modname = _get_class(patch)
+    if cls is None:
         report["skipped"].append({"id": pid, "reason": "module/class not loaded yet"})
         return
-    if not hasattr(holder, attr):
-        # log what similar names ARE present so a renamed build is diagnosable
-        present = [n for n in dir(holder) if not n.startswith("__")]
-        hint = [n for n in present if attr.split("createSuit")[-1][:4].lower() in n.lower()] if "create" in attr else []
-        report["modules_seen"].setdefault(modname, sorted(present)[:60])
-        report["skipped"].append({"id": pid, "reason": "attr %r absent (hint: %s)" % (attr, hint)})
-        return
-
-    key = "%s|%s.%s" % (pid, modname, attr)
-    # store the TRUE original exactly once
-    if key not in reg["orig"]:
-        reg["orig"][key] = getattr(holder, attr)
-    true_orig = reg["orig"][key]
-
-    try:
-        if patch["kind"] in ("const", "attr"):
-            base = true_orig
-            if patch["op"] == "div":
-                new = base / factor
-            else:
-                new = base * factor
-            setattr(holder, attr, new)
-            report["applied"].append({"id": pid, "target": "%s.%s" % (modname, attr),
-                                       "detail": "%r -> %r (op=%s x%.3g)" % (base, new, patch["op"], factor)})
-        elif patch["kind"] in ("wrap_func", "wrap_method"):
-            is_method = patch["kind"] == "wrap_method"
-            wrapped = _make_playrate_wrapper(true_orig, factor, is_method)
-            setattr(holder, attr, wrapped)
-            reg["wrapped"].add(key)
-            report["applied"].append({"id": pid, "target": "%s.%s" % (modname, attr),
-                                       "detail": "setPlayRate(%.3g) wrapper" % factor})
+    for method in patch["methods"]:
+        key = "%s|%s.%s.%s" % (pid, modname, patch["cls"], method)
+        if patch["kind"] == "wrap_after":
+            ok, err = _patch_one(cls, method, key,
+                                 lambda o: _make_wrap_after(o, factor, patch["after"]))
+        elif patch["kind"] == "transitions":
+            ok, err = _patch_one(cls, method, key,
+                                 lambda o: _make_transition_scaler(o, factor))
         else:
-            report["skipped"].append({"id": pid, "reason": "unknown kind %r" % patch["kind"]})
-    except Exception as e:
-        _log_err("apply %s" % pid, e)
+            ok, err = False, "unknown kind %r" % patch["kind"]
+        if ok:
+            report["applied"].append({"id": pid, "target": "%s.%s.%s" % (modname, patch["cls"], method),
+                                       "detail": "x%.3g" % factor})
+        else:
+            present = [n for n in dir(cls) if not n.startswith("__")]
+            report["modules_seen"].setdefault("%s.%s" % (modname, patch["cls"]), sorted(present)[:80])
+            report["skipped"].append({"id": pid, "reason": "%s.%s: %s" % (patch["cls"], method, err)})
 
 
 def revert_all():
     report["revert"] = True
     for key, orig in list(reg["orig"].items()):
-        pid, dotted = key.split("|", 1)
-        modname, attr = dotted.rsplit(".", 1)
-        # re-resolve holder for this patch id
+        pid = key.split("|", 1)[0]
         patch = next((p for p in PATCHES if p["id"] == pid), None)
         if patch is None:
             continue
-        holder, attr2, _ = _holder_and_attr(patch)
-        if holder is None:
+        cls, _ = _get_class(patch)
+        if cls is None:
             report["skipped"].append({"id": pid, "reason": "module gone; nothing to revert"})
             continue
+        # key = "pid|modname.clsname.method"
+        method = key.rsplit(".", 1)[1]
         try:
-            setattr(holder, attr, orig)
-            report["reverted"].append({"id": pid, "target": dotted})
+            setattr(cls, method, orig)
+            report["reverted"].append({"id": pid, "target": key.split("|", 1)[1]})
         except Exception as e:
             _log_err("revert %s" % pid, e)
     reg["orig"].clear()
-    reg["wrapped"].clear()
     remove_import_hook()
 
 
 # --------------------------------------------------------------------------
-# Optional import hook: re-apply patches when a target module loads later
-# (e.g. attach at the login screen, patches kick in when the battle modules
-# get imported).  Wraps builtins.__import__ once; fully reversible.
+# Import hook: re-apply when a target module loads later (attach at login,
+# patches kick in as battle/toon modules import). Reversible.
 # --------------------------------------------------------------------------
 def install_import_hook(cfg):
     if reg["hook_installed"]:
         return
-    target_mod_names = set()
+    target = set()
     for p in PATCHES:
         for m in p["modules"]:
-            target_mod_names.add(m)
+            target.add(m)
     orig_import = builtins.__import__
     reg["orig_import"] = orig_import
     _busy = {"v": False}
 
     def hooked(name, *a, **k):
         module = orig_import(name, *a, **k)
-        if not _busy["v"] and name in target_mod_names:
+        if not _busy["v"] and name in target:
             _busy["v"] = True
             try:
-                apply_enabled(cfg)  # cheap + idempotent
+                apply_enabled(cfg)
             except Exception:
                 pass
             finally:
@@ -259,34 +282,23 @@ def apply_enabled(cfg):
 
 
 def probe_all(cfg):
-    """Read-only: report the current value/target of every patch without
-    changing anything. Used for the live-attach smoke test -- proves the whole
-    inject->marshal->eval->payload pipeline ran and can see the game modules,
-    while leaving gameplay untouched."""
+    """Read-only: report whether each target class/method is present. Proves the
+    inject->marshal->eval->payload pipeline ran and can see the game modules, without
+    changing anything. Run this FIRST on the live smoke test."""
     for patch in PATCHES:
         pid = patch["id"]
-        holder, attr, modname = _holder_and_attr(patch)
-        if holder is None:
-            report["probe"].append({"id": pid, "target": None,
-                                     "value": "module/class not loaded yet"})
+        cls, modname = _get_class(patch)
+        if cls is None:
+            report["probe"].append({"id": pid, "target": patch["modules"][0], "value": "module/class not loaded yet"})
             continue
-        if not hasattr(holder, attr):
-            report["probe"].append({"id": pid, "target": "%s.%s" % (modname, attr),
-                                     "value": "<absent>"})
-            continue
-        try:
-            cur = getattr(holder, attr)
-            val = repr(cur) if patch["kind"] in ("const", "attr") else "<callable %s>" % getattr(cur, "__name__", "?")
-        except Exception as e:
-            val = "err %r" % e
-        report["probe"].append({"id": pid, "target": "%s.%s" % (modname, attr), "value": val})
+        found = {}
+        for method in patch["methods"]:
+            found[method] = hasattr(cls, method)
+        report["probe"].append({"id": pid, "target": "%s.%s" % (modname, patch["cls"]), "value": found})
 
 
 # --------------------------------------------------------------------------
-# HUD bridge -- the on-screen overlay lives in inproc/hud.py, which the driver
-# concatenates ahead of this file so setup_hud/teardown_hud share this module
-# namespace (report/reg are visible to them). These wrappers stay no-op-safe if
-# hud.py wasn't concatenated or the HUD is disabled in config.
+# HUD bridge (hud.py is concatenated ahead of this file so it shares this namespace).
 # --------------------------------------------------------------------------
 def _hud_apply(cfg):
     hud_cfg = cfg.get("hud", {})
@@ -326,7 +338,7 @@ def main():
         revert_all()
         _hud_teardown()
     elif cfg.get("probe"):
-        probe_all(cfg)  # read-only smoke test; changes nothing
+        probe_all(cfg)
     else:
         apply_enabled(cfg)
         _hud_apply(cfg)
@@ -342,7 +354,6 @@ def main():
             json.dump(report, f, indent=2, default=repr)
     except Exception:
         pass
-    # Also echo to the game's stdout/log for good measure.
     try:
         sys.stdout.write("[ttrmod] applied=%d skipped=%d reverted=%d errors=%d\n" % (
             len(report["applied"]), len(report["skipped"]),

@@ -1,0 +1,166 @@
+{
+  "_meta": {
+    "engine": "TTREngine.arm64 (Toontown Rewritten), embedded CPython 3.8.17, hardened+whole-program-LTO, fully symbol-stripped (5 exports; all nm entries are U imports)",
+    "image_base": "0x100000000",
+    "file_offset_rule": "fileoff = vmaddr - 0x100000000 (verified: __TEXT vmaddr 0x100000000 fileoff 0; __text vmaddr 0x100008000)",
+    "reference": "stock CPython 3.8.14 arm64 dylib WITH symbols (/opt/homebrew/Cellar/python@3.8/3.8.14/.../Python; __TEXT vmaddr 0 so fileoff==vmaddr)",
+    "method": "structural + string-xref match of stripped engine funcs vs the symbol-ful stock reference; type objects located by scanning DATA for tp_name string pointers; small hot funcs verified inlined by structural disasm scans",
+    "build_path": "/builds/mirai/python/cpython",
+    "prologue16_note": "space-separated little-endian raw bytes at the function's first 16 bytes (4 arm64 instrs), for a runtime memcmp verify-guard at the vmaddr",
+    "confirmed_offsets": {
+      "tstate_current_cell": "0x101c0acd8 (holds current PyThreadState*)",
+      "PyThreadState.interp": "+0x10",
+      "PyThreadState.recursion_depth": "+0x20",
+      "PyThreadState.curexc_type": "+0x58",
+      "PyThreadState.curexc_value": "+0x60",
+      "PyThreadState.curexc_traceback": "+0x68",
+      "PyInterpreterState.modules": "+0x38 (this IS sys.modules)",
+      "PyTypeObject": "tp_name+0x18, tp_getattr+0x40, tp_setattr+0x48, tp_call+0x80, tp_getattro+0x90, tp_setattro+0x98, tp_flags+0xa8 (vectorcall bit = byte@+0xa9 bit3), tp_descr_get+0x110, tp_new+0x138",
+      "PyMethodDef": "ml_name+0x0, ml_meth+0x8, ml_flags+0x10, ml_doc+0x18",
+      "PyInstanceMethodObject.func": "+0x10 (basicsize 0x18)"
+    },
+    "type_objects": {
+      "PyCFunction_Type": "0x101a940b0",
+      "PyInstanceMethod_Type": "0x101a79c20",
+      "PyFloat_Type": "0x101aae5c8",
+      "PyTuple_Type": "0x101aa7b30"
+    },
+    "engine_helpers_identified": {
+      "_PyErr_Format": "0x100a47b10",
+      "PyUnicode_InternInPlace": "0x100a11518",
+      "PyUnicode_DecodeUTF8(FromStringAndSize)": "0x1009ee48c",
+      "Py_FatalError": "0x100a2241c",
+      "PyArg_UnpackTuple": "0x100a5078c",
+      "gc_new_allocator(_PyObject_GC_New-family)": "0x10095d6f8",
+      "PyUnicode_AsUTF8": "0x100a07a38",
+      "_PyEval_EvalFrameDefault": "0x100a39f2c"
+    }
+  },
+
+  "PyInstanceMethod_New": {
+    "found": "no",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "high",
+    "evidence": "NO standalone out-of-line copy. In the stock reference _PyInstanceMethod_New (0x1f95c) has EXACTLY ONE caller: instancemethod_new (the type's tp_new). Under LTO the engine inlined its whole body into instancemethod_new (tp_new = sub_10097D094 @ 0x10097d094): alloc via the GC allocator, set ob_type=&PyInstanceMethod_Type(0x101a79c20), Py_INCREF(func), store func at method+0x10, then GC-track. Not exported (stripped exe) + single caller => standalone dead-stripped.",
+    "fallback": "Capability preserved. PyInstanceMethod_Type is present/ready at 0x101a79c20 with tp_new=0x10097d094. Create a self-binding instancemethod by CALLING the type with your callable: PyObject_Call((PyObject*)0x101a79c20, one_tuple, NULL) or (once you have it) PyObject_CallFunctionObjArgs((PyObject*)0x101a79c20, callable, NULL). That runs tp_new (the inlined New) and returns an instancemethod whose tp_descr_get(0x10097d078) binds self on attribute access. Or call tp_new directly: ((PyObject*(*)(PyObject*,PyObject*,PyObject*))0x10097d094)(0x101a79c20, one_tuple, NULL). im->func @ +0x10, basicsize 0x18.",
+    "inlined_into": "sub_10097D094 (instancemethod_new / tp_new), prologue16: ff 03 01 d1 f4 4f 02 a9 fd 7b 03 a9 fd c3 00 91"
+  },
+
+  "PyCFunction_NewEx": {
+    "found": "yes",
+    "vmaddr": "0x1009b9bdc",
+    "prologue16": "ff 43 01 d1 f8 5f 01 a9 f6 57 02 a9 f4 4f 03 a9",
+    "confidence": "high",
+    "evidence": "sub_1009B9BDC(PyMethodDef *ml, PyObject *self, PyObject *module). Reads ml->ml_flags at ml+0x10, masks 0x8F, switch-selects the per-convention vectorcall trampoline (sub_1009BA05C=NOARGS / sub_1009BA1D8=O / sub_1009B9F30=FASTCALL|KEYWORDS / sub_1009B9DD0=FASTCALL), emits SystemError '%s() method: bad call flags' on a bad mask, pops the PyCFunction free_list (qword_101BEC4C0) else allocates fresh (sub_10095D6F8), sets obj+8 = &PyCFunction_Type(0x101a940b0). Matches stock 0x4f208 incl. flags jump-table + free-list. Prologue matches reference (sub #0x50; stp x24,x23; x22,x21; x20,x19).",
+    "PyMethodDef_layout": "ml_name@+0x0(const char*), ml_meth@+0x8(PyCFunction), ml_flags@+0x10(int; METH_* mask 0x8F), ml_doc@+0x18. PyCFunctionObject: m_ml@+0x10, m_self@+0x18, m_module@+0x20, m_weakreflist@+0x28, vectorcall@+0x30."
+  },
+
+  "PyObject_GetAttrString": {
+    "found": "yes",
+    "vmaddr": "0x1009c5578",
+    "prologue16": "ff 03 01 d1 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
+    "confidence": "high",
+    "evidence": "sub_1009C5578(v, const char* name). Fast path: tp_getattr @ Py_TYPE(v)+0x40, tail-call if set. Else strlen+PyUnicode_DecodeUTF8(0x1009ee48c) ('input too long' overflow error) then INLINED PyObject_GetAttr (unicode check @ Py_TYPE(key)+0xab bit4 -> 'attribute name must be string, not %.200s'; tp_getattro tp+0x90; tp_getattr tp+0x40 via PyUnicode_AsUTF8; else 'quotquot.50s object has no attribute %U') + Py_DECREF(key). Matches stock 0x52c58."
+  },
+
+  "PyObject_SetAttrString": {
+    "found": "yes",
+    "vmaddr": "0x1009c5834",
+    "prologue16": "ff 03 01 d1 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
+    "confidence": "high",
+    "evidence": "sub_1009C5834(v, const char* name, value). Fast path: tp_setattr @ Py_TYPE(v)+0x48, tail-call if set. Else strlen+PyUnicode_DecodeUTF8 then PyUnicode_InternInPlace(0x100a11518) (=InternFromString), then calls PyObject_SetAttr (sub_1009C5924) out-of-line, then Py_DECREF. Matches stock 0x52dd4."
+  },
+
+  "PyObject_Call": {
+    "found": "yes",
+    "vmaddr": "0x10096a64c",
+    "prologue16": "ff 03 01 d1 f6 57 01 a9 f4 4f 02 a9 fd 7b 03 a9",
+    "confidence": "high",
+    "evidence": "sub_10096A64C(callable, args, kwargs). Checks Py_TPFLAGS_HAVE_VECTORCALL (tp flags byte @tp+0xa9 bit3) + tp_vectorcall_offset(tp+0x38); if present tail-calls _PyVectorcall_Call (sub_10096A510). Special-cases tp==&PyCFunction_Type(0x101a940b0) -> cfunction fast path (sub_10096A844). Else loads tp_call(tp+0x80), Py_EnterRecursiveCall (recursion_depth @ tstate+0x20), blr tp_call, else \"'%.200s' object is not callable\". Exactly one of two funcs referencing that string; the other (sub_100969DB4) is the large variadic _PyObject_MakeTpCall/FastCallDict sibling. Matches stock 0x1cdd4."
+  },
+
+  "PyObject_GetAttr": {
+    "found": "yes",
+    "vmaddr": "0x1009c56cc",
+    "prologue16": "ff c3 00 d1 f4 4f 01 a9 fd 7b 02 a9 fd 83 00 91",
+    "confidence": "high",
+    "evidence": "sub_1009C56CC(v, name). Standalone out-of-line copy (also inlined into GetAttrString). Checks name unicode first @ Py_TYPE(name)+0xab bit4 -> 'attribute name must be string, not %.200s'; tp_getattro tp+0x90 (else) tp_getattr tp+0x40 via PyUnicode_AsUTF8; else 'quotquot.50s object has no attribute %U' using tp_name @ tp+0x18. Matches stock 0x52cdc. (The sub_10097C214/CE78 funcs sharing the strings are the generic getattro impls: they check arg0's type & call _PyType_Lookup, not this.)"
+  },
+
+  "PyObject_SetAttr": {
+    "found": "yes",
+    "vmaddr": "0x1009c5924",
+    "prologue16": "ff 43 01 d1 f6 57 02 a9 f4 4f 03 a9 fd 7b 04 a9",
+    "confidence": "high",
+    "evidence": "sub_1009C5924(v, name, value). name unicode check @ Py_TYPE(name)+0xab bit4 -> 'attribute name must be string'; Py_INCREF(name)+PyUnicode_InternInPlace(sub_100A11518); tp_setattro tp+0x98 (call) else tp_setattr tp+0x48; else the SetAttr-UNIQUE errors \"'%.100s' object has no attributes (%s .%U)\" and \"'%.100s' object has only read-only attributes (%s .%U)\". Matches stock 0x52e70."
+  },
+
+  "PyObject_CallFunctionObjArgs": {
+    "found": "not_located",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "medium",
+    "evidence": "Not pinned in this pass (no distinctive string; the shared helper object_vacall was not anchored). Definitely survives out-of-line (heavily called by importlib/io). Stock 0x1e64c: tiny wrapper that sets up a va-list stack pointer and tail-calls object_vacall(NULL-first-arg). To finish: locate object_vacall (builds a small PyObject* stack array from va_list and calls _PyObject_Vectorcall), then its callers = this + CallMethodObjArgs.",
+    "workaround": "Not required for the route: PyObject_Call (0x10096a64c) with an argument tuple covers all calls. Build the tuple via the type-call trick or Py_BuildValue."
+  },
+  "PyObject_CallMethodObjArgs": {
+    "found": "not_located",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "medium",
+    "evidence": "Stock 0x1e3b0: calls _PyObject_GetMethod(obj,name,&bound) then object_vacall. Same anchor gap as CallFunctionObjArgs. Workaround: PyObject_GetAttr(0x1009c56cc) to fetch the bound method, then PyObject_Call(0x10096a64c)."
+  },
+
+  "PyFloat_FromDouble": {
+    "found": "not_located",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "medium",
+    "evidence": "Not pinned this pass. Stock 0x2e5a4: pops float free_list (else 24-byte alloc), sets ob_type=&PyFloat_Type, stores the double at obj+0x10. In this build it does NOT use the 'stp d9,d8' prologue and does not reference PyFloat_Type via a simple adrp near a double-store, so it is either inlined at hot call sites or uses a merged allocator. PyFloat_Type = 0x101aae5c8 (503 xrefs). To finish: xref PyFloat_Type and find the small ctor that writes a double to obj+0x10.",
+    "workaround": "If Py_BuildValue is located, use Py_BuildValue(\"d\", x). Else construct via PyFloat_Type call: PyObject_Call((PyObject*)0x101aae5c8, one_tuple_of_number, NULL)."
+  },
+  "PyTuple_New": {
+    "found": "not_located",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "medium",
+    "evidence": "Not uniquely pinned this pass (many bundled-lib funcs share the freelist/prologue shape). Definitely survives out-of-line (called from thousands of sites). Stock 0x5e4f0: takes Py_ssize_t size, negative -> _PyErr_BadInternalCall, size<=19 uses size-indexed free_list, else _PyObject_GC_NewVar; sets ob_type=&PyTuple_Type(0x101aa7b30), ob_size at obj+0x10, items from obj+0x18. To finish: among PyTuple_Type xrefs, the ONE-arg (Py_ssize_t) ctor with the negative-size BadInternalCall + size-indexed freelist.",
+    "PyTuple_Type": "0x101aa7b30",
+    "layout": "PyTupleObject: ob_size @ +0x10, ob_item[] @ +0x18."
+  },
+  "PyTuple_Pack": {
+    "found": "not_located", "vmaddr": null, "prologue16": null, "confidence": "low",
+    "evidence": "Stock 0x5e880: prologue sub #0x30; calls PyTuple_New then fills items from va_list. Find as a small caller of PyTuple_New once that is pinned."
+  },
+  "Py_BuildValue": {
+    "found": "not_located", "vmaddr": null, "prologue16": null, "confidence": "low",
+    "evidence": "Stock 0xe441c: va wrapper over do_mkvalue (switch on format chars). No distinctive string; medium effort to pin. Would be the most convenient single primitive for wrapper bodies (\"d\", \"O\", \"(OO)\", etc.)."
+  },
+
+  "PyErr_Occurred": {
+    "found": "no",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "high",
+    "evidence": "INLINED, no standalone. Structural scan found the body (load tstate cell 0x101c0acd8; if non-NULL read curexc_type @ tstate+0x58) inlined at DOZENS of error-check sites as `ldr [.,#0xcd8]; cbz; ldr [.,#0x58]; cbnz <err>` (e.g. 0x1000977e4, 0x1000a2258 region...). curexc_type@0x58 confirmed (matches reference).",
+    "equivalent": "PyObject* err = ({ void* t = *(void**)0x101c0acd8; t ? *(void**)((char*)t + 0x58) : NULL; });  // non-NULL means an exception is set"
+  },
+  "PyErr_Clear": {
+    "found": "no",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "medium",
+    "evidence": "No standalone tiny copy surfaced (consistent with PyErr_Occurred being inlined; stock 0xd0bd4 is a 5-instr tail-call to _PyErr_Restore(tstate,0,0,0)). Treat as inlined.",
+    "equivalent": "From frida: t=*(void**)0x101c0acd8; save old = t[0x58],t[0x60],t[0x68]; set them NULL; Py_XDECREF each old (decref = if(--*(ssize_t*)o==0) (*(void(**)(void*))(*(void**)((char*)o+8)+0x30))(o)). If you only need to *test/consume* errors, clearing the three fields to NULL (leaking a ref) is acceptable in a mod. A cleaner option is to locate _PyErr_Restore and call it with (tstate,0,0,0)."
+  },
+
+  "PyImport_GetModuleDict": {
+    "found": "no",
+    "vmaddr": null,
+    "prologue16": null,
+    "confidence": "high",
+    "evidence": "INLINED, no standalone (like offsets.json's PyImport_AddModule). All engine references to 'PyImport_GetModuleDict: no module dictionary!' sit inside large callers that read interp->modules directly (importlib helper sub_100019250, sub_10006685C, sub_100097F04); the only tiny site (sub_10006B4FC) is a C++ __throw_system_error cold stub.",
+    "route_to_sys_modules": "PREFERRED & CONFIRMED: sys.modules = *(*(*(0x101c0acd8) + 0x10) + 0x38). i.e. tstate=*(void**)0x101c0acd8; interp=*(tstate+0x10); module_dict=*(interp+0x38). Verified in BOTH the stock reference (PyImport_GetModuleDict 0xd96b0) AND the live engine (importlib helper sub_100019250 computes *(*(cell+16)+56))."
+  }
+}
