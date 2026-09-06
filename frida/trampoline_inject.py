@@ -158,7 +158,12 @@ def load_modset(path):
             continue
         spawn.append({"co_name": co, "factor": float(s.get("factor", 3.0)),
                       "group": s.get("group", "?")})
-    return entries, bool(data.get("log_unmatched", True)), context, spawn
+    # `tunnel_identity`: the street-tunnel WALK, scaled by OBJECT IDENTITY (localAvatar.tunnelTrack), not
+    # by name/co_name. attr=null -> auto-discover the hashed attr on the first iris-correlated walk, then
+    # pin it in memory; set attr to pin it up front (no discovery). factor/iris_window_ms tune it;
+    # enabled:false turns the whole tunnel-identity path off. A free-form object, passed through as-is.
+    tunnel = data.get("tunnel_identity") or {}
+    return entries, bool(data.get("log_unmatched", True)), context, spawn, tunnel
 
 
 def readiness(syms):
@@ -288,6 +293,22 @@ rpc.exports = {
       }
       ST.mod1 = p.mod1 || null;
       ST.probeAttrs = !!(ST.mod1 && ST.mod1.probe_attrs);   // mod1 first-fire __dict__ diagnostic
+      // TUNNEL-IDENTITY (the street-tunnel WALK). The walk interval is localAvatar.tunnelTrack -- an
+      // UNNAMED Sequence (auto-named vlt8e0d5a85-<n>) built + start()ed by the HASHED handlers
+      // handleTunnelOut/handleTunnelIn and stored under a HASHED attr -- so it matches NO name entry and
+      // its spawn co_name is hashed. It is therefore identified by OBJECT IDENTITY: the starting interval
+      // IS localAvatar.<tunnelAttr>. The (hashed) attr is auto-discovered on the first iris-correlated
+      // walk (handleTunnelIn calls base.transitions.irisIn synchronously right before start), then PINNED
+      // so every later walk (both directions) scales by identity alone. Config arrives via the modset spec
+      // (modset.json `tunnel_identity`, env-overridable). See STATUS.md "Tunnel walk by object identity".
+      var tcfg = (ST.mod1 && ST.mod1.spec && ST.mod1.spec.tunnel) ? ST.mod1.spec.tunnel : null;
+      ST.tunnelCfg = tcfg;
+      ST.tunnelEnabled = !!(tcfg && tcfg.enabled !== false);
+      ST.tunnelAttr = (tcfg && tcfg.attr) ? tcfg.attr : null;         // pinned hashed attr, else discover
+      ST.tunnelFactor = (tcfg && tcfg.factor) ? tcfg.factor : 4.0;
+      ST.irisWindowMs = (tcfg && tcfg.iris_window_ms) ? tcfg.iris_window_ms : 200;
+      ST.lastIrisMs = 0;                                              // Date.now() of the last iris start
+      ST.localAvatar = null; ST.localAvatarDict = null;               // cached once in-world (stable identity)
       // build a float by hand (STATUS.md recipe): pop the free-list head (relink via +8, numfree--),
       // else pymalloc(24); then ob_refcnt=1 @+0, ob_type=&PyFloat_Type @+8, ob_fval @+0x10.
       ST.makeFloat = function(v){
@@ -325,6 +346,88 @@ rpc.exports = {
           return true;
         } catch(e){ ST.clearExc(); return false; }
       };
+      // ---- TUNNEL WALK by OBJECT IDENTITY (localAvatar.tunnelTrack) ----
+      // Resolve + cache base.localAvatar and its instance __dict__ (whose object identity is stable for
+      // the avatar's life -- caching one ref keeps it alive). Path mirrors the selftest:
+      // sys.modules['builtins'].base.localAvatar, fallback builtins.localAvatar. Caches only a NON-null
+      // result, so it retries each start() until the local toon exists (injector may attach pre-login).
+      ST.resolveLocalAvatar = function(){
+        try {
+          if (ST.localAvatar && !ST.localAvatar.isNull()) return ST.localAvatar;
+          if (!(ST.DictGetStr && ST.GetAttrStr)) return ptr(0);
+          var md = ST.sysmodules(); if (md.isNull()) return ptr(0);
+          var bi = ST.DictGetStr(md, Memory.allocUtf8String('builtins'));   // borrowed
+          if (bi.isNull()){ ST.clearExc(); return ptr(0); }
+          var base = ST.GetAttrStr(bi, Memory.allocUtf8String('base'));
+          var av = ptr(0);
+          if (!base.isNull()){ av = ST.GetAttrStr(base, Memory.allocUtf8String('localAvatar')); if (av.isNull()) ST.clearExc(); }
+          else { ST.clearExc(); }
+          if (av.isNull()){ av = ST.GetAttrStr(bi, Memory.allocUtf8String('localAvatar')); if (av.isNull()){ ST.clearExc(); return ptr(0); } }
+          ST.localAvatar = av; ST.keep.push(av);
+          var d = ST.GetAttrStr(av, Memory.allocUtf8String('__dict__'));
+          if (!d.isNull()){ ST.localAvatarDict = d; ST.keep.push(d); } else { ST.clearExc(); ST.localAvatarDict = null; }
+          try { send({t:'avatar', tp: ST.tpname(av)}); } catch(e){}
+          return av;
+        } catch(e){ ST.clearExc(); return ptr(0); }
+      };
+      // does the interval name look like the screen iris (irisTask, or anything containing 'iris')?
+      ST.isIrisName = function(nm){ return !!(nm && nm.toLowerCase().indexOf('iris') >= 0); };
+      // scale `inst` as the tunnel walk (tunnel factor), emit [SCALED] with group 'tunnel'; tstate-clean.
+      ST.scaleTunnel = function(inst, nm, why){
+        var ok = ST.setPlayRate(inst, ST.tunnelFactor);
+        if (ok){ try {
+          ST.scaledNames = ST.scaledNames || {}; var first = (ST.scaledNames[nm] === undefined);
+          ST.scaledNames[nm] = (ST.scaledNames[nm]||0) + 1;
+          ST.scaledGroups = ST.scaledGroups || {}; ST.scaledGroups['tunnel'] = (ST.scaledGroups['tunnel']||0) + 1;
+          if (first) send({t:'scaled', name:nm, factor:ST.tunnelFactor, group:'tunnel', tunnel:why});
+        } catch(e){} }
+        ST.clearExc();
+        return ok;
+      };
+      // FAST PATH (pinned attr known): is the starting interval EXACTLY localAvatar.<tunnelAttr>?
+      // Borrowed dict read (no descriptor call, no ref leak). ATTR-SPECIFIC -> can never match a
+      // different toon interval: the teleport self.track lives under a different attr, so getattr of the
+      // tunnel attr returns the tunnel track (or None), never the teleport track. Runs before the name
+      // table; the tunnel track is unnamed so ordering is harmless, and this keeps identity authoritative.
+      ST.tunnelFastPath = function(inst, nm){
+        try {
+          if (!ST.tunnelAttr) return false;
+          var av = ST.resolveLocalAvatar(); if (av.isNull()) return false;
+          var d = ST.localAvatarDict; if (!d || d.isNull()) return false;
+          var v = ST.DictGetStr(d, Memory.allocUtf8String(ST.tunnelAttr));   // borrowed
+          if (v.isNull()){ ST.clearExc(); return false; }
+          if (!v.equals(inst)) return false;
+          return ST.scaleTunnel(inst, nm, 'pinned');
+        } catch(e){ ST.clearExc(); return false; }
+      };
+      // DISCOVERY (attr not yet pinned): only NAME-UNMATCHED intervals reach here (teleport & co.
+      // returned above via the name table), so this NEVER touches the named teleport self.track. When an
+      // unmatched interval starts within the iris window (an irisTask fired in the same handler --
+      // handleTunnelIn's synchronous base.transitions.irisIn) AND it IS a value in localAvatar's instance
+      // dict, that dict key is the (hashed) tunnel-track attr: pin it (so the fast path scales every
+      // later walk in BOTH directions), log [TUNNELATTR], and scale. The iris gate + avatar-ownership
+      // keep discovery off unrelated intervals. Borrowed dict iteration (no ref leak). tstate-clean.
+      ST.tunnelDiscover = function(inst, nm){
+        try {
+          if ((Date.now() - (ST.lastIrisMs||0)) > ST.irisWindowMs) return false;   // not iris-correlated
+          var av = ST.resolveLocalAvatar(); if (av.isNull()) return false;
+          var d = ST.localAvatarDict; if (!d || d.isNull()) return false;
+          if (!(ST.GetIter && ST.IterNext && ST.AsUTF8 && ST.DictGetItem)) return false;
+          var it = ST.GetIter(d); if (it.isNull()){ ST.clearExc(); return false; }
+          var k, foundKey = null;
+          while (!(k = ST.IterNext(it)).isNull()){
+            var v = ST.DictGetItem(d, k);                            // borrowed value
+            if (!v.isNull() && v.equals(inst)){ try { foundKey = ST.AsUTF8(k).readCString(); } catch(e){ foundKey = null; } break; }
+          }
+          ST.clearExc();
+          if (foundKey === null) return false;
+          ST.tunnelAttr = foundKey;                                  // PIN -> fast path handles both dirs
+          var co = null; try { co = ST.spawnCoName(); } catch(e){ co = null; }
+          try { send({t:'tunnelattr', attr:foundKey, co:co, sample:nm}); } catch(e){}
+          return ST.scaleTunnel(inst, nm, 'discovered');
+        } catch(e){ ST.clearExc(); return false; }
+      };
+
       // GENERIC discovery == payload.py's _apply_after: attr / iname_attr / iname_sub. Every getattr
       // that can miss is followed by clearExc so a failed lookup never leaks onto the tstate.
       ST.applyAfter = function(inst, spec, factorVal){
@@ -391,6 +494,16 @@ rpc.exports = {
             if (nm4.isNull()){ ST.clearExc(); return 0; }
             var nms4 = null; try { nms4 = ST.AsUTF8(nm4).readCString(); } catch(e){ nms4 = null; }
             if (nms4 === null){ ST.clearExc(); return 0; }
+            // (0) IRIS STAMP + (1) TUNNEL WALK BY OBJECT IDENTITY (fast path, pinned attr). The street-
+            // tunnel walk interval is localAvatar.<hashed tunnelTrack attr> -- an UNNAMED Sequence that
+            // matches no name entry -- so it is identified by OBJECT IDENTITY, not name/co_name. The iris
+            // stamp records when the screen iris (irisTask) fires so discovery (below, after the name
+            // table) can correlate handleTunnelIn's synchronous irisIn with the walk's start. The fast
+            // path is attr-specific -> it can only ever match the tunnel track, never the teleport track.
+            if (ST.tunnelEnabled){
+              if (ST.isIrisName(nms4)) ST.lastIrisMs = Date.now();
+              if (ST.tunnelFastPath(inst, nms4)){ ST.clearExc(); return 1; }
+            }
             // CONTEXT SCALING (takes priority over the name table): if a wrap-around context method
             // is on the stack (ST.ctx set), this interval was CREATED inside it -> scale it by the
             // context's factor regardless of its (possibly auto-named/hashed) getName(). ALWAYS log
@@ -451,6 +564,15 @@ rpc.exports = {
                 if (firstSeen) send({t:'scaled', name:nms4, factor:matched.factor, group:matched.group});
               } catch(e){} }
               ST.clearExc(); return okm ? 1 : 0;
+            }
+            // (5) TUNNEL WALK BY OBJECT IDENTITY (discovery). Only NAME-UNMATCHED intervals reach here
+            // (teleport & every named group returned above via the name table), so discovery can NEVER
+            // touch the teleport self.track. When an unmatched interval starts within the iris window AND
+            // it IS a value in localAvatar's instance dict, that attr is the (hashed) tunnel-track attr:
+            // pin it, log [TUNNELATTR], and scale as tunnel. Once pinned, the fast path (above) scales
+            // every later walk in BOTH directions with no iris needed.
+            if (ST.tunnelEnabled && !ST.tunnelAttr){
+              if (ST.tunnelDiscover(inst, nms4)){ ST.clearExc(); return 1; }
             }
             // unmatched: log its NAME once (deduped, capped) so the operator sees what's available,
             // AND log its spawning co_name once per DISTINCT co_name -- so a single street-tunnel
@@ -1163,7 +1285,7 @@ def main():
     # clearing both would fall back to the signature scan (META_INTERVAL_SIG).
     if mode == "modset":
         tbl_path = os.environ.get("TTRMOD_MODSET", os.path.join(ROOT, "modset.json"))
-        entries, log_unmatched, context, spawn_context = load_modset(tbl_path)
+        entries, log_unmatched, context, spawn_context, tunnel_cfg = load_modset(tbl_path)
         if not (ovr_mod and ovr_cls):
             MOD1["override"] = {"module": META_INTERVAL_MODULE, "cls": META_INTERVAL_CLASS}
         MOD1["methods"] = list(META_INTERVAL_SIG)   # signature fallback if the override is cleared
@@ -1173,11 +1295,34 @@ def main():
         env_log = os.environ.get("TTRMOD_LOGNAMES", "")
         if env_log != "":
             want_log = env_log in ("1", "true", "yes")
-        MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log, "spawn": spawn_context}
+        # TUNNEL-IDENTITY: scale the street-tunnel WALK (localAvatar.tunnelTrack) by OBJECT IDENTITY.
+        # From modset.json `tunnel_identity`, with env overrides. attr pinned => skip discovery.
+        tun = {
+            "enabled": bool(tunnel_cfg.get("enabled", True)),
+            "attr":    tunnel_cfg.get("attr"),
+            "factor":  float(tunnel_cfg.get("factor", 4.0)),
+            "iris_window_ms": int(tunnel_cfg.get("iris_window_ms", 200)),
+        }
+        if os.environ.get("TTRMOD_TUNNEL", "") in ("0", "false", "no"):
+            tun["enabled"] = False
+        if os.environ.get("TTRMOD_TUNNEL_ATTR"):
+            tun["attr"] = os.environ["TTRMOD_TUNNEL_ATTR"]
+        if os.environ.get("TTRMOD_TUNNEL_FACTOR"):
+            tun["factor"] = float(os.environ["TTRMOD_TUNNEL_FACTOR"])
+        if os.environ.get("TTRMOD_IRIS_WINDOW_MS"):
+            tun["iris_window_ms"] = int(os.environ["TTRMOD_IRIS_WINDOW_MS"])
+        MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log,
+                        "spawn": spawn_context, "tunnel": tun}
         # wrap-around CONTEXT targets (resolve owning class by the method signature; wrap wrap-around).
         MOD1["context"] = context
         print("[tramp-live] modset: %d active entries; groups=%s; log_unmatched=%s; table=%s" % (
             len(entries), sorted(set(e["group"] for e in entries)), want_log, tbl_path))
+        if tun["enabled"]:
+            print("[tramp-live] modset tunnel-identity: localAvatar.tunnelTrack by OBJECT IDENTITY "
+                  "x%g; attr=%s; iris_window=%dms" % (
+                      tun["factor"], (tun["attr"] or "(auto-discover)"), tun["iris_window_ms"]))
+        else:
+            print("[tramp-live] modset tunnel-identity: DISABLED (TTRMOD_TUNNEL=0)")
         if context:
             print("[tramp-live] modset context: %d wrap-around target(s) -> %s" % (
                 len(context), ", ".join("%s(x%g,%s)" % (c["method"], c["factor"], c["group"]) for c in context)))
@@ -1216,13 +1361,22 @@ def main():
             elif pl.get("t") == "spawnco":
                 box.setdefault("spawncos", []).append(pl.get("co"))
                 print("[SPAWNCO]", pl.get("co"), "(e.g. interval %s)" % pl.get("sample"))
+            elif pl.get("t") == "tunnelattr":
+                box["tunnel_attr"] = pl.get("attr")
+                print("[TUNNELATTR]", pl.get("attr"),
+                      ("co=%s" % pl.get("co")) if pl.get("co") else "",
+                      ("(e.g. %s)" % pl.get("sample")) if pl.get("sample") else "",
+                      "-- localAvatar's hashed tunnel-track attr; pin it in modset.json tunnel_identity.attr")
+            elif pl.get("t") == "avatar":
+                print("[avatar] localAvatar resolved (%s)" % pl.get("tp"))
             elif pl.get("t") == "scaled":
                 box.setdefault("scaled", []).append(pl.get("name"))
-                _ctx = pl.get("ctx"); _co = pl.get("co")
+                _ctx = pl.get("ctx"); _co = pl.get("co"); _tun = pl.get("tunnel")
                 print("[SCALED]", pl.get("name"), "x", pl.get("factor"),
                       ("(%s)" % pl.get("group")) if pl.get("group") else "",
                       ("ctx=%s" % _ctx) if _ctx else "",
-                      ("co=%s" % _co) if _co else "")
+                      ("co=%s" % _co) if _co else "",
+                      ("tunnel=%s" % _tun) if _tun else "")
             elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
@@ -1305,6 +1459,9 @@ def main():
             si = ex.scaledInfo() or {}
             print("[tramp-live] modset scaled by GROUP:", json.dumps(si.get("groups", {})))
             print("[tramp-live] modset scaled by NAME :", json.dumps(si.get("names", {})))
+            if box.get("tunnel_attr"):
+                print("[tramp-live] tunnel walk = localAvatar.%s (discovered by object identity) -- "
+                      "pin it in modset.json tunnel_identity.attr to skip discovery next run" % box["tunnel_attr"])
             if box.get("names"):
                 print("[tramp-live] UNMATCHED interval names seen (%d):" % len(box["names"]))
                 for nm in box["names"]:
