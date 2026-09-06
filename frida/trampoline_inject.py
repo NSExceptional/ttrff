@@ -1233,6 +1233,8 @@ function rpcHook(){ return ST.hook; }
 
 
 def main():
+    try: sys.stdout.reconfigure(line_buffering=True)   # immediate logs even when the runner wraps/pipes stdout (belt-and-suspenders with PYTHONUNBUFFERED)
+    except Exception: pass
     syms = load_symbols()
     missing, tuple_fn = readiness(syms)
     print("[tramp-live] symbols loaded: %d ; tuple builder: %s" % (len(syms), tuple_fn))
