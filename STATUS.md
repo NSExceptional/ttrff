@@ -33,6 +33,13 @@ Last updated 2026-09-05._
 
 ## Current state
 
+**Crash-safe STOP (2026-09-06).** Stop the resident injector with **`scripts/tt-mod-stop`** (stop file) or
+`kill -TERM`, **never Ctrl+C** — the compiled runner dies hard on SIGINT before the host's revert runs,
+which would leave the constantly-firing `MetaInterval.start` trampoline (and the context wraps) dangling →
+instant crash. `tt-mod-stop` makes the host revert EVERY installed wrap, detach cleanly, and exit; if the
+revert can't be confirmed it stays attached (game alive) rather than dropping with wraps live. See
+"Stopping the mods safely" under the `modset` section; offline-proven in `localtest/stoprevert_test.py`.
+
 **Milestone-1 COMPLETE (2026-09-05) — live native dispatch PROVEN end-to-end.** The C-API
 orchestration route is validated on the live hardened engine: install a self-binding native
 trampoline on a real game method → the game's own call runs OUR native `NativeCallback` → the
@@ -622,6 +629,45 @@ trigger animations, printing `[SCALED] <name> x<factor> (<group>)` and `[IVALNAM
 the signature scan `start+setPlayRate+append+clearIntervals`); override the table path with
 `TTRMOD_MODSET`. Offline-validate the table logic first: `localtest/modset_test.py`.
 
+### Stopping the mods safely — use `scripts/tt-mod-stop`, NOT Ctrl+C (2026-09-06)
+
+In persistent "play" mode (`modset`, or any `TTRMOD_POLL=0`) the host stays resident and, on stop, **must
+revert every installed wrap BEFORE the frida session drops.** The trampolines (the `MetaInterval.start`
+wrap-after and the `tunnelOut`/`tunnelIn` context wrap-arounds) live in the **frida agent's memory** and
+die with the session — so any wrap still installed when the session drops points at freed memory, and the
+**constantly-firing `MetaInterval.start` hook crashes the game on the very next interval start.**
+
+- **STOP WITH:** `scripts/tt-mod-stop` (or `kill -TERM <pid>`). It is the RELIABLE, documented stop.
+  ```sh
+  scripts/tt-mod-stop        # drops the stop file, waits for a clean revert + exit
+  ```
+- **DO NOT rely on Ctrl+C.** **Finding (confirmed live):** the compiled runner (`frida/ttr-frida-runner`,
+  launched by `frida/run-injector.sh` under `sudo`) **dies HARD on SIGINT** — the process is torn down
+  **before** the Python host's `except KeyboardInterrupt` revert path runs. The evidence: on the crashing
+  run the tee'd log ended mid-scaling with **no `[reverting]`/`[reverted]`/Ctrl+C lines at all** and
+  `TTREngine` was gone; logs are unbuffered/line-buffered, so a missing line means the code truly never
+  ran. So Ctrl+C leaves the dangling `MetaInterval.start` hook → instant crash. Ctrl+C is kept only as a
+  best-effort belt; it is not trustworthy on this runner.
+- **How the safe stop works (no signals involved):** the resident poll loop watches a **stop file**
+  (`$TTRMOD_STOPFILE`, else `/tmp/ttrmod-stop`). `tt-mod-stop` drops the file; the host then runs the FULL
+  revert, detaches cleanly, removes the file, and exits. `tt-mod-stop` waits until the file is consumed
+  (which happens only after a **confirmed** revert) or the injector process is gone. A **SIGTERM** handler
+  triggers the same graceful revert, so `kill -TERM` is safe too. A stale stop file is cleared at startup.
+- **Revert completeness (audited 2026-09-06):** revert restores **EVERY** installed wrap. Every install
+  now funnels through `ST.recordInstall` into `ST.installed` (the `MetaInterval.start` wrap-after AND every
+  context wrap-around AND the legacy single install), and `revert()` enumerates `ST.installed` as the
+  single source of truth — so no wrap type can be skipped (a skipped wrap alone would dangle and crash on
+  detach). The `tunnel_identity` / `spawn_context` scaling needs **no** separate wrap (it runs *inside* the
+  `start` wrap-after), so it is covered by reverting that one wrap.
+- **Confirmed-or-stay-attached:** revert **detaches only after the revert is confirmed** (the agent's
+  `reverted` message came back AND every `setattr` rc was 0). If it can't confirm within the timeout (e.g.
+  the game is idle/frozen so no Python frame runs the one-shot revert hook), the host **does NOT detach and
+  does NOT exit** — it stays attached (process alive ⇒ trampolines valid ⇒ game alive) rather than dropping
+  with wraps live. Re-run `tt-mod-stop` once the game is responsive.
+- **Offline proof:** `localtest/stoprevert_test.py` (pure Python; drives the real host stop/revert
+  functions) + the revert-completeness assertion added to `localtest/wraparound_test.py` (real CPython 3.8:
+  installs a start-wrap + 4 context wraps, reverts via the `ST.installed` enumeration, asserts none remain).
+
 ### `modset.json` config format
 ```jsonc
 { "log_unmatched": true,
@@ -902,7 +948,7 @@ offline tests.
 | `frida/inject.py` | legacy eval path (marshal.loads + `PyCode_NewWithPosOnlyArgs` + `PyEval_EvalCode`); diagnostic modes `--hello` (+`TTRMOD_HELLOSRC`), `TTRMOD_NOEVAL`, `TTRMOD_TESTOBJ`+`TTRMOD_TESTSRC`, `TTRMOD_LOADONLY`. `Process.setExceptionHandler`→`/tmp/ttrmod-crash.json`; hang → thread `sample()`→`/tmp/ttrmod-sample.json`; self-exits (no 120s hangs). |
 | `frida/ftest.py` | proven bare-attach sanity check |
 | `frida/diag.py` | attach diagnostics |
-| `frida/run-injector.sh` | sudo wrapper (root attach) |
+| `frida/run-injector.sh` | sudo wrapper (root attach). Runs the compiled `ttr-frida-runner`, which **dies hard on SIGINT** → stop the resident injector with `scripts/tt-mod-stop` (stop file) / `kill -TERM`, NOT Ctrl+C. |
 | `frida/ttr-frida-runner` + `.runner-env` | signed/entitled py3.13 + frida17 runner; `debugger.entitlements` |
 | `inproc/payload.py` | the 7 `setPlayRate`-wrapper monkeypatch groups (battle/runin/teleport/tunnel/book/iris) — the logic being ported to native trampolines |
 | `inproc/hud.py` | read-only street HUD (tasks, gags, street name); concatenated ahead of payload for the eval path |
@@ -919,7 +965,8 @@ offline tests.
 | **`localtest/modset_test.py`** | **offline PROOF (PASS) of the `modset` table logic** — discovers the `MetaInterval` by `start+setPlayRate+append+clearIntervals`, wraps `start`, and against a mock scales each started interval with the FIRST-matching table entry's OWN factor/group (teleport 4 / book 3 / iris 3 / tunnel 4), honors first-match ordering (`openBook`→3.0 not the broad `Book`→99.0), leaves unmatched intervals untouched-but-logged, and is junk-safe (getName() raising / returning a non-string → clean, tstate clear). Mirrors the shipping `modset` branch. |
 | **`localtest/spawnctx_test.py`** | **offline PROOF (PASS) of SPAWN-CONTEXT scaling** (approach 2, the CORRECT tunnel fix) — wraps `MetaInterval.start`, and against mock hashed-named `LocalToon` handlers proves: an interval started inside `vlt_handleTunnelOut`/`vlt_handleTunnelIn` (co_name in `spawn_context`) is scaled by the spawn factor (4.0) though its auto-named `vlt8e0d5a85-<n>` name matches no table entry, and the spawning co_name reads back EXACTLY (both directions); an interval started by a different method (`vlt_someOtherAnim`, co_name not in the set) is NOT scaled and its co_name is surfaced in the `[SPAWNCO]` discovery log; the name table still applies to directly-started intervals (`teleportOut`→5.0); tstate clean throughout, original called once. Verifies the CPython 3.8 frame/code/co_name offsets (+0x18/+0x20/+0x70) end-to-end against real 3.8 frames. Mirrors the shipping `spec.mode==='modset'` spawn branch + `ST.spawnCoName`. |
 | **`localtest/tunnelident_test.py`** | **offline PROOF (PASS) of the TUNNEL-WALK-BY-OBJECT-IDENTITY logic** (the CORRECT tunnel fix) — wraps `MetaInterval.start`, resolves a mock `base.localAvatar` exactly as live, and proves the walk (`localAvatar.<hashed tunnelTrack attr>`, an unnamed Sequence) is discovered by object identity on the first iris-correlated arrival (`[TUNNELATTR]` = the hashed attr, never `track`), scaled ×4 (`tunnel`) in BOTH directions (arrival by discovery, departure by the pinned fast path), config-pin works with no iris; the teleport `self.track` (avatar-owned but NAMED, different attr) scales by NAME only and never as tunnel/repins; an avatar-owned no-iris interval + a non-avatar interval are left untouched (iris & ownership gates); junk-safe; tstate clean; reverts. Scale counts tunnel=3/teleport=1/transitions=1. Mirrors the shipping `spec.mode==='modset'` tunnel-identity branch (`resolveLocalAvatar`/`tunnelFastPath`/`tunnelDiscover`). |
-| **`localtest/wraparound_test.py`** | **offline PROOF (PASS) of the wrap-AROUND context-scaling** — resolves a mock `LocalToon` by the `tunnelOut` signature, wraps context methods wrap-around, and against a mock `MetaInterval` proves: (a) an interval started *during* a context method is scaled by the CONTEXT factor and its (hashed `vlt8e0d5a85-…`) name logged with `ctx=tunnel` though it matches no table entry; (b) outside a context, only the name table applies; (c) the context flag clears even when the wrapped method raises (no leaked ctx / tstate exception); (d) nesting/reentrancy saves+restores the outer context. Mirrors the shipping `makeCtxWrap` + `modset` ctx branch. |
+| **`localtest/stoprevert_test.py`** | **offline PROOF (PASS) of the CRASH-SAFE STOP + REVERT** (pure Python — drives the REAL host functions `wait_for_stop`/`revert_and_detach`/`install_sigterm` from `trampoline_inject.py` against a faithful fake agent; no frida/root/target). Proves: the stop file and a real SIGTERM trigger a graceful stop; revert enumerates & restores ALL installed wraps (start-wrap + context wraps + more) so NONE remain; a revert that can't confirm (idle/frozen) — or whose `setattr` fails — does NOT detach (stays attached, game alive); the stop file is consumed on a clean stop; bounded modes still time out; `request_stop` is idempotent; exception-clean throughout. |
+| **`localtest/wraparound_test.py`** | **offline PROOF (PASS) of the wrap-AROUND context-scaling** — resolves a mock `LocalToon` by the `tunnelOut` signature, wraps context methods wrap-around, and against a mock `MetaInterval` proves: (a) an interval started *during* a context method is scaled by the CONTEXT factor and its (hashed `vlt8e0d5a85-…`) name logged with `ctx=tunnel` though it matches no table entry; (b) outside a context, only the name table applies; (c) the context flag clears even when the wrapped method raises (no leaked ctx / tstate exception); (d) nesting/reentrancy saves+restores the outer context; and **(F) REVERT COMPLETENESS** — reverting via the production `ST.installed` enumeration (`recordInstall`/`revertAll`) restores ALL 5 installed wraps (start wrap-after + 4 context wrap-arounds) and a read-back confirms each attr IS the original again, i.e. **none remain installed**. Mirrors the shipping `makeCtxWrap` + `modset` ctx branch + `revert()`. |
 | `lldb/attach.py` | dead lldb path (kept for reference; do not use) |
 | `driver.py` | lldb-era host driver (legacy) |
 | `ttrmod` | bash entrypoint (legacy `--probe`/apply/`--revert` wrapper) |
@@ -945,6 +992,7 @@ Pure bash; deps `winctl`, `magick` (ImageMagick), `tesseract`, `jq`, `awk` — a
 | `scripts/tt-kill` | `scripts/tt-kill [--all]` | SIGTERM→SIGKILL the engine (`TTREngine`) only; `--all` also kills the launcher. |
 | `scripts/tt-recover` | `scripts/tt-recover` | overnight crash/hang recovery: soft fix first (wake / dismiss / re-nav via `tt-to-playground`), then engine-kill + relaunch, then full cold start. |
 | `scripts/tt-sample` | `scripts/tt-sample <interval_ms> <count> <outdir>` | burst-capture timestamped render frames (`frame_<elapsed_ms>.png`) for measuring animation/transition durations. |
+| **`scripts/tt-mod-stop`** | `scripts/tt-mod-stop` | **the SAFE way to stop the resident injector.** Drops the stop file the injector's poll loop watches, then waits until the injector reverts ALL wraps + detaches cleanly + exits (or the process is gone). Use this, **NOT Ctrl+C** — the compiled runner dies hard on SIGINT before the revert runs, dangling the `MetaInterval.start` hook → crash. `$TTRMOD_STOPFILE` overrides the path (default `/tmp/ttrmod-stop`). See "Stopping the mods safely" above. |
 
 **How `tt-state` classifies** (topology → nonblack → pixel probe → OCR; "rough but reliable"):
 - `dead` no engine + no launcher · `launcher` launcher window/proc up, no engine render window ·

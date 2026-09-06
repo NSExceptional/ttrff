@@ -45,16 +45,22 @@ Validate the table logic offline first (no game needed):
 
     python3 localtest/modset_test.py     # via the signed frida runner; see STATUS.md
 
-Then run against the live client (attaches as root, applies the whole table, polls while you
-trigger animations, then reverts cleanly):
+Then run against the live client (attaches as root and applies the whole table, staying resident so
+the mods keep working while you play):
 
-    sudo -n env TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 TTRMOD_POLL=150 \
+    sudo -n env TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 \
         TTRMOD_SCRIPT=frida/trampoline_inject.py frida/run-injector.sh
 
 `TTRMOD_LOGNAMES=1` prints every started interval's name (`[IVALNAME]`) so you can discover
 new ones, and prints `[SCALED] <name> x<factor> (<group>)` each time a match is scaled.
 Trigger animations (teleport via the book, open/close the book, walk through a building door,
-be near a cog battle) to see them speed up. The tool reverts and detaches on its own.
+be near a cog battle) to see them speed up.
+
+**Stop it with `scripts/tt-mod-stop` (from another terminal) — NOT Ctrl+C.** The tool must restore
+the original game methods *before* it detaches; if the frida session drops while the wrapper is still
+installed, the game crashes on the next animation. `tt-mod-stop` triggers that clean revert and waits
+for it. Do **not** use Ctrl+C: the runner dies too hard on SIGINT for the revert to run (`kill -TERM`
+also works). For a time-boxed run that reverts on its own after N seconds, add `TTRMOD_POLL=<seconds>`.
 
 ## Group coverage
 

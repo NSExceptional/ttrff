@@ -27,7 +27,11 @@
 #   (d) nesting/reentrancy is safe -- an outer ctx method (tunnel 4.0) that calls an inner ctx method
 #       (inner 9.0) restores the OUTER ctx on the inner's return: intervals before/after the inner
 #       call scale 4.0, the inner's interval scales 9.0, and ctx is null once the outer returns;
-#   E. tstate clean after every case; original always called once; result passed through.
+#   E. tstate clean after every case; original always called once; result passed through;
+#   F. REVERT COMPLETENESS -- reverting via the production ST.installed enumeration (recordInstall +
+#      revertAll) restores ALL 5 installed wraps (the start wrap-after + all 4 context wrap-arounds);
+#      reading each wrapped attr back confirms it IS the original again, i.e. NONE remain installed
+#      (a skipped wrap would leave a dangling trampoline that crashes the game when the session drops).
 #
 #   run:  sudo -n env PYTHONPATH=/Users/tanner/Library/Python/3.13/lib/python/site-packages \
 #              /opt/homebrew/bin/python3.13 localtest/wraparound_test.py
@@ -200,7 +204,7 @@ rpc.exports = {
       var base = m.base; out.base = base.toString();
       function at(n){ var a = base.add(ptr(p.offsets[n])); out.resolved[n]=a.toString(); return a; }
       ST = {
-        base: base, done:false, keep:[], entries: p.table, logOn: true, log: [],
+        base: base, done:false, keep:[], installed:[], entries: p.table, logOn: true, log: [],
         scaledGroups: {}, scaledNames: [], ctxLog: [],
         ctx: null,                                        // <-- the wrap-around context flag
         frame_eval:  at('_PyEval_EvalFrameDefault'),
@@ -227,6 +231,20 @@ rpc.exports = {
       };
       ST.tpname = function(o){ try { return o.add(8).readPointer().add(0x18).readPointer().readCString(); } catch(e){ return '?'; } };
       ST.clearExc = function(){ try { if (!ST.Occurred().isNull()) ST.Clear(); } catch(e){} };
+      // MIRROR production frida/trampoline_inject.py: every wrap install is recorded in ST.installed
+      // via recordInstall, and revertAll enumerates ST.installed to restore EVERY original (the start
+      // wrap-after AND every context wrap-around). Skipping even one leaves a dangling trampoline.
+      ST.recordInstall = function(cls, mn, orig){ ST.installed.push({cls:cls, mn:mn, orig:orig}); };
+      ST.revertAll = function(){
+        var rcs = [], allOk = true;
+        for (var i=0;i<ST.installed.length;i++){
+          var it = ST.installed[i];
+          var rc = ST.SetAttrStr(it.cls, it.mn, it.orig);
+          rcs.push(rc); if (rc !== 0) allOk = false;
+        }
+        ST.clearExc();
+        return { rc: rcs, all_ok: allOk, n: ST.installed.length };
+      };
       ST.pack1 = function(o){ return ST.TuplePack(1, o); };
       ST.makeFloat = function(v){
         var op = ST.Malloc(0x18); if (op.isNull()) return ptr(0);
@@ -411,6 +429,7 @@ rpc.exports = {
             var mnStart = cstr('start'); ST.keep.push(mnStart);
             var origStart = ST.GetAttrStr(miCls, mnStart); ST.keep.push(origStart);
             ST.SetAttrStr(miCls, mnStart, ST.makeWrapAfter(origStart));
+            ST.recordInstall(miCls, mnStart, origStart);   // the MetaInterval.start wrap-after
 
             // wrap the LocalToon context methods wrap-AROUND (each with its own group/factor).
             var ltCls = ltRec.clsPtr; ST.keep.push(ltCls);
@@ -421,6 +440,7 @@ rpc.exports = {
               ST.keep.push(orig);
               var im = ST.makeCtxWrap(orig, group, factor);
               ST.SetAttrStr(ltCls, mn, im);
+              ST.recordInstall(ltCls, mn, orig);   // a context wrap-around (tunnelOut/.../outerNest)
               return orig;
             }
             var oTunnelOut  = wrapCtx('tunnelOut',       'tunnel', 4.0);
@@ -502,13 +522,23 @@ rpc.exports = {
             R.ctx_logged    = ST.ctxLog.slice().sort();
             R.logged_names  = ST.log.slice().sort();
 
-            // revert every wrap
-            ST.SetAttrStr(miCls, mnStart, origStart);
-            if (oTunnelOut)  ST.SetAttrStr(ltCls, cstr('tunnelOut'),       oTunnelOut);
-            if (oTunnelRais) ST.SetAttrStr(ltCls, cstr('tunnelOutRaises'), oTunnelRais);
-            if (oInner)      ST.SetAttrStr(ltCls, cstr('innerCtx'),        oInner);
-            if (oOuter)      ST.SetAttrStr(ltCls, cstr('outerNest'),       oOuter);
+            // REVERT COMPLETENESS -- revert via the PRODUCTION path: enumerate ST.installed (the
+            // start wrap-after + all 4 context wrap-arounds, recorded via recordInstall) and restore
+            // every original, exactly as frida/trampoline_inject.py's revert() does. Then READ BACK
+            // each wrapped attr and assert it IS the original object again (identity) -- i.e. NONE of
+            // the trampolines remain installed. A wrap the revert skipped would still point at the
+            // agent's (soon-freed) memory and crash the game on the next call once the session drops.
+            var revr = ST.revertAll();
+            R.revert_rc = revr.rc; R.revert_all_ok = revr.all_ok; R.revert_installed_count = revr.n;
+            var remaining = [];
+            for (var ri=0; ri<ST.installed.length; ri++){
+              var it = ST.installed[ri];
+              var cur = ST.GetAttrStr(it.cls, it.mn);
+              if (cur.isNull() || !cur.equals(it.orig)) remaining.push(it.mn.readCString());
+            }
             ST.clearExc();
+            R.revert_remaining_installed = remaining;
+            R.revert_all_restored = (remaining.length === 0);
 
             R.ok = !!(
               R.discovery_pass && R.ctx_wraps_installed &&
@@ -531,7 +561,9 @@ rpc.exports = {
               R.nest.after_inner_rate === 4.0 && R.nest.ctx_cleared_after && R.nest.tstate_clean &&
               // group tally: tunnel = tunnelOut(1) + tunnelOutRaises(1, scaled before it raised) +
               // outerNest(iv1 + iv2 = 2) = 4 ; inner = innerCtx(1) ; teleport = free_matched(1) :
-              R.scaled_groups.tunnel === 4 && R.scaled_groups.inner === 1 && R.scaled_groups.teleport === 1
+              R.scaled_groups.tunnel === 4 && R.scaled_groups.inner === 1 && R.scaled_groups.teleport === 1 &&
+              // (E) REVERT COMPLETENESS: all 5 installed wraps (start + 4 ctx) restored -> none remain:
+              R.revert_installed_count === 5 && R.revert_all_ok === true && R.revert_all_restored === true
             );
             if (!ST.Occurred().isNull()) ST.Clear();
             try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){}
@@ -587,7 +619,8 @@ def main():
         "PASS -- context-scaling reaches the fire-and-forget, hashed-named tunnel-walk interval "
         "(scaled by CREATION CONTEXT, name logged with ctx=tunnel); intervals outside a context go "
         "through the name table unchanged; ctx clears even when the wrapped method raises (no leak); "
-        "nesting saves/restores the outer context; tstate clean throughout"
+        "nesting saves/restores the outer context; tstate clean throughout; and reverting via the "
+        "production ST.installed enumeration restores ALL 5 wraps (start + 4 ctx) -- none remain installed"
         if verdict else "FAIL -- see result above"))
     try: tgt.kill(); session.detach()
     except Exception: pass

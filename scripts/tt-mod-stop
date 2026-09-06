@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# tt-mod-stop -- cleanly STOP the resident TTR mod injector (frida/trampoline_inject.py) so it
+# REVERTS every installed wrap BEFORE the frida session drops. THIS IS THE RELIABLE STOP.
+#
+# Why not Ctrl+C: the injector runs under the compiled runner (frida/ttr-frida-runner, launched by
+# frida/run-injector.sh under sudo), which dies HARD on SIGINT -- the process is torn down before the
+# host's revert path runs. That leaves the constantly-firing MetaInterval.start trampoline (and the
+# tunnelOut context wrap) installed while the frida agent's memory is freed => the game crashes on the
+# very next interval start. (Observed live: the log ended mid-scaling with no [reverting]/[reverted].)
+#
+# How this works: the injector's resident poll loop watches a STOP FILE. This script drops that file;
+# the injector then reverts ALL wraps, detaches cleanly, removes the file, and exits. No signals
+# involved, so it does not depend on Ctrl+C/SIGINT behaving. (SIGTERM is also handled by the injector,
+# so `kill -TERM <pid>` is safe too -- but the stop file is the documented path.)
+#
+#   tt-mod-stop                        drop the stop file, wait for a clean revert + exit
+#   TTRMOD_STOPFILE=/path tt-mod-stop  use a non-default stop-file path (match the injector's env)
+#
+# Exit 0 = injector reverted + exited (or was not running). Exit 1 = timed out (the injector may be
+# STAYING ATTACHED because it could not confirm the revert -- that is the SAFE state, game alive).
+set -euo pipefail
+
+STOPFILE="${TTRMOD_STOPFILE:-/tmp/ttrmod-stop}"
+INJECTOR_PAT="trampoline_inject.py"     # matches the runner argv (and any python host)
+TIMEOUT_TICKS="${TTRMOD_STOP_TICKS:-120}"   # 120 * 0.5s = 60s; revert normally confirms in ms
+TICK=0.5
+
+# Best-effort "is the resident injector still running?" -- it runs as ROOT (sudo), so a non-root
+# `pgrep -f` may not see its argv. Try sudo -n, then a plain -f, then the process NAME (p_comm is
+# readable cross-user; the runner's comm is `ttr-frida-runner`, truncated to 15 chars).
+injector_running() {
+    sudo -n pgrep -f "$INJECTOR_PAT" >/dev/null 2>&1 && return 0
+    pgrep -f "$INJECTOR_PAT"          >/dev/null 2>&1 && return 0
+    pgrep    "ttr-frida-runne"        >/dev/null 2>&1 && return 0
+    return 1
+}
+
+echo "[tt-mod-stop] requesting graceful stop via $STOPFILE"
+echo "[tt-mod-stop] (this is the SAFE way to stop -- Ctrl+C on the runner can crash the game)"
+: > "$STOPFILE"
+
+for _ in $(seq 1 "$TIMEOUT_TICKS"); do
+    # DONE when the injector consumes+removes the stop file -- it does that only AFTER a confirmed
+    # revert + clean detach (the safe teardown), so "file gone" reliably means "mods reverted".
+    if [ ! -e "$STOPFILE" ]; then
+        echo "[tt-mod-stop] stop file consumed -- mods reverted, session detached cleanly. Safe."
+        exit 0
+    fi
+    # Or if the injector process is clearly gone (e.g. it was already dead, or crashed): clean up.
+    if ! injector_running; then
+        echo "[tt-mod-stop] injector process is gone; clearing the stop file."
+        rm -f "$STOPFILE" 2>/dev/null || true
+        exit 0
+    fi
+    sleep "$TICK"
+done
+
+echo "[tt-mod-stop] WARNING: injector still running after ~$(awk "BEGIN{print $TIMEOUT_TICKS*$TICK}")s."
+echo "               It may be STAYING ATTACHED on purpose because it could NOT confirm the revert"
+echo "               (e.g. the game is idle/frozen, so no Python frame runs the revert hook). That is"
+echo "               the SAFE state -- the game stays alive with wraps restored-or-live, no crash."
+echo "               Return to / unfreeze the game, then run tt-mod-stop again, or check the injector log."
+exit 1

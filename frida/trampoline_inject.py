@@ -27,6 +27,7 @@
 import os
 import sys
 import json
+import signal
 import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -218,7 +219,7 @@ rpc.exports = {
         interp_off: p.interp_off, modules_off: p.modules_off,
         frame_off:  p.frame_off, fcode_off: p.fcode_off, coname_off: p.coname_off,
         tmod: p.tmod, tcls: p.tcls, tmeth: p.tmeth,
-        done:false, keep:[],
+        done:false, keep:[], installed:[],
         // WRAP-AROUND CONTEXT (context-scaling). ctx is null except while a wrapped context
         // method (e.g. LocalToon.tunnelOut) is on the stack, when it holds {group, factor, label}.
         // The MetaInterval.start hook scales -- by ctx.factor -- any interval that STARTS while
@@ -281,6 +282,13 @@ rpc.exports = {
       };
       // clear-then-report-done: use for ALL onEnter exits so no exception ever leaks into the game.
       ST.fin = function(r){ ST.clearExc(); try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){} send({t:'done', r:r}); };
+      // RECORD EVERY INSTALLED WRAP IN ONE PLACE. revert() restores exactly what is in ST.installed,
+      // so any wrap that is SetAttrStr'd onto a class MUST be recorded here or revert will skip it --
+      // and a skipped wrap leaves its trampoline (native agent memory) installed, so when the session
+      // drops that method points at freed memory and the game crashes on the very next call. Every
+      // install site (the MetaInterval.start wrap-after, each context wrap-around like tunnelOut, and
+      // the legacy single install) funnels through this; revert enumerates ST.installed to restore ALL.
+      ST.recordInstall = function(cls, mn, orig){ try { ST.installed.push({cls:cls, mn:mn, orig:orig}); } catch(e){} };
 
       // ---- milestone-2: manual PyFloat builder + generic wrap-after (payload.py port) ----
       if (p.floatv){
@@ -1093,7 +1101,7 @@ rpc.exports = {
                   var im0 = ST.makeWrapAfter(orig0, m.spec, m.factor, meth0);
                   if (im0.isNull()){ wired.push({cls:targets[ti].class_name, method:meth0, ok:false, reason:'wrap build NULL'}); continue; }
                   var rc0 = ST.SetAttrStr(cls0, mn0, im0);
-                  ST.installed.push({cls:cls0, mn:mn0, orig:orig0});
+                  ST.recordInstall(cls0, mn0, orig0);   // MetaInterval.start wrap-after -> revert restores it
                   if (rc0 === 0) anyOk = true;
                   wired.push({cls:targets[ti].class_name, method:meth0, ok:(rc0===0), setattr_rc:rc0});
                 }
@@ -1128,7 +1136,7 @@ rpc.exports = {
                   var cim = ST.makeCtxWrap(corig, ce.group, cFactor, ce.method);
                   if (cim.isNull()){ ctxWired.push({method:ce.method, group:ce.group, cls:cchosen[cj].class_name, ok:false, reason:'ctx wrap build NULL'}); continue; }
                   var crc = ST.SetAttrStr(ccls, cmn, cim);
-                  ST.installed.push({cls:ccls, mn:cmn, orig:corig});
+                  ST.recordInstall(ccls, cmn, corig);   // context wrap-around (tunnelOut/...) -> revert restores it
                   if (crc === 0) anyOk = true;
                   ctxWired.push({method:ce.method, group:ce.group, factor:cFactor,
                                  cls:cchosen[cj].class_name, all_direct:cchosen[cj].all_direct,
@@ -1183,6 +1191,7 @@ rpc.exports = {
             // (the trampoline's native code lives in this session's memory; leaving it installed
             // past detach = a dangling call target = crash on the next invocation).
             ST.cls = cls; ST.keep.push(cls); ST.methNameStr = methName; ST.keep.push(methName);
+            ST.recordInstall(cls, methName, orig);   // legacy single install -> revert restores it too
             // ST.fin clears any pending exc, detaches the INTERCEPTOR (not the session — the
             // NativeCallback stays valid while attached), and reports.
             ST.fin({ok:(rc===0), stage:'installed', setattr_rc:rc,
@@ -1207,29 +1216,190 @@ rpc.exports = {
   // Re-arm a one-shot frame-eval hook that setattrs the original back, then detaches.
   revert: function () {
     try {
-      // items = the mod1 multi-method list, else the single legacy install triple.
-      var items = (ST && ST.installed && ST.installed.length) ? ST.installed
-                : ((ST && ST.cls !== undefined) ? [{cls:ST.cls, mn:ST.methNameStr, orig:ST.orig}] : null);
-      if (!items){ return { ok:false, e:'nothing installed' }; }
+      // SINGLE SOURCE OF TRUTH: ST.installed holds EVERY wrap installed via ST.recordInstall --
+      // the MetaInterval.start wrap-after, every context wrap-around (tunnelOut/tunnelIn/...), and
+      // the legacy single install. Enumerate and restore ALL of them; skipping even one leaves a
+      // dangling trampoline that crashes on the next call once the session drops.
+      var items = (ST && ST.installed) ? ST.installed : null;
+      if (!items || !items.length){ return { ok:false, e:'nothing installed' }; }
+      ST.reverted = false;                              // allow a re-arm (host retries if a setattr fails)
       ST.rlistener = Interceptor.attach(ST.hook, {
         onEnter: function () {
-          if (ST.reverted) return; ST.reverted = true;
+          if (ST.reverted) return; ST.reverted = true;  // one-shot, main thread, GIL held
           try {
-            var rcs = [];
-            for (var i=0;i<items.length;i++){ rcs.push(ST.SetAttrStr(items[i].cls, items[i].mn, items[i].orig)); }
+            var rcs = [], allOk = true;
+            for (var i=0;i<items.length;i++){
+              var rc = ST.SetAttrStr(items[i].cls, items[i].mn, items[i].orig);
+              rcs.push(rc); if (rc !== 0) allOk = false;
+            }
             ST.clearExc();
+            // detach the frida Interceptor ONLY after every original is restored, so no wrap is ever
+            // left pointing at freed agent memory. all_ok=false => the host must NOT detach.
             try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){}
-            send({t:'reverted', rc:rcs});
+            send({t:'reverted', rc:rcs, n:items.length, all_ok:allOk});
           } catch(e){ send({t:'reverted', err:String(e)}); }
         }
       });
-      return { ok:true };
+      return { ok:true, n:items.length };
     } catch(e){ return { ok:false, e:String(e) }; }
   }
 };
 // hook address injected by init via a global (kept simple)
 function rpcHook(){ return ST.hook; }
 """
+
+
+# ============================ crash-safe STOP + REVERT (host side) ============================
+# THE STOP PROBLEM. In persistent (modset "play") mode the host stays resident, and on stop it MUST
+# revert every installed wrap BEFORE the frida session drops -- the trampolines live in the agent's
+# memory and die with the session, so any wrap still installed then points at freed memory and the
+# constantly-firing MetaInterval.start hook crashes the game on the very next interval start.
+#
+# Ctrl+C is NOT a trustworthy stop here: the compiled runner (frida/ttr-frida-runner, launched under
+# sudo via frida/run-injector.sh) dies HARD on SIGINT -- the process is torn down before Python's
+# KeyboardInterrupt/`except` revert path runs (observed live: the log ended mid-scaling with NO
+# [reverting]/[reverted]/Ctrl+C lines and TTREngine gone). So the RELIABLE stop is a STOP FILE polled
+# in the resident loop (no signal handling at all): scripts/tt-mod-stop drops it. SIGTERM is ALSO
+# handled (so `kill -TERM` is safe), and Ctrl+C/KeyboardInterrupt is kept as a best-effort belt. All
+# paths converge on revert_and_detach(), which restores EVERY installed wrap and detaches ONLY once
+# the revert is confirmed.
+#
+# These helpers are module-level (not nested in main) so localtest/stoprevert_test.py can drive the
+# REAL logic offline with a faithful fake agent -- no frida, no root, no live game.
+
+DEFAULT_STOPFILE = "/tmp/ttrmod-stop"
+
+
+def stopfile_path():
+    """The stop file the resident loop watches: $TTRMOD_STOPFILE, else /tmp/ttrmod-stop."""
+    return os.environ.get("TTRMOD_STOPFILE") or DEFAULT_STOPFILE
+
+
+def clear_stopfile(stopfile):
+    """Remove the stop file if present (best-effort). Called to clear a STALE file before the loop
+    and to CONSUME it after a confirmed revert+detach, so a leftover never instantly stops a run."""
+    try:
+        if os.path.exists(stopfile):
+            os.remove(stopfile)
+    except Exception:
+        pass
+
+
+def make_stop_state():
+    return {"stop": False, "reason": None}
+
+
+def request_stop(stop, reason):
+    """Mark that a stop was requested (idempotent; the FIRST reason sticks)."""
+    if not stop["stop"]:
+        stop["reason"] = reason
+    stop["stop"] = True
+
+
+def install_sigterm(stop, log=print):
+    """Make `kill -TERM <pid>` trigger the same graceful revert as the stop file: the handler just
+    sets the stop flag; the resident loop notices it within a tick. Returns the previous handler
+    (so callers/tests can restore it)."""
+    def _handler(signum, frame):
+        request_stop(stop, "SIGTERM")
+    try:
+        return signal.signal(signal.SIGTERM, _handler)
+    except Exception:
+        return None
+
+
+def wait_for_stop(box, stop, stopfile, persist, poll_s, fires_fn=None, log=print,
+                  tick=0.5, now_fn=None, sleep_fn=None):
+    """Resident poll loop. Returns the reason it stopped: 'stop-file', a signal reason ('SIGTERM'),
+    'detached', or 'timeout' (bounded modes). The STOP FILE is checked every `tick` so stopping needs
+    no working signal delivery. KeyboardInterrupt propagates to the caller (best-effort belt)."""
+    import time as _time
+    now_fn = now_fn or _time.time
+    sleep_fn = sleep_fn or _time.sleep
+    t0 = now_fn()
+    last = 0
+    last_beat = t0
+    while True:
+        if box.get("detached"):
+            return "detached"
+        if os.path.exists(stopfile):
+            request_stop(stop, "stop-file")
+            return "stop-file"
+        if stop["stop"]:
+            return stop["reason"] or "stop"
+        sleep_fn(tick)
+        f = last
+        if fires_fn is not None:
+            try:
+                f = fires_fn()
+            except Exception:
+                return "detached"        # session gone -> treat as detached
+        now = now_fn()
+        if persist:
+            if now - last_beat >= 30.0:
+                log("[tramp-live] alive - fires=%d (stop with scripts/tt-mod-stop, NOT Ctrl+C)" % f)
+                last_beat = now
+        else:
+            if f != last:
+                log("[tramp-live] fires=%d" % f)
+            if now - t0 >= poll_s:
+                return "timeout"
+        last = f
+
+
+def revert_and_detach(ex, session, box, rev, target_label, alive_check=None,
+                      confirm_timeout=8.0, log=print):
+    """Revert ALL installed wraps, then detach ONLY once the revert is CONFIRMED (the agent's
+    'reverted' message came back AND every setattr rc was 0). If it cannot confirm within the
+    timeout, do NOT detach and do NOT let the process exit -- staying ATTACHED keeps the agent's
+    trampolines valid (game alive), whereas exiting would drop the session with wraps still live and
+    crash the game on the next interval start. Returns True if reverted+detached, False if it gave up
+    because the game process is gone (trampolines then moot) or the session detached under us."""
+    if alive_check is None:
+        alive_check = lambda: subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
+    if box.get("detached"):
+        return False
+    if not alive_check():
+        log("[tramp-live] game already gone - nothing to revert; not detaching")
+        return False
+    log("[tramp-live] reverting (restoring ALL installed wraps: %s) before detach..." % target_label)
+    box["reverted"] = False
+    box["revert_ok"] = None
+    rev.clear()
+    ex.revert()
+    while True:
+        if rev.wait(confirm_timeout):
+            if box.get("revert_ok"):
+                log("[tramp-live] reverted OK - all originals restored; detaching")
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+                return True
+            # the hook fired but a setattr FAILED (a wrap may still dangle) -> re-arm and retry.
+            log("[tramp-live] !! revert reported a FAILED setattr (rc=%s) - NOT detaching; retrying"
+                % box.get("revert_rc"))
+            if box.get("detached") or not alive_check():
+                log("[tramp-live] game gone/detached while retrying - trampolines moot; stopping")
+                return False
+            box["reverted"] = False
+            box["revert_ok"] = None
+            rev.clear()
+            ex.revert()
+            continue
+        # timed out: the one-shot revert hook is still armed (never fired -- game idle/frozen?). Do
+        # NOT clear rev (nothing was set) and do NOT detach. Stay attached so no trampoline dangles.
+        log("[tramp-live] !! revert not confirmed in %gs - NOT detaching. Staying ATTACHED (process "
+            "alive => mods live => game alive) rather than dropping with wraps live. The game may be "
+            "idle/frozen (no Python frames => the revert hook can't fire); use tt-mod-stop again once "
+            "it's responsive." % confirm_timeout)
+        if box.get("detached"):
+            log("[tramp-live] session detached under us while waiting - trampolines moot; stopping")
+            return False
+        if not alive_check():
+            log("[tramp-live] game process gone while waiting - trampolines moot; stopping")
+            return False
+        # loop: keep waiting for the still-armed hook to fire on the next frame.
 
 
 def main():
@@ -1379,7 +1549,16 @@ def main():
                       ("ctx=%s" % _ctx) if _ctx else "",
                       ("co=%s" % _co) if _co else "",
                       ("tunnel=%s" % _tun) if _tun else "")
-            elif pl.get("t") == "reverted": print("[reverted]", json.dumps(pl)); box["reverted"] = True; rev.set()
+            elif pl.get("t") == "reverted":
+                print("[reverted]", json.dumps(pl))
+                rcs = pl.get("rc") or []
+                all_ok = pl.get("all_ok")
+                if all_ok is None:
+                    all_ok = (len(rcs) > 0 and all(x == 0 for x in rcs))
+                box["revert_rc"] = rcs
+                box["revert_ok"] = bool(pl.get("err") is None and all_ok)   # CONFIRMED only if every wrap restored
+                box["reverted"] = True
+                rev.set()
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
     session.on("detached", on_det)
@@ -1421,36 +1600,41 @@ def main():
     else:
         target_label = T_METHOD
         trigger_hint = "trigger '%s' in-game (e.g. walk through a door for a screen wipe)" % T_METHOD
-    # modset is the "play" mode: stay resident until Ctrl+C so the mods keep working
-    # while you play. Test modes keep a bounded poll. TTRMOD_POLL overrides either way
-    # (a number = poll that many seconds; 0 = stay resident regardless of mode).
+    # modset is the "play" mode: stay resident until stopped so the mods keep working while you
+    # play. Test modes keep a bounded poll. TTRMOD_POLL overrides either way (a number = poll that
+    # many seconds; 0 = stay resident regardless of mode).
     poll_env = os.environ.get("TTRMOD_POLL")
     if poll_env is not None:
         poll_s = float(poll_env)
     else:
         poll_s = 0.0 if mode == "modset" else 30.0
     persist = poll_s <= 0
+    # graceful-stop plumbing: the stop FILE (scripts/tt-mod-stop) is the reliable stop; SIGTERM is
+    # handled too; Ctrl+C is only a best-effort belt (the compiled runner dies hard on SIGINT). Clear
+    # any STALE stop file first so a leftover doesn't instantly stop this run.
+    stopfile = stopfile_path()
+    clear_stopfile(stopfile)
+    stop = make_stop_state()
+    prev_sigterm = install_sigterm(stop)
     if persist:
         print("[tramp-live] %s" % trigger_hint)
-        print("[tramp-live] MODS LIVE — leave this running while you play. Press Ctrl+C to stop and cleanly revert.")
+        print("[tramp-live] MODS LIVE — leave this running while you play. To STOP cleanly, run "
+              "`scripts/tt-mod-stop` (or `kill -TERM %d`). Do NOT rely on Ctrl+C — the runner can die "
+              "before the revert runs, which would crash the game." % os.getpid())
+        print("[tramp-live] (stop file: %s)" % stopfile)
     else:
-        print("[tramp-live] %s. Polling %gs..." % (trigger_hint, poll_s))
-    t = time.time(); last = 0; last_beat = t
+        print("[tramp-live] %s. Polling %gs (or stop early with scripts/tt-mod-stop)..." % (trigger_hint, poll_s))
     try:
-        while not box.get("detached"):
-            time.sleep(2.0)
-            try: f = ex.fires()
-            except Exception: break
-            now = time.time()
-            if persist:
-                if now - last_beat >= 30.0:
-                    print("[tramp-live] alive — fires=%d (Ctrl+C to stop + revert)" % f); last_beat = now
-            else:
-                if f != last: print("[tramp-live] fires=%d" % f)
-                if now - t >= poll_s: break
-            last = f
+        reason = wait_for_stop(box, stop, stopfile, persist, poll_s, fires_fn=ex.fires)
     except KeyboardInterrupt:
-        print("\n[tramp-live] Ctrl+C — stopping: reverting mods and detaching cleanly...")
+        request_stop(stop, "Ctrl+C")
+        reason = "Ctrl+C"
+        print("\n[tramp-live] Ctrl+C — stopping (unreliable on this runner; prefer scripts/tt-mod-stop). "
+              "Reverting and detaching cleanly...")
+    if reason in ("stop-file", "SIGTERM"):
+        print("[tramp-live] stop requested via %s — reverting mods and detaching cleanly..." % reason)
+    elif reason == "detached":
+        print("[tramp-live] session detached (game gone?) — skipping revert")
     try:
         ab = ex.appliedBy()
         if ab: print("[tramp-live] appliedBy (method -> #intervals scaled):", json.dumps(ab))
@@ -1475,22 +1659,23 @@ def main():
                     print("    co_name:", co)
         except Exception:
             pass
-    alive = subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
-    print("[tramp-live] final fires=%d  game_alive=%s" % (last, alive))
-    # MUST revert before detaching: the trampoline's native code dies with the session, so a
-    # method still pointing at it would crash on the next call. The game is live (frame-eval
-    # fires constantly), so the revert hook fires within ms.
-    if alive and not box.get("detached"):
-        print("[tramp-live] reverting (restoring original %s) before detach..." % target_label)
-        ex.revert()
-        if rev.wait(8.0):
-            print("[tramp-live] reverted OK — original restored; safe to detach")
-        else:
-            print("[tramp-live] !! revert hook never fired — NOT detaching (a dangling trampoline "
-                  "would crash on next %s). Session left attached; investigate." % target_label)
-            return
     try:
-        session.detach()
+        final_fires = ex.fires()
+    except Exception:
+        final_fires = -1
+    alive = subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
+    print("[tramp-live] final fires=%d  game_alive=%s" % (final_fires, alive))
+    # MUST revert before detaching: the trampolines' native code dies with the session, so any wrap
+    # still installed would crash on the next call. revert_and_detach restores EVERY installed wrap
+    # (MetaInterval.start + every context wrap-around) and detaches ONLY once that is confirmed; if it
+    # can't confirm it STAYS ATTACHED (game alive) rather than dropping with wraps live.
+    revert_and_detach(ex, session, box, rev, target_label)
+    # consume the stop file (we've reverted+detached, or given up because the game is gone) and
+    # restore the previous SIGTERM handler, so a fresh run starts clean.
+    clear_stopfile(stopfile)
+    try:
+        if prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
     except Exception:
         pass
 
