@@ -314,22 +314,28 @@ rpc.exports = {
       // Purpose: attribute each inter-step battle delay to a CLIENT timer (scalable) or a SERVER-gated
       // event (a hard limit). It changes NOTHING -- it installs logging-only wraps that timestamp the
       // key battle events so their ordering + gaps are visible, on top of (and orthogonal to) whatever
-      // scaling the modset is doing. Two layers: (1) METHOD trace -- resolve the battle FSM class by
-      // signature (btSig, the readable methods it defines) and wrap the INBOUND `setState` (the server
-      // state-change: state name + arrival ms) and the OUTBOUND `d_*Done` senders (d_movieDone /
-      // d_faceOffDone / d_rewardDone / d_joinDone -> each is `self.sendUpdate('...Done', ...)`, i.e. the
-      // client reporting a step done EARLY, then idling for the server). We wrap setState (not the FSM
-      // enter* methods) because ClassicFSM CAPTURES `self.enterX` as a bound method at battle __init__
-      // (State.__enterFunc), so replacing enterX on the class is invisible to it -- whereas setState is
-      // the DC field the server calls by name (normal dispatch) and it synchronously drives the enter,
-      // so setState's timestamp == the state-enter time AND names the state. (2) INTERVAL trace -- in the
-      // modset start hook, timestamp when a battle interval (faceoff-battle / movie-track /
-      // movie-reward-track / to-pending) STARTS and read its getDuration()/getPlayRate() (read-only), so
-      // the movie's real end == start + duration/playRate can be compared to when d_movieDone fires.
+      // scaling the modset is doing. HASHING-PROOF: the battle FSM class + the d_*Done helper methods are
+      // per-build HASHED (co_name AND class-dict key), so nothing is named. Two layers:
+      //   (1) METHOD trace -- resolve the battle class by a signature of PRESERVED INBOUND DC field names
+      //       (btSig, default setState+setMembers+setMovie: a DC field's method name is fixed by the wire
+      //       contract -- C++ receiveUpdate calls it by that name -- so it survives obfuscation). Then wrap
+      //       the INBOUND `setState` (server state-change: names the state; we wrap setState not the FSM
+      //       enter* methods because ClassicFSM captures `self.enterX` as a bound method at __init__, so
+      //       replacing enterX on the class is invisible to it -- whereas setState is the DC field the
+      //       server calls by name and it synchronously drives the enter, so its timestamp == the
+      //       state-enter time AND names the state) and the OUTBOUND `sendUpdate` (the readable direct-tree
+      //       DistributedObject sender; d_movieDone/d_faceOffDone/d_rewardDone/d_joinDone are each just
+      //       `self.sendUpdate('<name>Done', ...)`, so wrapping sendUpdate ON THE BATTLE CLASS and logging
+      //       only field names ending in 'Done' captures the client's "step finished" reports by their
+      //       fixed DC string, regardless of the hashed d_* helper name, and scoped to battle objects).
+      //   (2) INTERVAL trace -- in the modset start hook, timestamp when a battle interval (faceoff-battle
+      //       / movie-track / movie-reward-track / to-pending) STARTS and read its getDuration()/
+      //       getPlayRate() (read-only), so the movie's real end == start + duration/playRate can be
+      //       compared to when the outbound movieDone fires.
       ST.bt        = (ST.mod1 && ST.mod1.battletrace) ? ST.mod1.battletrace : null;
       ST.btEnabled = !!(ST.bt && ST.bt.enabled);
       ST.btMethods = (ST.bt && ST.bt.methods && ST.bt.methods.length) ? ST.bt.methods : [];
-      ST.btSig     = (ST.bt && ST.bt.sig && ST.bt.sig.length) ? ST.bt.sig : ['setState', 'd_movieDone'];
+      ST.btSig     = (ST.bt && ST.bt.sig && ST.bt.sig.length) ? ST.bt.sig : ['setState', 'setMembers', 'setMovie'];
       ST.btNames   = (ST.bt && ST.bt.names && ST.bt.names.length) ? ST.bt.names : [];
       ST.btInstalled = false;   // idempotent guard: the FSM class may load only on the first battle
       // TUNNEL-IDENTITY (the street-tunnel WALK). The walk interval is localAvatar.tunnelTrack -- an
@@ -910,26 +916,48 @@ rpc.exports = {
           send({t:'bt', ms:Date.now(), ev:'ival', name:nm, dur:dur, rate:rate});
         } catch(e){ ST.clearExc(); }
       };
-      // Build a LOGGING-ONLY wrap-after (METH_VARARGS|KEYWORDS=0x3): timestamp the call, optionally read a
-      // string arg (setState's state name = args[1]), then call the ORIGINAL exactly once and pass its
-      // result straight through (NULL-on-raise included -- we NEVER clear the ORIGINAL's exception, only
-      // our own arg-read miss, and only BEFORE running the original so it starts clean). Changes nothing.
-      ST.makeTraceWrap = function(orig, label, readStateArg){
+      // Build a LOGGING-ONLY wrap-after (METH_VARARGS|KEYWORDS=0x3): timestamp the call, read the DC
+      // field/state NAME (ob_item[1], a str -- self is ob_item[0]), then call the ORIGINAL exactly once
+      // and pass its result straight through (NULL-on-raise included -- we NEVER clear the ORIGINAL's
+      // exception, only our own arg-read miss, and only BEFORE running the original so it starts clean).
+      // Changes nothing. `kind` selects the HASHING-PROOF signal:
+      //   'setState' -- INBOUND: the server-sent DC field setState(stateName, ts). ob_item[1] is the state
+      //                 name (a str). The battle class is hashed but the DC field NAME setState is fixed by
+      //                 the wire contract (C++ receiveUpdate calls it by that name), so this fires + names
+      //                 the state regardless of the per-build hash.
+      //   'send'     -- OUTBOUND: DistributedObject.sendUpdate(fieldName, args). ob_item[1] is the DC field
+      //                 name (a str). We log ONLY when it ends in 'Done' (movieDone/faceOffDone/rewardDone/
+      //                 joinDone -- the client's "step finished" reports); every other sendUpdate passes
+      //                 through silently. `d_movieDone` etc. are hashed, but the STRING they pass to
+      //                 sendUpdate is the fixed DC field name, so the name is visible here regardless.
+      //   null       -- plain timestamp under `label` (legacy: a readable d_*Done, if ever un-hashed).
+      ST.makeTraceWrap = function(orig, label, kind){
         var cb = new NativeCallback(function (self, args, kwargs) {
           try {
-            var state = null;
-            if (readStateArg && ST.AsUTF8){
+            var arg1 = null;
+            if (kind && ST.AsUTF8){
               try {
-                var n = args.add(0x10).readS64().toNumber();          // tuple ob_size
+                var n = args.add(0x10).readS64().toNumber();          // tuple ob_size (self is ob_item[0])
                 if (n >= 2){
-                  var sObj = args.add(0x18 + 8).readPointer();        // ob_item[1] = state name (a str)
-                  if (!sObj.isNull()){ try { state = ST.AsUTF8(sObj).readCString(); } catch(e){ state = null; } }
+                  var sObj = args.add(0x18 + 8).readPointer();        // ob_item[1] = state / DC field name (a str)
+                  if (!sObj.isNull()){ try { arg1 = ST.AsUTF8(sObj).readCString(); } catch(e){ arg1 = null; } }
                 }
-              } catch(e){ state = null; }
+              } catch(e){ arg1 = null; }
               ST.clearExc();   // clear any exc from OUR arg read BEFORE the original runs (never leak into it)
             }
-            try { ST.btFires = (ST.btFires||0) + 1; } catch(e){}
-            send({t:'bt', ms:Date.now(), ev:'m', label:label, state:state});
+            if (kind === 'send'){
+              // OUTBOUND: only the DC done-reports (field name ends in 'Done'); other sendUpdates are ignored.
+              if (arg1 && arg1.length >= 4 && arg1.slice(-4) === 'Done'){
+                try { ST.btFires = (ST.btFires||0) + 1; } catch(e){}
+                send({t:'bt', ms:Date.now(), ev:'m', dir:'out', label:arg1, field:arg1, state:null});
+              }
+            } else if (kind === 'setState'){
+              try { ST.btFires = (ST.btFires||0) + 1; } catch(e){}
+              send({t:'bt', ms:Date.now(), ev:'m', dir:'in', label:'setState', state:arg1});
+            } else {
+              try { ST.btFires = (ST.btFires||0) + 1; } catch(e){}
+              send({t:'bt', ms:Date.now(), ev:'m', dir:'out', label:label, state:null});
+            }
           } catch(e){ ST.clearExc(); }
           return ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original once; result passed through UNTOUCHED
         }, 'pointer', ['pointer','pointer','pointer']);
@@ -1090,14 +1118,24 @@ rpc.exports = {
       };
       // ================================ end shared block ================================
 
-      // Install the BATTLETRACE method wraps (READ-ONLY). Resolve the battle FSM class by signature
-      // (btSig -- readable methods it defines, default setState+d_movieDone -> DistributedBattleBase),
-      // preferring the class that defines them DIRECTLY, then install a logging-only wrap on each btMethod
-      // that is a real function on the class (a hashed/absent one is reported + skipped, never fatal).
-      // Idempotent (ST.btInstalled). Called eagerly at arm (if the battle module is already loaded, i.e.
-      // you are in a battle) AND lazily from the modset start hook on the first battle interval (so it
-      // still arms if you attach BEFORE the fight). Every wrap is recorded in ST.installed -> reverted on
-      // stop like any other. Pure resolution + setattr; clears the tstate on exit.
+      // Install the BATTLETRACE method wraps (READ-ONLY), HASHING-PROOF. The battle FSM class + its
+      // d_*Done senders are per-build HASHED (co_name AND class-dict key), so we never name them. Instead:
+      //   * RESOLVE the battle class by a signature of PRESERVED INBOUND DC field names (btSig, default
+      //     setState+setMembers+setMovie): a DC field's method name is fixed by the wire contract (C++
+      //     receiveUpdate calls it by that name), so it survives the obfuscator -- setState+setMembers+
+      //     setMovie together uniquely pick out DistributedBattleBase. Prefer the class defining them
+      //     DIRECTLY.
+      //   * WRAP each btMethod (default setState + sendUpdate) ON THAT CLASS. `setState` is defined there
+      //     (INBOUND server state, ob_item[1]=state name). `sendUpdate` is INHERITED from DistributedObject
+      //     (readable direct-tree method; GetAttrStr walks the MRO to it) -- setting the wrap on the battle
+      //     class SCOPES it to battle objects only (no global hot path) and captures OUTBOUND done-reports
+      //     by the DC field string (ob_item[1] ending in 'Done'), regardless of the hashed d_* helper name.
+      // A hashed/absent method is reported + skipped, never fatal. Idempotent (ST.btInstalled). Called
+      // eagerly at arm (if the battle module is already loaded = you are in a battle) AND lazily from the
+      // modset start hook on the first battle interval (so it still arms if you attach BEFORE the fight).
+      // Every wrap is recorded in ST.installed -> reverted on stop like any other (reverting an inherited
+      // wrap re-sets the real inherited function as an own attr: behaviourally identical, changes nothing).
+      // Pure resolution + setattr; clears the tstate on exit.
       ST.installBattleTrace = function(md){
         try {
           if (!ST.btEnabled || ST.btInstalled) return null;
@@ -1113,16 +1151,17 @@ rpc.exports = {
           for (var i=0;i<ST.btMethods.length;i++){
             var meth = ST.btMethods[i];
             var mn = Memory.allocUtf8String(meth);
-            var orig = ST.GetAttrStr(cls, mn);
+            var orig = ST.GetAttrStr(cls, mn);   // walks the MRO -> finds inherited sendUpdate too
             if (orig.isNull()){ ST.clearExc(); wired.push({method:meth, ok:false, reason:'absent/hashed'}); continue; }
             var otn = ST.tpname(orig);
             if (otn !== 'function'){ ST.clearExc(); wired.push({method:meth, ok:false, reason:'not a function ('+otn+')'}); continue; }
             ST.keep.push(orig); ST.keep.push(mn);
-            var im = ST.makeTraceWrap(orig, meth, (meth === 'setState'));
+            var kind = (meth === 'setState') ? 'setState' : ((meth === 'sendUpdate') ? 'send' : null);
+            var im = ST.makeTraceWrap(orig, meth, kind);
             if (im.isNull()){ wired.push({method:meth, ok:false, reason:'wrap build NULL'}); continue; }
             var rc = ST.SetAttrStr(cls, mn, im);
             ST.recordInstall(cls, mn, orig);   // revert restores it
-            wired.push({method:meth, ok:(rc===0), setattr_rc:rc});
+            wired.push({method:meth, ok:(rc===0), kind:kind, setattr_rc:rc});
           }
           ST.clearExc();
           var info = {cls:rec.class_name, sig:ST.btSig, all_direct:rec.all_direct,
@@ -1740,19 +1779,24 @@ def main():
 
     # BATTLETRACE (READ-ONLY diagnosis): TTRMOD_BATTLETRACE=1 layers timestamped logging on top of the
     # (unchanged) modset run so each inter-step battle delay can be attributed to a CLIENT timer or a
-    # SERVER-gated event. It installs NOTHING that changes gameplay -- only logging wraps on the battle
-    # FSM class's INBOUND setState + OUTBOUND d_*Done senders, plus a start-timestamp/duration line for
-    # battle intervals. All env-overridable: TTRMOD_BT_METHODS (methods to trace), TTRMOD_BT_SIG (the
-    # readable signature that resolves the battle FSM class), TTRMOD_BT_NAMES (battle interval substrings).
+    # SERVER-gated event. It installs NOTHING that changes gameplay. HASHING-PROOF: the battle class and
+    # its d_*Done senders are per-build hashed, so we never name them -- we (a) resolve the battle class by
+    # a signature of PRESERVED INBOUND DC field names (setState+setMembers+setMovie; DC field method names
+    # are fixed by the wire contract, so they survive the obfuscator), then (b) wrap INBOUND `setState`
+    # (server state + name) and OUTBOUND `sendUpdate` (the readable direct-tree sender; we log only field
+    # names ending in 'Done' = the client's step-finished reports, whose NAME is the fixed DC string even
+    # though d_movieDone itself is hashed), plus a start-timestamp/duration line for battle intervals.
+    # All env-overridable: TTRMOD_BT_METHODS (methods to wrap), TTRMOD_BT_SIG (the preserved-name signature
+    # that resolves the battle class), TTRMOD_BT_NAMES (battle interval substrings).
     bt_on = os.environ.get("TTRMOD_BATTLETRACE", "") in ("1", "true", "yes")
     bt_methods = [s.strip() for s in os.environ.get(
-        "TTRMOD_BT_METHODS", "setState,d_movieDone,d_faceOffDone,d_rewardDone,d_joinDone").split(",") if s.strip()]
-    bt_sig = [s.strip() for s in os.environ.get("TTRMOD_BT_SIG", "setState,d_movieDone").split(",") if s.strip()]
+        "TTRMOD_BT_METHODS", "setState,sendUpdate").split(",") if s.strip()]
+    bt_sig = [s.strip() for s in os.environ.get("TTRMOD_BT_SIG", "setState,setMembers,setMovie").split(",") if s.strip()]
     bt_names = [s.strip() for s in os.environ.get(
         "TTRMOD_BT_NAMES", "faceoff-battle,movie-track,movie-reward-track,to-pending").split(",") if s.strip()]
     MOD1["battletrace"] = {"enabled": bt_on, "methods": bt_methods, "sig": bt_sig, "names": bt_names}
     if bt_on:
-        print("[tramp-live] BATTLETRACE ON (read-only): trace methods=%s ; resolve battle FSM by sig=%s ; "
+        print("[tramp-live] BATTLETRACE ON (read-only): wrap methods=%s ; resolve battle class by sig=%s ; "
               "battle intervals=%s" % ("/".join(bt_methods), "+".join(bt_sig), ",".join(bt_names)))
 
     mode = os.environ.get("TTRMOD_MODE", "install")
@@ -1889,11 +1933,13 @@ def main():
                       ("tunnel=%s" % _tun) if _tun else "")
             elif pl.get("t") == "btinstall":
                 info = pl.get("info") or {}
-                print("[BTINSTALL] battle FSM class=%s module=%s (sig=%s, all_direct=%s):" % (
+                print("[BTINSTALL] battle class=%s module=%s (sig=%s, all_direct=%s):" % (
                     info.get("cls"), info.get("module"), "+".join(info.get("sig") or []), info.get("all_direct")))
                 for w in info.get("wired") or []:
-                    print("            %-16s -> %s%s" % (
+                    role = {"setState": "INBOUND server state", "send": "OUTBOUND done-reports"}.get(w.get("kind"), "")
+                    print("            %-16s -> %s%s%s" % (
                         w.get("method"), "OK" if w.get("ok") else "FAIL",
+                        (" [%s]" % role) if (w.get("ok") and role) else "",
                         "" if w.get("ok") else " (%s)" % w.get("reason")))
             elif pl.get("t") == "bt":
                 # timestamped battle event. Print relative ms (to the first bt event) so gaps read at a
@@ -1905,10 +1951,11 @@ def main():
                 box.setdefault("bt", []).append({"rel": rel, **pl})
                 if pl.get("ev") == "m":
                     label = pl.get("label"); state = pl.get("state")
-                    if label == "setState":
+                    is_in = (pl.get("dir") == "in") or (label == "setState")
+                    if is_in:
                         print("[BT] +%7dms  <- setState  state=%s   (INBOUND: server drives the FSM here)" % (rel, state))
                     else:
-                        print("[BT] +%7dms  -> %s   (OUTBOUND: client reports this step done, then idles for the server)" % (rel, label))
+                        print("[BT] +%7dms  -> sendUpdate('%s')   (OUTBOUND: client reports this step done, then idles for the server)" % (rel, label))
                 elif pl.get("ev") == "ival":
                     d = pl.get("dur"); r = pl.get("rate")
                     ds = ("%.3fs" % d) if isinstance(d, (int, float)) else str(d)
@@ -2007,10 +2054,10 @@ def main():
     except Exception:
         pass
     # BATTLE TIMELINE (read-only diagnosis): the ordered, timestamped battle events with the gap since the
-    # previous event. Read the gaps like this: an OUTBOUND d_*Done followed by a large gap then an INBOUND
-    # setState => that step is SERVER-GATED (the client finished + reported early, then waited on the
-    # server) and is NOT client-reducible; a gap bounded by a client interval's own duration/timer =>
-    # CLIENT-side and scalable. Hand this block back for the per-delay attribution.
+    # previous event. Read the gaps like this: an OUTBOUND sendUpdate('...Done') followed by a large gap
+    # then an INBOUND setState => that step is SERVER-GATED (the client finished + reported early, then
+    # waited on the server) and is NOT client-reducible; a step that advances with NO intervening inbound
+    # setState after its done-report => client-driven and scalable. Hand this block back for attribution.
     bt = box.get("bt") or []
     if bt:
         print("[tramp-live] ===== BATTLE TIMELINE (%d events; relMs = ms since first event) =====" % len(bt))
@@ -2020,10 +2067,10 @@ def main():
             gap = "" if prev is None else "  (+%dms since prev)" % (rel - prev)
             prev = rel
             if e.get("ev") == "m":
-                if e.get("label") == "setState":
+                if (e.get("dir") == "in") or (e.get("label") == "setState"):
                     desc = "<- INBOUND  setState state=%s" % e.get("state")
                 else:
-                    desc = "-> OUTBOUND %s (client done -> idles for server)" % e.get("label")
+                    desc = "-> OUTBOUND sendUpdate('%s') (client done -> idles for server)" % e.get("label")
             else:
                 d = e.get("dur"); r = e.get("rate")
                 ds = ("%.3fs" % d) if isinstance(d, (int, float)) else str(d)

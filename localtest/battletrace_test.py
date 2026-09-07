@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
-# localtest/battletrace_test.py -- OFFLINE validation of the READ-ONLY BATTLETRACE mechanism that ships
-# in frida/trampoline_inject.py (TTRMOD_BATTLETRACE=1). BATTLETRACE changes NOTHING about gameplay: it
-# only timestamps + logs the key battle events so their ordering + inter-step gaps are measurable, to
-# attribute each delay to a CLIENT timer (scalable) or a SERVER-gated event (a hard limit). It has two
-# layers, BOTH exercised here against stock arm64 CPython 3.8 with faithful mocks:
+# localtest/battletrace_test.py -- OFFLINE validation of the READ-ONLY, HASHING-PROOF BATTLETRACE that
+# ships in frida/trampoline_inject.py (TTRMOD_BATTLETRACE=1). BATTLETRACE changes NOTHING about gameplay:
+# it only timestamps + logs the key battle events so their ordering + inter-step gaps are measurable, to
+# attribute each delay to a CLIENT timer (scalable) or a SERVER-gated event (a hard limit).
 #
-#   (1) METHOD trace: resolve the battle FSM class by SIGNATURE (setState+d_movieDone -> the real
-#       DistributedBattleBase; a decoy defining only setState is NOT chosen), then install a LOGGING-ONLY
-#       wrap-after on the INBOUND `setState` (reads the state-name arg = args[1]) and the OUTBOUND
-#       `d_*Done` senders. Each wrap timestamps (Date.now()), calls the ORIGINAL exactly once, and passes
-#       its result straight through.
+# The live TTR client per-build HASHES the battle FSM class AND the d_*Done "step finished" helper methods
+# (co_name and class-dict key alike), so neither can be named. The mocks here model that faithfully and
+# prove the tracer captures the signal WITHOUT naming any hashed thing, against stock arm64 CPython 3.8:
+#
+#   (1) METHOD trace (hashing-proof): resolve the battle class by a signature of PRESERVED INBOUND DC
+#       FIELD names [setState,setMembers,setMovie] (a DC field method name is fixed by the wire contract,
+#       so it survives obfuscation) -- NOT the hashed class/helper names. Decoys (setState-only, and
+#       setState+setMembers-but-no-setMovie) are excluded. Then install LOGGING-ONLY wrap-afters on:
+#         * INBOUND  `setState`   -- reads the state-name arg (ob_item[1]); the server's clock.
+#         * OUTBOUND `sendUpdate` -- inherited from the readable DistributedObject base, wrapped ON the
+#           battle class (scoped to battle objects). The hashed d_*Done helpers each call
+#           self.sendUpdate('<name>Done', ...), so reading ob_item[1] and logging only names ending in
+#           'Done' captures the outbound reports by their FIXED DC string. A non-'Done' sendUpdate
+#           (requestAttack) is driven too and must NOT be logged.
+#       Each wrap timestamps (Date.now()), calls the ORIGINAL exactly once, passes its result through.
 #   (2) INTERVAL trace: the modset start hook, on a battle-named interval (faceoff-battle / movie-track /
 #       movie-reward-track / to-pending), timestamps the START and reads getDuration()/getPlayRate()
 #       (read-only) via the inlined-PyFloat recipe (ob_type==PyFloat_Type -> double @ +0x10).
 #
 # Asserts:
-#   A. discovery: the battle class is found by the [setState,d_movieDone] signature (exactly the mock,
-#      not the setState-only decoy);
-#   B. all 5 trace methods wire (installed as functions);
+#   A. discovery: the battle class is found by the [setState,setMembers,setMovie] signature (exactly the
+#      mock, neither decoy) -- i.e. resolvable WITHOUT the hashed class name;
+#   B. both wrap methods wire (setState direct + sendUpdate inherited, installed as functions);
 #   C. a scripted 2-round battle (join -> faceoff -> waitforinput -> playmovie -> reward) produces the
-#      EXPECTED ordered event stream, each event carrying the right label / state / interval-name+duration;
+#      EXPECTED ordered stream: inbound setState (with state name), outbound sendUpdate done-reports
+#      captured by DC field name (joinDone/faceOffDone/movieDone/rewardDone), interval start+duration --
+#      and the non-'Done' requestAttack is absent (filter proof);
 #   D. TIMESTAMPS are present + monotonic non-decreasing, and advance across a deliberate spin (round-2
 #      events strictly later than round-1) -- i.e. the ms clock is real, so live gaps will be meaningful;
-#   E. PASS-THROUGH: every wrapped method ran its ORIGINAL exactly once (recorded on the mock) and its
-#      return value was passed through unchanged (distinct sentinels); interval start() passed through too;
+#   E. PASS-THROUGH: every wrapped original ran once (recorded on the mock, in order) and its return value
+#      passed through unchanged (setState->8001; each hashed helper returns sendUpdate's 8010, proving the
+#      sendUpdate wrap passed through); interval start() passed its sentinel through too;
 #   F. tstate CLEAN after every call;
-#   G. REVERT via ST.installed restores EVERY wrap: after revert, driving setState fires NO trace event
-#      (and the original still runs), and the class attr identity is back to the original;
+#   G. REVERT via ST.installed restores EVERY wrap: after revert, driving setState AND a hashed outbound
+#      helper fires NO trace event (originals still run: 8001 / 8010), and both class attrs are plain
+#      functions again;
 #   H. the target stays ALIVE throughout.
 #
 #   run:  sudo -n env TTRMOD_SCRIPT=localtest/battletrace_test.py frida/run-injector.sh
@@ -87,39 +100,67 @@ def resolve_offsets(dylib):
     return offs
 
 
-# Target program: a mock battle FSM (setState + the d_*Done senders, each recording its call and returning
-# a distinct sentinel so pass-through is checkable) under a fake vault-hashed module, a decoy class that
-# defines ONLY setState (must NOT be chosen by the [setState,d_movieDone] signature), a mock MetaInterval,
-# and the battle interval instances + arg constants in __main__. Busy loop keeps _PyEval_EvalFrameDefault
-# firing (main thread, GIL held).
+# Target program: a mock battle class (preserved inbound DC fields setState/setMembers/setMovie + HASHED
+# d_*Done helpers that reach the wire only via an inherited, readable sendUpdate on a DistributedObject
+# base) under a fake vault-hashed module; two decoys (setState-only, and setState+setMembers) that the
+# [setState,setMembers,setMovie] signature must NOT choose; a mock MetaInterval; and the battle interval
+# instances + arg constants in __main__. Each mock method records its call + returns a distinct sentinel so
+# pass-through is checkable. Busy loop keeps _PyEval_EvalFrameDefault firing (main thread, GIL held).
 TARGET_PROG = r"""
 import sys, types, time
 
 def _make_battle():
-    class DistributedBattleMock:
+    # Faithful model of the LIVE HASHING. The obfuscator renames a method's co_name AND its class-dict key
+    # identically -- so the battle class itself and its d_*Done "step finished" helpers are unreadable by
+    # name. What SURVIVES (and what the hashing-proof tracer keys off) is the DC WIRE CONTRACT:
+    #   * INBOUND DC field methods keep their names (C++ receiveUpdate calls them by the DC field name) ->
+    #     setState / setMembers / setMovie stay readable and are the resolve signature.
+    #   * OUTBOUND goes through DistributedObject.sendUpdate(fieldName, ...), a readable direct-tree method
+    #     whose STRING arg is the fixed DC field name -- even though the d_*Done helper that calls it is
+    #     hashed.
+    class DistributedObjectMock:
+        # the readable Panda base: sendUpdate carries the DC field name as a str arg (the outbound
+        # chokepoint). Records the call + returns a distinct sentinel so pass-through is checkable.
+        def sendUpdate(self, fieldName, args=[], sendToId=None):
+            self.calls.append(('sendUpdate', fieldName)); return 8010
+
+    class DistributedBattleMock(DistributedObjectMock):
         def __init__(self):
-            self.calls = []          # (method, args) in call order -- proves the ORIGINAL ran
+            self.calls = []          # (method, ...) in call order -- proves each ORIGINAL ran
+        # INBOUND DC fields -- names fixed by the wire contract (the resolve signature):
         def setState(self, state, ts):
             self.calls.append(('setState', state, ts)); return 8001
-        def d_faceOffDone(self, toonId):
-            self.calls.append(('d_faceOffDone', toonId)); return 8002
-        def d_movieDone(self, toonId):
-            self.calls.append(('d_movieDone', toonId)); return 8003
-        def d_rewardDone(self, toonId):
-            self.calls.append(('d_rewardDone', toonId)); return 8004
-        def d_joinDone(self, toonId, avId):
-            self.calls.append(('d_joinDone', toonId, avId)); return 8005
-        # a few non-traced methods, for realism
+        def setMembers(self, *a):
+            self.calls.append(('setMembers',)); return 8006
+        def setMovie(self, *a):
+            self.calls.append(('setMovie',)); return 8007
+        # OUTBOUND done-reports -- HASHED method names (the tracer never references them); each reaches the
+        # wire ONLY via self.sendUpdate('<name>Done', ...) with the PRESERVED DC field string, and RETURNS
+        # sendUpdate's result (so the driven return proves the wrapped sendUpdate passed its original through).
+        def vlt0a1b(self, toonId):            # was d_joinDone   -> sendUpdate('joinDone')
+            self.calls.append(('d_joinDone', toonId)); return self.sendUpdate('joinDone', [toonId])
+        def vlt2c3d(self, toonId):            # was d_faceOffDone-> sendUpdate('faceOffDone')
+            self.calls.append(('d_faceOffDone', toonId)); return self.sendUpdate('faceOffDone', [])
+        def vlt4e5f(self, toonId):            # was d_movieDone  -> sendUpdate('movieDone')
+            self.calls.append(('d_movieDone', toonId)); return self.sendUpdate('movieDone', [])
+        def vlt6a7b(self, toonId):            # was d_rewardDone -> sendUpdate('rewardDone')
+            self.calls.append(('d_rewardDone', toonId)); return self.sendUpdate('rewardDone', [])
+        # a NON-done sendUpdate (field does NOT end in 'Done') -- must NOT be traced (filter proof):
+        def vlt8c9d(self, *a):                # was d_requestAttack -> sendUpdate('requestAttack')
+            self.calls.append(('d_requestAttack',)); return self.sendUpdate('requestAttack', [1, 2, 3])
         def enterPlayMovie(self, ts): pass
-        def d_timeout(self, toonId): pass
     return DistributedBattleMock
 
-# decoy: has setState but NOT d_movieDone -> the signature [setState,d_movieDone] must skip it
-def _make_decoy():
+# decoys: a plain DistributedObject with setState (like MANY DOs) must NOT match the battle signature; and
+# a near-miss with setState+setMembers but NOT setMovie proves all three preserved fields are required.
+def _make_decoys():
     class NotTheBattle:
         def setState(self, *a): return -1
-        def d_faceOffDone(self, *a): return -1   # even sharing some names, it lacks d_movieDone
-    return NotTheBattle
+        def sendUpdate(self, *a): return -1
+    class AlmostBattle:
+        def setState(self, *a): return -1
+        def setMembers(self, *a): return -1
+    return NotTheBattle, AlmostBattle
 
 # mock Panda MetaInterval: getName / getDuration / getPlayRate for the interval trace; start() is the
 # wrap-after target (returns a sentinel = pass-through; resets play_rate = proves wrap-AFTER);
@@ -144,7 +185,7 @@ _bmod.DistributedBattle = _make_battle()
 sys.modules["vlt24ab6c6d.vltbattle.vltDistributedBattle"] = _bmod
 
 _dmod = types.ModuleType("decoy_battle_mod")
-_dmod.NotTheBattle = _make_decoy()
+_dmod.NotTheBattle, _dmod.AlmostBattle = _make_decoys()
 sys.modules["decoy_battle_mod"] = _dmod
 
 _mmod = types.ModuleType("vlt1609aac2.vltinterval.vltMetaInterval")
@@ -253,21 +294,31 @@ rpc.exports = {
           ST.btLog.push({seq: ST.seq++, ms: Date.now(), ev:'ival', name:nm, dur:dur, rate:rate});
         } catch(e){ ST.clearExc(); }
       };
-      ST.makeTraceWrap = function(orig, label, readStateArg){
+      // kind: 'setState' (INBOUND, ob_item[1]=state name) | 'send' (OUTBOUND sendUpdate, ob_item[1]=DC
+      // field name; logged only when it ends in 'Done') | null (plain label). Mirrors trampoline_inject.py.
+      ST.makeTraceWrap = function(orig, label, kind){
         var cb = new NativeCallback(function (self, args, kwargs) {
           try {
-            var state = null;
-            if (readStateArg && ST.AsUTF8){
+            var arg1 = null;
+            if (kind && ST.AsUTF8){
               try {
-                var n = args.add(0x10).readS64().toNumber();
+                var n = args.add(0x10).readS64().toNumber();          // tuple ob_size (self is ob_item[0])
                 if (n >= 2){
-                  var sObj = args.add(0x18 + 8).readPointer();      // ob_item[1] = state name
-                  if (!sObj.isNull()){ try { state = ST.AsUTF8(sObj).readCString(); } catch(e){ state = null; } }
+                  var sObj = args.add(0x18 + 8).readPointer();        // ob_item[1] = state / DC field name
+                  if (!sObj.isNull()){ try { arg1 = ST.AsUTF8(sObj).readCString(); } catch(e){ arg1 = null; } }
                 }
-              } catch(e){ state = null; }
+              } catch(e){ arg1 = null; }
               ST.clearExc();
             }
-            ST.btLog.push({seq: ST.seq++, ms: Date.now(), ev:'m', label:label, state:state});
+            if (kind === 'send'){
+              if (arg1 && arg1.length >= 4 && arg1.slice(-4) === 'Done'){
+                ST.btLog.push({seq: ST.seq++, ms: Date.now(), ev:'m', dir:'out', label:arg1, field:arg1, state:null});
+              }
+            } else if (kind === 'setState'){
+              ST.btLog.push({seq: ST.seq++, ms: Date.now(), ev:'m', dir:'in', label:'setState', state:arg1});
+            } else {
+              ST.btLog.push({seq: ST.seq++, ms: Date.now(), ev:'m', dir:'out', label:label, state:null});
+            }
           } catch(e){ ST.clearExc(); }
           return ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original once; result passed through
         }, 'pointer', ['pointer','pointer','pointer']);
@@ -299,11 +350,12 @@ rpc.exports = {
             var otn = ST.tpname(orig);
             if (otn !== 'function'){ ST.clearExc(); wired.push({method:meth, ok:false, reason:'not a function ('+otn+')'}); continue; }
             ST.keep.push(orig); ST.keep.push(mn);
-            var im = ST.makeTraceWrap(orig, meth, (meth === 'setState'));
+            var kind = (meth === 'setState') ? 'setState' : ((meth === 'sendUpdate') ? 'send' : null);
+            var im = ST.makeTraceWrap(orig, meth, kind);
             if (im.isNull()){ wired.push({method:meth, ok:false, reason:'wrap NULL'}); continue; }
             var rc = ST.SetAttrStr(cls, mn, im);
             ST.recordInstall(cls, mn, orig);
-            wired.push({method:meth, ok:(rc===0), setattr_rc:rc});
+            wired.push({method:meth, ok:(rc===0), kind:kind, setattr_rc:rc});
           }
           ST.clearExc();
           return {cls:rec.class_name, all_direct:rec.all_direct, wired:wired, clsPtr:cls};
@@ -417,7 +469,8 @@ rpc.exports = {
             if (md.isNull()){ send({t:'done', r:{ok:false, stage:'no sys.modules'}}); return; }
             var main = ST.AddModule(cstr('__main__'));
 
-            // A: discover the battle FSM class by the [setState,d_movieDone] signature (decoy excluded)
+            // A: discover the battle class by the PRESERVED-name signature [setState,setMembers,setMovie]
+            // (both decoys -- setState-only, and setState+setMembers-but-no-setMovie -- must be excluded)
             var found = ST.scanBySignature(md, ST.btSig);
             var names = {}; for (var i=0;i<found.length;i++){ names[found[i].class_name] = found[i]; }
             R.found_names = Object.keys(names).sort();
@@ -470,23 +523,28 @@ rpc.exports = {
             function spin(ms){ var t0 = Date.now(); while (Date.now() - t0 < ms){ /* burn wall-clock so timestamps advance */ } }
 
             // ===== scripted 2-round battle =====
+            // The OUTBOUND helpers are driven by their HASHED names (vlt*) -- simulating the client's own
+            // internal call -- but the tracer never references those names: it captures each via the
+            // sendUpdate wrap by the DC field string. A non-'Done' sendUpdate (requestAttack) is driven too
+            // and must NOT be traced.
             R.drive = {};
             // round 1: run-in join -> faceoff -> waitforinput
             R.drive.to_pending = startIval('to_pending_ival');            // ival trace
-            R.drive.d_joinDone = callM('d_joinDone', [iarg, avid]);       // OUTBOUND
+            R.drive.d_joinDone = callM('vlt0a1b', [iarg]);                // OUTBOUND -> sendUpdate('joinDone')
             R.drive.setFaceOff = callM('setState', [sFace, iarg]);        // INBOUND state=FaceOff
             R.drive.faceoff    = startIval('faceoff_ival');               // ival trace
-            R.drive.d_faceOff  = callM('d_faceOffDone', [iarg]);          // OUTBOUND
+            R.drive.d_faceOff  = callM('vlt2c3d', [iarg]);                // OUTBOUND -> sendUpdate('faceOffDone')
             R.drive.setWait    = callM('setState', [sWait, iarg]);        // INBOUND state=WaitForInput
             var round1_maxseq = ST.seq - 1;
+            R.drive.reqAttack  = callM('vlt8c9d', [iarg]);                // NON-done sendUpdate -> must NOT trace
             spin(6);                                                       // advance the clock a measurable amount
             // round 2: playmovie -> reward
             R.drive.setPlay    = callM('setState', [sPlay, iarg]);        // INBOUND state=PlayMovie
             R.drive.movie      = startIval('movie_ival');                 // ival trace
-            R.drive.d_movie    = callM('d_movieDone', [iarg]);            // OUTBOUND
+            R.drive.d_movie    = callM('vlt4e5f', [iarg]);                // OUTBOUND -> sendUpdate('movieDone')
             R.drive.setReward  = callM('setState', [sReward, iarg]);      // INBOUND state=Reward
             R.drive.reward     = startIval('reward_ival');                // ival trace
-            R.drive.d_reward   = callM('d_rewardDone', [iarg]);           // OUTBOUND
+            R.drive.d_reward   = callM('vlt6a7b', [iarg]);                // OUTBOUND -> sendUpdate('rewardDone')
 
             R.btlog = ST.btLog.slice();
             R.round1_maxseq = round1_maxseq;
@@ -511,33 +569,38 @@ rpc.exports = {
             for (var k=0;k<ST.installed.length;k++){ ST.SetAttrStr(ST.installed[k].cls, ST.installed[k].mn, ST.installed[k].orig); }
             ST.clearExc();
             var log_len_before = ST.btLog.length;
-            var post = callM('setState', [sAfter, iarg]);                 // should NOT trace now
+            var post = callM('setState', [sAfter, iarg]);                 // INBOUND: should NOT trace now
+            var postOut = callM('vlt4e5f', [iarg]);                       // OUTBOUND sendUpdate('movieDone'): NOT traced now
             R.revert = {
-              btlog_grew: (ST.btLog.length !== log_len_before),           // must be false
-              post_ret: post.ret,                                         // 8001 -> original still ran
-              post_tstate_clean: post.tstate_clean,
+              btlog_grew: (ST.btLog.length !== log_len_before),           // must be false (neither wrap fires)
+              post_ret: post.ret,                                         // 8001 -> setState original still ran
+              post_out_ret: postOut.ret,                                  // 8010 -> sendUpdate original still ran
+              post_tstate_clean: (post.tstate_clean && postOut.tstate_clean),
             };
-            // class attr identity restored?
-            var setNow = ST.GetAttrStr(bt.clsPtr, cstr('setState'));
-            var origSet = null; for (var q=0;q<ST.installed.length;q++){ if (ST.installed[q].mn === undefined) continue; }
-            R.revert.setState_is_function_again = (ST.tpname(setNow) === 'function');
+            // class attr identity restored (both wraps reverted to plain functions)?
+            var setNow  = ST.GetAttrStr(bt.clsPtr, cstr('setState'));
+            var sendNow = ST.GetAttrStr(bt.clsPtr, cstr('sendUpdate'));
+            R.revert.setState_is_function_again   = (ST.tpname(setNow)  === 'function');
+            R.revert.sendUpdate_is_function_again = (ST.tpname(sendNow) === 'function');
 
             // ===== verdict =====
             var lg = R.btlog;
             function ev(i){ return lg[i] || {}; }
+            // OUTBOUND events carry the DC FIELD NAME as the label (captured from sendUpdate's str arg);
+            // the non-'Done' requestAttack sendUpdate is filtered out, so it never appears here.
             var expected = [
               {ev:'ival', name:'to-pending-toon-42', dur:1.20},
-              {ev:'m', label:'d_joinDone'},
-              {ev:'m', label:'setState', state:'FaceOff'},
+              {ev:'m', dir:'out', label:'joinDone'},
+              {ev:'m', dir:'in',  label:'setState', state:'FaceOff'},
               {ev:'ival', name:'faceoff-battle77', dur:3.50},
-              {ev:'m', label:'d_faceOffDone'},
-              {ev:'m', label:'setState', state:'WaitForInput'},
-              {ev:'m', label:'setState', state:'PlayMovie'},
+              {ev:'m', dir:'out', label:'faceOffDone'},
+              {ev:'m', dir:'in',  label:'setState', state:'WaitForInput'},
+              {ev:'m', dir:'in',  label:'setState', state:'PlayMovie'},
               {ev:'ival', name:'movie-track', dur:6.00},
-              {ev:'m', label:'d_movieDone'},
-              {ev:'m', label:'setState', state:'Reward'},
+              {ev:'m', dir:'out', label:'movieDone'},
+              {ev:'m', dir:'in',  label:'setState', state:'Reward'},
               {ev:'ival', name:'movie-reward-track', dur:4.00},
-              {ev:'m', label:'d_rewardDone'},
+              {ev:'m', dir:'out', label:'rewardDone'},
             ];
             R.expected_len = expected.length; R.got_len = lg.length;
             var order_ok = (lg.length === expected.length);
@@ -546,6 +609,7 @@ rpc.exports = {
               if (g.ev !== x.ev){ order_ok = false; break; }
               if (x.ev === 'm'){
                 if (g.label !== x.label){ order_ok = false; break; }
+                if (x.dir !== undefined && g.dir !== x.dir){ order_ok = false; break; }
                 if (x.state !== undefined && g.state !== x.state){ order_ok = false; break; }
               } else {
                 if (g.name !== x.name){ order_ok = false; break; }
@@ -567,13 +631,16 @@ rpc.exports = {
             for (var s=0;s<lg.length;s++){ if (lg[s].seq <= R.round1_maxseq) r1last = lg[s].ms; else if (r2first === null) r2first = lg[s].ms; }
             R.clock_advanced = (r1last !== null && r2first !== null && r2first > r1last);
 
-            // pass-through + tstate clean for driven methods
+            // pass-through + tstate clean for driven methods. The OUTBOUND helpers are HASHED + UNWRAPPED,
+            // so each returns whatever the (wrapped) sendUpdate returned -> 8010 proves the sendUpdate wrap
+            // passed its original through. setState (wrapped) returns its own 8001. reqAttack is the
+            // non-'Done' sendUpdate (still returns 8010; its wrap fired but logged nothing).
             var drives = [R.drive.d_joinDone, R.drive.setFaceOff, R.drive.d_faceOff, R.drive.setWait,
-                          R.drive.setPlay, R.drive.d_movie, R.drive.setReward, R.drive.d_reward];
-            var expect_ret = {d_joinDone:8005, setState:8001, d_faceOffDone:8002, d_movieDone:8003, d_rewardDone:8004};
+                          R.drive.reqAttack, R.drive.setPlay, R.drive.d_movie, R.drive.setReward, R.drive.d_reward];
             R.passthrough_ok = (
-              R.drive.d_joinDone.ret === 8005 && R.drive.d_faceOff.ret === 8002 &&
-              R.drive.d_movie.ret === 8003 && R.drive.d_reward.ret === 8004 &&
+              R.drive.d_joinDone.ret === 8010 && R.drive.d_faceOff.ret === 8010 &&
+              R.drive.d_movie.ret === 8010 && R.drive.d_reward.ret === 8010 &&
+              R.drive.reqAttack.ret === 8010 &&
               R.drive.setFaceOff.ret === 8001 && R.drive.setWait.ret === 8001 &&
               R.drive.setPlay.ret === 8001 && R.drive.setReward.ret === 8001 &&
               // interval starts passed their sentinels through:
@@ -583,19 +650,21 @@ rpc.exports = {
             R.tstate_ok = drives.every(function(d){ return d.tstate_clean; }) &&
                           R.drive.to_pending.tstate_clean && R.drive.faceoff.tstate_clean &&
                           R.drive.movie.tstate_clean && R.drive.reward.tstate_clean;
-            // mock recorded exactly the 8 traced method calls (snapshotted BEFORE the revert+post drive)
-            // in order -> every wrapped original ran once, args reached it. (The post-revert original
-            // running is proven separately by R.revert.post_ret === 8001.)
-            R.mock_calls_ok = (
-              R.mock_calls.length === 8 &&
-              R.mock_calls[0] === 'd_joinDone' && R.mock_calls[1] === 'setState' &&
-              R.mock_calls[2] === 'd_faceOffDone' && R.mock_calls[3] === 'setState' &&
-              R.mock_calls[4] === 'setState' && R.mock_calls[5] === 'd_movieDone' &&
-              R.mock_calls[6] === 'setState' && R.mock_calls[7] === 'd_rewardDone'
-            );
+            // mock recorded EVERY original in order (snapshotted BEFORE the revert+post drive): each hashed
+            // helper ran once, then called the REAL sendUpdate with its DC field, interleaved with setState.
+            // 14 entries: helper, sendUpdate, setState, helper, sendUpdate, setState, (reqAttack helper,
+            // sendUpdate), setState, helper, sendUpdate, setState, helper, sendUpdate.
+            var mc = R.mock_calls;
+            var mc_expect = ['d_joinDone','sendUpdate','setState','d_faceOffDone','sendUpdate','setState',
+                             'd_requestAttack','sendUpdate','setState','d_movieDone','sendUpdate','setState',
+                             'd_rewardDone','sendUpdate'];
+            R.mock_calls_ok = (mc.length === mc_expect.length);
+            for (var mci=0; mci<mc_expect.length && R.mock_calls_ok; mci++){ if (mc[mci] !== mc_expect[mci]) R.mock_calls_ok = false; }
 
             R.revert_ok = (R.revert.btlog_grew === false && R.revert.post_ret === 8001 &&
-                           R.revert.post_tstate_clean === true && R.revert.setState_is_function_again === true);
+                           R.revert.post_out_ret === 8010 && R.revert.post_tstate_clean === true &&
+                           R.revert.setState_is_function_again === true &&
+                           R.revert.sendUpdate_is_function_again === true);
 
             R.ok = !!(
               R.discovery_pass && R.all_wired && R.order_ok && R.ts_present && R.ts_monotonic &&
@@ -621,8 +690,8 @@ def main():
     tgt = subprocess.Popen([TARGET_PY, "-c", TARGET_PROG]); time.sleep(0.4)
     print("[battletrace] target_py=%s pid=%d" % (TARGET_PY, tgt.pid))
 
-    BT_METHODS = ["setState", "d_movieDone", "d_faceOffDone", "d_rewardDone", "d_joinDone"]
-    BT_SIG = ["setState", "d_movieDone"]
+    BT_METHODS = ["setState", "sendUpdate"]                        # INBOUND state + OUTBOUND done-reports
+    BT_SIG = ["setState", "setMembers", "setMovie"]               # preserved inbound DC field names
     BT_NAMES = ["faceoff-battle", "movie-track", "movie-reward-track", "to-pending"]
 
     done = threading.Event(); box = {}
@@ -657,10 +726,12 @@ def main():
     verdict = bool(r.get("ok") and alive)
     print("[battletrace] target_alive=%s" % alive)
     print("[battletrace] VERDICT: %s" % (
-        "PASS -- battletrace resolves the battle FSM class by signature, installs read-only logging wraps "
-        "on setState + the d_*Done senders, timestamps an ordered battle event stream (inbound setState / "
-        "outbound d_*Done / interval start+duration), passes every original through unchanged, keeps the "
-        "tstate clean, and reverts fully via ST.installed"
+        "PASS -- battletrace resolves the battle class HASHING-PROOF (preserved inbound DC field signature "
+        "setState+setMembers+setMovie, never the hashed class/helper names), installs read-only logging "
+        "wraps on the inbound setState + the inherited outbound sendUpdate (capturing the hashed d_*Done "
+        "reports by their fixed DC field string, filtering non-'Done'), timestamps an ordered event stream "
+        "(inbound setState / outbound done-report / interval start+duration), passes every original through "
+        "unchanged, keeps the tstate clean, and reverts fully via ST.installed"
         if verdict else "FAIL -- see result above"))
     try: tgt.kill(); session.detach()
     except Exception: pass
