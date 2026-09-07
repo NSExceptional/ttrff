@@ -310,6 +310,28 @@ rpc.exports = {
       }
       ST.mod1 = p.mod1 || null;
       ST.probeAttrs = !!(ST.mod1 && ST.mod1.probe_attrs);   // mod1 first-fire __dict__ diagnostic
+      // ---- BATTLETRACE (READ-ONLY diagnosis, TTRMOD_BATTLETRACE=1) ----
+      // Purpose: attribute each inter-step battle delay to a CLIENT timer (scalable) or a SERVER-gated
+      // event (a hard limit). It changes NOTHING -- it installs logging-only wraps that timestamp the
+      // key battle events so their ordering + gaps are visible, on top of (and orthogonal to) whatever
+      // scaling the modset is doing. Two layers: (1) METHOD trace -- resolve the battle FSM class by
+      // signature (btSig, the readable methods it defines) and wrap the INBOUND `setState` (the server
+      // state-change: state name + arrival ms) and the OUTBOUND `d_*Done` senders (d_movieDone /
+      // d_faceOffDone / d_rewardDone / d_joinDone -> each is `self.sendUpdate('...Done', ...)`, i.e. the
+      // client reporting a step done EARLY, then idling for the server). We wrap setState (not the FSM
+      // enter* methods) because ClassicFSM CAPTURES `self.enterX` as a bound method at battle __init__
+      // (State.__enterFunc), so replacing enterX on the class is invisible to it -- whereas setState is
+      // the DC field the server calls by name (normal dispatch) and it synchronously drives the enter,
+      // so setState's timestamp == the state-enter time AND names the state. (2) INTERVAL trace -- in the
+      // modset start hook, timestamp when a battle interval (faceoff-battle / movie-track /
+      // movie-reward-track / to-pending) STARTS and read its getDuration()/getPlayRate() (read-only), so
+      // the movie's real end == start + duration/playRate can be compared to when d_movieDone fires.
+      ST.bt        = (ST.mod1 && ST.mod1.battletrace) ? ST.mod1.battletrace : null;
+      ST.btEnabled = !!(ST.bt && ST.bt.enabled);
+      ST.btMethods = (ST.bt && ST.bt.methods && ST.bt.methods.length) ? ST.bt.methods : [];
+      ST.btSig     = (ST.bt && ST.bt.sig && ST.bt.sig.length) ? ST.bt.sig : ['setState', 'd_movieDone'];
+      ST.btNames   = (ST.bt && ST.bt.names && ST.bt.names.length) ? ST.bt.names : [];
+      ST.btInstalled = false;   // idempotent guard: the FSM class may load only on the first battle
       // TUNNEL-IDENTITY (the street-tunnel WALK). The walk interval is localAvatar.tunnelTrack -- an
       // UNNAMED Sequence (auto-named vlt8e0d5a85-<n>) built + start()ed by the HASHED handlers
       // handleTunnelOut/handleTunnelIn and stored under a HASHED attr -- so it matches NO name entry and
@@ -604,6 +626,14 @@ rpc.exports = {
             if (nm4.isNull()){ ST.clearExc(); return 0; }
             var nms4 = null; try { nms4 = ST.AsUTF8(nm4).readCString(); } catch(e){ nms4 = null; }
             if (nms4 === null){ ST.clearExc(); return 0; }
+            // BATTLETRACE (READ-ONLY, runs BEFORE any scaling; changes nothing). When a battle interval
+            // starts: (a) lazily arm the method wraps if the FSM class only loaded now (idempotent), and
+            // (b) emit a timestamped [BT] line with its base duration + current playRate. This does not
+            // return -- the interval then flows through the normal scaling path below, unchanged.
+            if (ST.btEnabled && ST.btHit(nms4)){
+              if (!ST.btInstalled){ try { ST.installBattleTrace(null); } catch(e){ ST.clearExc(); } }
+              ST.btEmitIval(inst, nms4);
+            }
             // (0) IRIS STAMP + (1) TUNNEL WALK BY OBJECT IDENTITY (fast path, pinned attr). The iris stamp
             // records when the screen iris (irisTask) fires so BOTH tunnel-arrival paths -- the LocalToon-
             // method+iris check (4.5) and the object-identity discovery (5) -- can correlate handleTunnelIn's
@@ -838,6 +868,81 @@ rpc.exports = {
         ST.keep.push(im); return im;
       };
 
+      // ---- BATTLETRACE helpers (READ-ONLY) ----
+      // Read a Python float's C double WITHOUT a C-API call: PyFloat_AsDouble is inlined away in the
+      // engine, but the layout is fixed -- if ob_type == &PyFloat_Type, the double lives at +0x10
+      // (STATUS.md recipe). Returns null for a non-float / null obj. Never raises, never leaks an exc.
+      ST.floatDouble = function(obj){
+        try {
+          if (!obj || obj.isNull()) return null;
+          if (ST.FloatType && obj.add(8).readPointer().equals(ST.FloatType)) return obj.add(0x10).readDouble();
+          return null;
+        } catch(e){ return null; }
+      };
+      // Call a no-arg method that returns a float (getDuration / getPlayRate) and read it as a JS number.
+      // Pure read (these are const accessors on a Panda interval); any miss clears the tstate (crash-guard).
+      ST.callFloat0 = function(inst, name){
+        try {
+          if (!ST.TupleNew) return null;
+          var m = ST.GetAttrStr(inst, Memory.allocUtf8String(name));
+          if (m.isNull()){ ST.clearExc(); return null; }
+          var r = ST.Call(m, ST.TupleNew(0), ptr(0));
+          if (r.isNull()){ ST.clearExc(); return null; }
+          var d = ST.floatDouble(r);
+          ST.clearExc();
+          return d;
+        } catch(e){ ST.clearExc(); return null; }
+      };
+      // Is this interval name one of the battle intervals we trace?
+      ST.btHit = function(nm){
+        if (!nm || !ST.btNames.length) return false;
+        for (var i=0;i<ST.btNames.length;i++){ if (ST.btNames[i] && nm.indexOf(ST.btNames[i]) >= 0) return true; }
+        return false;
+      };
+      // Emit a timestamped [BT] interval line: when a battle interval STARTED, its base duration, and its
+      // CURRENT playRate (as read right after the game's own start(); the modset's setPlayRate has not run
+      // yet at this point, so rate here is the CLIENT's own rate -- proving the client does not natively
+      // speed the movie and OUR mod is what scales it). Real playback == dur / (playRate * modFactor).
+      ST.btEmitIval = function(inst, nm){
+        try {
+          var dur = ST.callFloat0(inst, 'getDuration');
+          var rate = ST.callFloat0(inst, 'getPlayRate');
+          send({t:'bt', ms:Date.now(), ev:'ival', name:nm, dur:dur, rate:rate});
+        } catch(e){ ST.clearExc(); }
+      };
+      // Build a LOGGING-ONLY wrap-after (METH_VARARGS|KEYWORDS=0x3): timestamp the call, optionally read a
+      // string arg (setState's state name = args[1]), then call the ORIGINAL exactly once and pass its
+      // result straight through (NULL-on-raise included -- we NEVER clear the ORIGINAL's exception, only
+      // our own arg-read miss, and only BEFORE running the original so it starts clean). Changes nothing.
+      ST.makeTraceWrap = function(orig, label, readStateArg){
+        var cb = new NativeCallback(function (self, args, kwargs) {
+          try {
+            var state = null;
+            if (readStateArg && ST.AsUTF8){
+              try {
+                var n = args.add(0x10).readS64().toNumber();          // tuple ob_size
+                if (n >= 2){
+                  var sObj = args.add(0x18 + 8).readPointer();        // ob_item[1] = state name (a str)
+                  if (!sObj.isNull()){ try { state = ST.AsUTF8(sObj).readCString(); } catch(e){ state = null; } }
+                }
+              } catch(e){ state = null; }
+              ST.clearExc();   // clear any exc from OUR arg read BEFORE the original runs (never leak into it)
+            }
+            try { ST.btFires = (ST.btFires||0) + 1; } catch(e){}
+            send({t:'bt', ms:Date.now(), ev:'m', label:label, state:state});
+          } catch(e){ ST.clearExc(); }
+          return ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original once; result passed through UNTOUCHED
+        }, 'pointer', ['pointer','pointer','pointer']);
+        ST.keep.push(cb);
+        var mname = Memory.allocUtf8String('ttrmod_bt'); ST.keep.push(mname);
+        var mdef = Memory.alloc(32); ST.keep.push(mdef);
+        mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
+        var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
+        ST.keep.push(cfunc);
+        var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
+        ST.keep.push(im); return im;
+      };
+
       // ===================== SHARED with localtest/findcls_test.py (verbatim) =====================
       // Find a target class by the METHODS it defines (the robust replacement for resolving a
       // vault-HASHED class by module/name -- LocalToon loads under vlt24ab6c6d.<hash>.<hash>).
@@ -984,6 +1089,48 @@ rpc.exports = {
         return outl;
       };
       // ================================ end shared block ================================
+
+      // Install the BATTLETRACE method wraps (READ-ONLY). Resolve the battle FSM class by signature
+      // (btSig -- readable methods it defines, default setState+d_movieDone -> DistributedBattleBase),
+      // preferring the class that defines them DIRECTLY, then install a logging-only wrap on each btMethod
+      // that is a real function on the class (a hashed/absent one is reported + skipped, never fatal).
+      // Idempotent (ST.btInstalled). Called eagerly at arm (if the battle module is already loaded, i.e.
+      // you are in a battle) AND lazily from the modset start hook on the first battle interval (so it
+      // still arms if you attach BEFORE the fight). Every wrap is recorded in ST.installed -> reverted on
+      // stop like any other. Pure resolution + setattr; clears the tstate on exit.
+      ST.installBattleTrace = function(md){
+        try {
+          if (!ST.btEnabled || ST.btInstalled) return null;
+          if (!(ST.GetAttrStr && ST.SetAttrStr && ST.scanBySignature)){ ST.clearExc(); return null; }
+          md = md || ST.sysmodules(); if (md.isNull()){ ST.clearExc(); return null; }
+          var found = ST.scanBySignature(md, ST.btSig);
+          if (!found || !found.length){ ST.clearExc(); return null; }   // battle module not loaded yet -> retry later
+          var direct = found.filter(function(r){ return r.all_direct; });
+          var rec = direct.length ? direct[0] : found[0];
+          var cls = rec.clsPtr; ST.keep.push(cls);
+          ST.btInstalled = true;   // set BEFORE wiring so a re-entrant start() can't double-install
+          var wired = [];
+          for (var i=0;i<ST.btMethods.length;i++){
+            var meth = ST.btMethods[i];
+            var mn = Memory.allocUtf8String(meth);
+            var orig = ST.GetAttrStr(cls, mn);
+            if (orig.isNull()){ ST.clearExc(); wired.push({method:meth, ok:false, reason:'absent/hashed'}); continue; }
+            var otn = ST.tpname(orig);
+            if (otn !== 'function'){ ST.clearExc(); wired.push({method:meth, ok:false, reason:'not a function ('+otn+')'}); continue; }
+            ST.keep.push(orig); ST.keep.push(mn);
+            var im = ST.makeTraceWrap(orig, meth, (meth === 'setState'));
+            if (im.isNull()){ wired.push({method:meth, ok:false, reason:'wrap build NULL'}); continue; }
+            var rc = ST.SetAttrStr(cls, mn, im);
+            ST.recordInstall(cls, mn, orig);   // revert restores it
+            wired.push({method:meth, ok:(rc===0), setattr_rc:rc});
+          }
+          ST.clearExc();
+          var info = {cls:rec.class_name, sig:ST.btSig, all_direct:rec.all_direct,
+                      module:(rec.bindings && rec.bindings[0] ? rec.bindings[0].module : '?'), wired:wired};
+          try { send({t:'btinstall', info:info}); } catch(e){}
+          return info;
+        } catch(e){ ST.clearExc(); return null; }
+      };
 
       out.ok = !!ST.pack1; return out;
     } catch(e){ out.notes.push('init ex: '+e); return out; }
@@ -1276,11 +1423,22 @@ rpc.exports = {
                   ltInfo.note = 'LocalToon not resolved at install (walk in-world first?); retries per iris-correlated start';
                 }
               }
+              // BATTLETRACE (READ-ONLY): resolve the battle FSM class by signature and install logging
+              // wraps on setState + the d_*Done senders. Best-effort here (needs the battle module loaded
+              // = you are already in a battle); otherwise the modset start hook installs it lazily on the
+              // first battle-named interval. Reverted via ST.installed like any wrap.
+              var btInfo = {enabled: ST.btEnabled};
+              if (ST.btEnabled){
+                try { var bi = ST.installBattleTrace(mods0); if (bi){ btInfo.installed = true; btInfo.cls = bi.cls; btInfo.wired = bi.wired; }
+                      else { btInfo.installed = false; btInfo.note = 'battle FSM class not resolved at install (be IN a battle, or it arms lazily on the first battle interval)'; } }
+                catch(e){ ST.clearExc(); }
+                btInfo.methods = ST.btMethods; btInfo.sig = ST.btSig; btInfo.names = ST.btNames;
+              }
               ST.fin({ok:anyOk, stage:'mod1_installed',
                       resolved_by: (m.override && m.override.module ? 'override' : 'signature-scan'),
                       targets: targets.map(function(t){ return {module:t.module, attr:t.attr, class_name:t.class_name, all_direct:t.all_direct}; }),
                       methods: m.methods, attr: m.spec.attr, factor: m.factor,
-                      wired: wired, ctx_wired: ctxWired, ltiris: ltInfo,
+                      wired: wired, ctx_wired: ctxWired, ltiris: ltInfo, battletrace: btInfo,
                       note:'wrap-after live; walk into a street tunnel to see it fire + speed the walk'});
             } catch(e){ ST.fin({ok:false, stage:'mod1 ex', e:String(e)}); }
             return;
@@ -1580,6 +1738,23 @@ def main():
     if os.environ.get("TTRMOD_FACTOR"):
         MOD1["factor"] = float(os.environ["TTRMOD_FACTOR"])
 
+    # BATTLETRACE (READ-ONLY diagnosis): TTRMOD_BATTLETRACE=1 layers timestamped logging on top of the
+    # (unchanged) modset run so each inter-step battle delay can be attributed to a CLIENT timer or a
+    # SERVER-gated event. It installs NOTHING that changes gameplay -- only logging wraps on the battle
+    # FSM class's INBOUND setState + OUTBOUND d_*Done senders, plus a start-timestamp/duration line for
+    # battle intervals. All env-overridable: TTRMOD_BT_METHODS (methods to trace), TTRMOD_BT_SIG (the
+    # readable signature that resolves the battle FSM class), TTRMOD_BT_NAMES (battle interval substrings).
+    bt_on = os.environ.get("TTRMOD_BATTLETRACE", "") in ("1", "true", "yes")
+    bt_methods = [s.strip() for s in os.environ.get(
+        "TTRMOD_BT_METHODS", "setState,d_movieDone,d_faceOffDone,d_rewardDone,d_joinDone").split(",") if s.strip()]
+    bt_sig = [s.strip() for s in os.environ.get("TTRMOD_BT_SIG", "setState,d_movieDone").split(",") if s.strip()]
+    bt_names = [s.strip() for s in os.environ.get(
+        "TTRMOD_BT_NAMES", "faceoff-battle,movie-track,movie-reward-track,to-pending").split(",") if s.strip()]
+    MOD1["battletrace"] = {"enabled": bt_on, "methods": bt_methods, "sig": bt_sig, "names": bt_names}
+    if bt_on:
+        print("[tramp-live] BATTLETRACE ON (read-only): trace methods=%s ; resolve battle FSM by sig=%s ; "
+              "battle intervals=%s" % ("/".join(bt_methods), "+".join(bt_sig), ",".join(bt_names)))
+
     mode = os.environ.get("TTRMOD_MODE", "install")
 
     # MODSET (production): ONE install of the MetaInterval.start hook driven by the curated
@@ -1712,6 +1887,34 @@ def main():
                       ("ctx=%s" % _ctx) if _ctx else "",
                       ("co=%s" % _co) if _co else "",
                       ("tunnel=%s" % _tun) if _tun else "")
+            elif pl.get("t") == "btinstall":
+                info = pl.get("info") or {}
+                print("[BTINSTALL] battle FSM class=%s module=%s (sig=%s, all_direct=%s):" % (
+                    info.get("cls"), info.get("module"), "+".join(info.get("sig") or []), info.get("all_direct")))
+                for w in info.get("wired") or []:
+                    print("            %-16s -> %s%s" % (
+                        w.get("method"), "OK" if w.get("ok") else "FAIL",
+                        "" if w.get("ok") else " (%s)" % w.get("reason")))
+            elif pl.get("t") == "bt":
+                # timestamped battle event. Print relative ms (to the first bt event) so gaps read at a
+                # glance; keep the full ordered list for the end-of-run BATTLE TIMELINE dump.
+                ms = pl.get("ms")
+                if "bt_t0" not in box:
+                    box["bt_t0"] = ms
+                rel = (ms - box["bt_t0"]) if isinstance(ms, (int, float)) else 0
+                box.setdefault("bt", []).append({"rel": rel, **pl})
+                if pl.get("ev") == "m":
+                    label = pl.get("label"); state = pl.get("state")
+                    if label == "setState":
+                        print("[BT] +%7dms  <- setState  state=%s   (INBOUND: server drives the FSM here)" % (rel, state))
+                    else:
+                        print("[BT] +%7dms  -> %s   (OUTBOUND: client reports this step done, then idles for the server)" % (rel, label))
+                elif pl.get("ev") == "ival":
+                    d = pl.get("dur"); r = pl.get("rate")
+                    ds = ("%.3fs" % d) if isinstance(d, (int, float)) else str(d)
+                    rs = ("%.2f" % r) if isinstance(r, (int, float)) else str(r)
+                    print("[BT] +%7dms  ~~ ival START %-22s dur=%s rate=%s (client rate pre-mod-scale)" % (
+                        rel, pl.get("name"), ds, rs))
             elif pl.get("t") == "reverted":
                 print("[reverted]", json.dumps(pl))
                 rcs = pl.get("rc") or []
@@ -1803,6 +2006,31 @@ def main():
         if ab: print("[tramp-live] appliedBy (method -> #intervals scaled):", json.dumps(ab))
     except Exception:
         pass
+    # BATTLE TIMELINE (read-only diagnosis): the ordered, timestamped battle events with the gap since the
+    # previous event. Read the gaps like this: an OUTBOUND d_*Done followed by a large gap then an INBOUND
+    # setState => that step is SERVER-GATED (the client finished + reported early, then waited on the
+    # server) and is NOT client-reducible; a gap bounded by a client interval's own duration/timer =>
+    # CLIENT-side and scalable. Hand this block back for the per-delay attribution.
+    bt = box.get("bt") or []
+    if bt:
+        print("[tramp-live] ===== BATTLE TIMELINE (%d events; relMs = ms since first event) =====" % len(bt))
+        prev = None
+        for e in bt:
+            rel = e.get("rel", 0)
+            gap = "" if prev is None else "  (+%dms since prev)" % (rel - prev)
+            prev = rel
+            if e.get("ev") == "m":
+                if e.get("label") == "setState":
+                    desc = "<- INBOUND  setState state=%s" % e.get("state")
+                else:
+                    desc = "-> OUTBOUND %s (client done -> idles for server)" % e.get("label")
+            else:
+                d = e.get("dur"); r = e.get("rate")
+                ds = ("%.3fs" % d) if isinstance(d, (int, float)) else str(d)
+                rs = ("%.2f" % r) if isinstance(r, (int, float)) else str(r)
+                desc = "~~ ival    START %s dur=%s rate=%s" % (e.get("name"), ds, rs)
+            print("    +%7dms  %s%s" % (rel, desc, gap))
+        print("[tramp-live] ===== end BATTLE TIMELINE =====")
     if mode == "modset":
         try:
             si = ex.scaledInfo() or {}
