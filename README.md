@@ -3,8 +3,8 @@
 Personal, cosmetic quality-of-life tweaks for the owner's **own** Toontown Rewritten
 client, on the owner's own machine and account. It attaches to the running game at
 runtime and speeds up a set of **purely visual** animations (teleport, Shticker Book
-open/close, screen iris, building doors, and cog-battle movie/faceoff/run-in) all at
-once, driven by a small config table the owner can edit.
+open/close, screen iris, building doors, street-tunnel walks, and cog-battle
+movie/faceoff/run-in) all at once, driven by a small config table the owner can edit.
 
 ## What this is (and is not)
 
@@ -12,9 +12,9 @@ once, driven by a small config table the owner can edit.
   playback rate. Nothing else is touched.
 - **Is not:** a competitive cheat. It changes **no** movement / turn / aim / damage logic
   and grants **no** server-validated advantage — only client-side animation *timing*.
-  Where a delay is server-enforced (e.g. a building door's phase hold), that delay stays;
-  the mod only speeds the visuals around it. Everything it changes ports 1:1 to the real
-  TTR server.
+  Because it only touches client-side rendering, everything it speeds up ports 1:1 to the
+  real server — but a server-paced delay (a building door's phase hold, the wait between
+  cog-battle rounds) is **unaffected**: only the visuals around it get snappier.
 
 Client modification is **ToS-gray and at your own risk.** The owner has accepted that.
 **Do not distribute, and do not use on accounts you do not own.**
@@ -48,13 +48,13 @@ Validate the table logic offline first (no game needed):
 Then run against the live client (attaches as root and applies the whole table, staying resident so
 the mods keep working while you play):
 
-    sudo -n env TTRMOD_MODE=modset TTRMOD_LOGNAMES=1 \
+    sudo -n env TTRMOD_MODE=modset \
         TTRMOD_SCRIPT=frida/trampoline_inject.py frida/run-injector.sh
 
-`TTRMOD_LOGNAMES=1` prints every started interval's name (`[IVALNAME]`) so you can discover
-new ones, and prints `[SCALED] <name> x<factor> (<group>)` each time a match is scaled.
-Trigger animations (teleport via the book, open/close the book, walk through a building door,
-be near a cog battle) to see them speed up.
+Trigger animations (teleport via the book, open/close the book, walk through a building door, be near
+a cog battle, walk through a street tunnel) to see them speed up. Add `TTRMOD_LOGNAMES=1` to log every
+started interval's name (`[IVALNAME]`) — so you can discover new ones — plus a `[SCALED] <name>
+x<factor> (<group>)` line each time a match is scaled.
 
 **Stop it with `scripts/tt-mod-stop` (from another terminal) — NOT Ctrl+C.** The tool must restore
 the original game methods *before* it detaches; if the frida session drops while the wrapper is still
@@ -71,7 +71,7 @@ also works). For a time-boxed run that reverts on its own after N seconds, add `
 | transitions | the screen iris on any zone change | confirmed live |
 | door | building door swing + toon walk in/out | confirmed live |
 | battle | cog-battle faceoff, attack/reward movie, run-in | names captured live; scales on the next in-zone battle (cosmetic only — round pacing stays server-gated) |
-| tunnel | the street-tunnel walk (in and out) | scaled by the spawning handler's frame co_name (`spawn_context` in `modset.json`); fires on your own tunnel entry only — one live walk reveals the two hashed handler co_names via `[SPAWNCO]` |
+| tunnel | the street-tunnel walk (in and out) | fires on your own tunnel entry only. **Departure** (walking in) is caught by a context wrap on the readable `LocalToon.tunnelOut`; **arrival** (walking out) is caught deterministically by matching the walk to `LocalToon`'s own method set + the iris that fires with it — no hardcoded per-build hash. See `STATUS.md`. |
 
 Factors are conservative (teleport ~4×, everything else ~3×) and easy to tune in
 `modset.json`.
