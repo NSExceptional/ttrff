@@ -164,7 +164,16 @@ def load_modset(path):
     # pin it in memory; set attr to pin it up front (no discovery). factor/iris_window_ms tune it;
     # enabled:false turns the whole tunnel-identity path off. A free-form object, passed through as-is.
     tunnel = data.get("tunnel_identity") or {}
-    return entries, bool(data.get("log_unmatched", True)), context, spawn, tunnel
+    # `tunnel_localtoon_iris`: the DETERMINISTIC tunnel-ARRIVAL mechanism (the primary one). The arrival
+    # handler handleTunnelIn is a (HASHED) method of the LocalToon CLASS -- which resolves reliably by the
+    # `tunnelOut` method signature -- and it calls base.transitions.irisIn synchronously right before it
+    # starts the walk Sequence. So an interval whose SPAWNING-FRAME co_name is a member of LocalToon's own
+    # method set AND which started inside the iris window is the local toon's tunnel walk -- regardless of
+    # the per-session hash (no hardcoded co_name; the whole method set is re-derived live each session).
+    # factor/iris_window_ms tune it; lt_signature = the readable method(s) that uniquely resolve LocalToon
+    # (default ["tunnelOut"]); enabled:false turns it off. A free-form object, passed through as-is.
+    ltiris = data.get("tunnel_localtoon_iris") or {}
+    return entries, bool(data.get("log_unmatched", True)), context, spawn, tunnel, ltiris
 
 
 def readiness(syms):
@@ -317,6 +326,21 @@ rpc.exports = {
       ST.irisWindowMs = (tcfg && tcfg.iris_window_ms) ? tcfg.iris_window_ms : 200;
       ST.lastIrisMs = 0;                                              // Date.now() of the last iris start
       ST.localAvatar = null; ST.localAvatarDict = null;               // cached once in-world (stable identity)
+      // TUNNEL-LOCALTOON-IRIS (the DETERMINISTIC tunnel-ARRIVAL mechanism, PRIMARY). The arrival handler
+      // handleTunnelIn is a HASHED method of the LocalToon CLASS (which resolves reliably by the
+      // `tunnelOut` signature) and it calls base.transitions.irisIn synchronously right before starting
+      // the walk Sequence. So: an interval whose SPAWNING-FRAME co_name is a member of LocalToon's OWN
+      // method set AND which started inside the iris window IS the local toon's tunnel walk -- regardless
+      // of the per-session hash. No hardcoded co_name: the whole method set is re-derived live each
+      // session, so whatever hash handleTunnelIn got this session is in the set. Config from spec.ltiris.
+      var lcfg = (ST.mod1 && ST.mod1.spec && ST.mod1.spec.ltiris) ? ST.mod1.spec.ltiris : null;
+      ST.ltIrisEnabled = !!(lcfg && lcfg.enabled !== false);
+      ST.ltIrisFactor  = (lcfg && lcfg.factor) ? lcfg.factor : 4.0;
+      ST.ltIrisWindowMs = (lcfg && lcfg.iris_window_ms) ? lcfg.iris_window_ms : 200;
+      ST.ltSig = (lcfg && lcfg.lt_signature && lcfg.lt_signature.length) ? lcfg.lt_signature : ['tunnelOut'];
+      ST.localToonMethods = null;      // SET (co_name -> true) of LocalToon's own methods; null until resolved
+      ST.localToonName = null;         // resolved LocalToon class __name__ (for logging)
+      ST.lastLtScanMs = 0;             // rate-limit the heavy sys.modules scan while LocalToon is unresolved
       // build a float by hand (STATUS.md recipe): pop the free-list head (relink via +8, numfree--),
       // else pymalloc(24); then ob_refcnt=1 @+0, ob_type=&PyFloat_Type @+8, ob_fval @+0x10.
       ST.makeFloat = function(v){
@@ -435,6 +459,84 @@ rpc.exports = {
           return ST.scaleTunnel(inst, nm, 'discovered');
         } catch(e){ ST.clearExc(); return false; }
       };
+      // ---- TUNNEL-LOCALTOON-IRIS (the DETERMINISTIC tunnel-ARRIVAL path) ----
+      // Resolve LocalToon by the ltSig signature (default ['tunnelOut'] -- a UNIQUE signature that
+      // resolves LocalToon without ever naming its per-build hash) and cache the SET of its OWN method
+      // names (the class's tp_dict keys @ +0x108). This set includes the HASHED handleTunnelIn/
+      // handleTunnelOut, because the vault renames a `def NAME`'s co_name AND its class-attribute key to
+      // the SAME hash -- so co_name == tp_dict key for a method. Non-dunder keys only (drop __init__/etc.,
+      // which are collision-prone shared names -- the tunnel handlers are never underscore-prefixed), which
+      // matches the existing listcls/scanBySubstr filter. Read-only (borrowed lookups + pointer reads);
+      // clears the tstate on exit. Idempotent: returns the cached set once resolved. Heavy (iterates
+      // sys.modules), so it is called ONCE at install and thereafter only when iris-correlated + unresolved.
+      ST.resolveLocalToonMethods = function(md){
+        try {
+          if (ST.localToonMethods) return ST.localToonMethods;       // cached (resolve at most once)
+          // RATE-LIMIT: the scan iterates all of sys.modules, so while LocalToon is unresolved (e.g. attach
+          // preceded login) never scan more than once per second -- otherwise a burst of iris-correlated
+          // unmatched intervals could each trigger a full scan. Resolves for good on the first success.
+          var now = Date.now();
+          if (ST.lastLtScanMs && (now - ST.lastLtScanMs) < 1000) return null;
+          ST.lastLtScanMs = now;
+          if (!(ST.GetIter && ST.IterNext && ST.AsUTF8 && ST.DictGetStr && ST.DictGetItem && ST.GetAttrStr)){ ST.clearExc(); return null; }
+          md = md || ST.sysmodules(); if (md.isNull()){ ST.clearExc(); return null; }
+          var found = ST.scanBySignature(md, ST.ltSig);              // classes defining ALL of ltSig
+          if (!found || !found.length){ ST.clearExc(); return null; }
+          // prefer the class that defines the signature DIRECTLY (the real LocalToon, not a subclass that
+          // merely inherits it); else take the first full match.
+          var direct = found.filter(function(r){ return r.all_direct; });
+          var rec = direct.length ? direct[0] : found[0];
+          var cls = rec.clsPtr; ST.keep.push(cls);
+          var owndict = ptr(0); try { owndict = cls.add(0x108).readPointer(); } catch(e){ owndict = ptr(0); }
+          if (owndict.isNull()){ ST.clearExc(); return null; }
+          var set = {}, cnt = 0;
+          var it = ST.GetIter(owndict);
+          if (!it.isNull()){
+            var k;
+            while (!(k = ST.IterNext(it)).isNull()){
+              var nm = null; try { nm = ST.AsUTF8(k).readCString(); } catch(e){ nm = null; }
+              if (nm && nm[0] !== '_'){ set[nm] = true; cnt++; }     // co_name == attr key for a method
+            }
+          }
+          ST.clearExc();
+          if (cnt === 0) return null;                                // no methods -> treat as unresolved (retry)
+          ST.localToonMethods = set; ST.localToonName = rec.class_name;
+          try { send({t:'ltmethods', cls:rec.class_name, sig:ST.ltSig, count:cnt}); } catch(e){}
+          return set;
+        } catch(e){ ST.clearExc(); return null; }
+      };
+      // scale `inst` as the tunnel walk via the LocalToon-method+iris signal; [SCALED] via=localtoon-method.
+      ST.scaleTunnelLtIris = function(inst, nm, co){
+        var ok = ST.setPlayRate(inst, ST.ltIrisFactor);
+        if (ok){ try {
+          ST.scaledNames = ST.scaledNames || {}; var first = (ST.scaledNames[nm] === undefined);
+          ST.scaledNames[nm] = (ST.scaledNames[nm]||0) + 1;
+          ST.scaledGroups = ST.scaledGroups || {}; ST.scaledGroups['tunnel'] = (ST.scaledGroups['tunnel']||0) + 1;
+          if (first) send({t:'scaled', name:nm, factor:ST.ltIrisFactor, group:'tunnel', via:'localtoon-method', co:co});
+        } catch(e){} }
+        ST.clearExc();
+        return ok;
+      };
+      // The DETERMINISTIC ARRIVAL check. DOUBLE-GATED so it can NEVER scale non-tunnel intervals:
+      //   (1) iris-correlated: an iris-named interval started within ltIrisWindowMs (handleTunnelIn's
+      //       synchronous base.transitions.irisIn, stamped as lastIrisMs), AND
+      //   (2) LocalToon-owned: the spawning frame's co_name is in LocalToon's OWN method set.
+      // Only handleTunnelIn/handleTunnelOut satisfy BOTH (other LocalToon methods -- emotes etc. -- have no
+      // iris; other players'/cogs'/NPCs' walks are spawned by OTHER classes' methods, not in the set).
+      // Reached only for intervals the name table + context + spawn_context did NOT already scale (teleport
+      // is name-matched and returns first; the ctx-scaled departure returns first -> no double-scale). The
+      // co_name is passed in (already read once per start). Returns true iff it scaled. tstate-clean.
+      ST.tryTunnelLtIris = function(inst, nm, coName, md){
+        try {
+          if (!ST.ltIrisEnabled) return false;
+          if ((Date.now() - (ST.lastIrisMs||0)) > ST.ltIrisWindowMs) return false;   // gate (1): iris-correlated
+          if (coName === null || coName === undefined) return false;
+          if (!ST.localToonMethods){ ST.resolveLocalToonMethods(md); }               // lazy (iris-gated) resolve
+          if (!ST.localToonMethods) return false;
+          if (ST.localToonMethods[coName] !== true) return false;                    // gate (2): LocalToon method
+          return ST.scaleTunnelLtIris(inst, nm, coName);
+        } catch(e){ ST.clearExc(); return false; }
+      };
 
       // GENERIC discovery == payload.py's _apply_after: attr / iname_attr / iname_sub. Every getattr
       // that can miss is followed by clearExc so a failed lookup never leaks onto the tstate.
@@ -502,14 +604,17 @@ rpc.exports = {
             if (nm4.isNull()){ ST.clearExc(); return 0; }
             var nms4 = null; try { nms4 = ST.AsUTF8(nm4).readCString(); } catch(e){ nms4 = null; }
             if (nms4 === null){ ST.clearExc(); return 0; }
-            // (0) IRIS STAMP + (1) TUNNEL WALK BY OBJECT IDENTITY (fast path, pinned attr). The street-
-            // tunnel walk interval is localAvatar.<hashed tunnelTrack attr> -- an UNNAMED Sequence that
-            // matches no name entry -- so it is identified by OBJECT IDENTITY, not name/co_name. The iris
-            // stamp records when the screen iris (irisTask) fires so discovery (below, after the name
-            // table) can correlate handleTunnelIn's synchronous irisIn with the walk's start. The fast
-            // path is attr-specific -> it can only ever match the tunnel track, never the teleport track.
-            if (ST.tunnelEnabled){
+            // (0) IRIS STAMP + (1) TUNNEL WALK BY OBJECT IDENTITY (fast path, pinned attr). The iris stamp
+            // records when the screen iris (irisTask) fires so BOTH tunnel-arrival paths -- the LocalToon-
+            // method+iris check (4.5) and the object-identity discovery (5) -- can correlate handleTunnelIn's
+            // synchronous irisIn with the walk's start; it is needed whenever EITHER path is enabled. The
+            // object-identity fast path (attr-specific -> can only match the tunnel track, never teleport)
+            // is gated on ST.tunnelEnabled alone. The street-tunnel walk interval is unnamed, so it matches
+            // no name entry and is identified by co_name-membership (4.5) or object identity (5), not name.
+            if (ST.tunnelEnabled || ST.ltIrisEnabled){
               if (ST.isIrisName(nms4)) ST.lastIrisMs = Date.now();
+            }
+            if (ST.tunnelEnabled){
               if (ST.tunnelFastPath(inst, nms4)){ ST.clearExc(); return 1; }
             }
             // CONTEXT SCALING (takes priority over the name table): if a wrap-around context method
@@ -542,7 +647,7 @@ rpc.exports = {
             // when spawn entries exist OR logging is on; the read is pure pointer derefs (no getattr,
             // no exception risk). Every miss clears the tstate (same crash-guard discipline).
             var spawnList = spec.spawn || [];
-            var coName = (spawnList.length || spec.log) ? ST.spawnCoName() : null;
+            var coName = (spawnList.length || spec.log || ST.ltIrisEnabled) ? ST.spawnCoName() : null;
             if (spawnList.length && coName !== null){
               var smatch = null;
               for (var sp=0; sp<spawnList.length; sp++){ if (spawnList[sp] && spawnList[sp].co_name === coName){ smatch = spawnList[sp]; break; } }
@@ -572,6 +677,17 @@ rpc.exports = {
                 if (firstSeen) send({t:'scaled', name:nms4, factor:matched.factor, group:matched.group});
               } catch(e){} }
               ST.clearExc(); return okm ? 1 : 0;
+            }
+            // (4.5) TUNNEL ARRIVAL by LOCALTOON-METHOD + IRIS (the DETERMINISTIC primary tunnel path).
+            // Only NAME-UNMATCHED intervals reach here (teleport/book/door/iris returned above via the name
+            // table, and the ctx-scaled DEPARTURE returned at the ctx block -> no double-scale). If this
+            // interval was spawned by a method of the LocalToon CLASS (co_name in the live-resolved method
+            // set) AND it started inside the iris window, it is the local toon's tunnel walk (handleTunnelIn
+            // on ARRIVAL) -> scale it x tunnel factor, regardless of the per-session hash. Doubly-gated
+            // (LocalToon-method membership AND iris correlation) so it can never touch MMO-noise walks
+            // (spawned by OTHER classes) or non-tunnel LocalToon animations (no iris). See ST.tryTunnelLtIris.
+            if (ST.ltIrisEnabled){
+              if (ST.tryTunnelLtIris(inst, nms4, coName, null)){ ST.clearExc(); return 1; }
             }
             // (5) TUNNEL WALK BY OBJECT IDENTITY (discovery). Only NAME-UNMATCHED intervals reach here
             // (teleport & every named group returned above via the name table), so discovery can NEVER
@@ -1143,11 +1259,28 @@ rpc.exports = {
                                  ok:(crc===0), setattr_rc:crc});
                 }
               }
+              // TUNNEL-LOCALTOON-IRIS: resolve LocalToon's OWN method SET up front (best-effort) so the
+              // FIRST tunnel walk pays no scan cost. Uses the SAME signature scan as the tunnelOut context
+              // (LocalToon is resolvable by 'tunnelOut'). Harmless if the toon isn't in-world yet -- the
+              // per-start path re-resolves (iris-gated, so at most once per zone transition). Reported in
+              // ltiris so the operator sees the class + method count that will gate the arrival scale.
+              var ltInfo = {enabled: ST.ltIrisEnabled};
+              if (ST.mode === 'modset' && ST.ltIrisEnabled){
+                try { ST.resolveLocalToonMethods(mods0); } catch(e){ ST.clearExc(); }
+                if (ST.localToonMethods){
+                  ltInfo.resolved = true; ltInfo.cls = ST.localToonName;
+                  ltInfo.method_count = Object.keys(ST.localToonMethods).length;
+                  ltInfo.sig = ST.ltSig; ltInfo.factor = ST.ltIrisFactor; ltInfo.iris_window_ms = ST.ltIrisWindowMs;
+                } else {
+                  ltInfo.resolved = false; ltInfo.sig = ST.ltSig;
+                  ltInfo.note = 'LocalToon not resolved at install (walk in-world first?); retries per iris-correlated start';
+                }
+              }
               ST.fin({ok:anyOk, stage:'mod1_installed',
                       resolved_by: (m.override && m.override.module ? 'override' : 'signature-scan'),
                       targets: targets.map(function(t){ return {module:t.module, attr:t.attr, class_name:t.class_name, all_direct:t.all_direct}; }),
                       methods: m.methods, attr: m.spec.attr, factor: m.factor,
-                      wired: wired, ctx_wired: ctxWired,
+                      wired: wired, ctx_wired: ctxWired, ltiris: ltInfo,
                       note:'wrap-after live; walk into a street tunnel to see it fire + speed the walk'});
             } catch(e){ ST.fin({ok:false, stage:'mod1 ex', e:String(e)}); }
             return;
@@ -1457,7 +1590,7 @@ def main():
     # clearing both would fall back to the signature scan (META_INTERVAL_SIG).
     if mode == "modset":
         tbl_path = os.environ.get("TTRMOD_MODSET", os.path.join(ROOT, "modset.json"))
-        entries, log_unmatched, context, spawn_context, tunnel_cfg = load_modset(tbl_path)
+        entries, log_unmatched, context, spawn_context, tunnel_cfg, ltiris_cfg = load_modset(tbl_path)
         if not (ovr_mod and ovr_cls):
             MOD1["override"] = {"module": META_INTERVAL_MODULE, "cls": META_INTERVAL_CLASS}
         MOD1["methods"] = list(META_INTERVAL_SIG)   # signature fallback if the override is cleared
@@ -1483,8 +1616,27 @@ def main():
             tun["factor"] = float(os.environ["TTRMOD_TUNNEL_FACTOR"])
         if os.environ.get("TTRMOD_IRIS_WINDOW_MS"):
             tun["iris_window_ms"] = int(os.environ["TTRMOD_IRIS_WINDOW_MS"])
+        # TUNNEL-LOCALTOON-IRIS: the DETERMINISTIC tunnel-ARRIVAL mechanism. Resolve LocalToon by the
+        # `tunnelOut` signature, cache its own method-name SET, and in the start wrap-after scale any
+        # not-yet-scaled interval whose SPAWNING co_name is in that set AND which started inside the iris
+        # window (handleTunnelIn's synchronous irisIn) -- no hardcoded per-session hash. From modset.json
+        # `tunnel_localtoon_iris`, with env overrides.
+        lt = {
+            "enabled":        bool(ltiris_cfg.get("enabled", True)),
+            "factor":         float(ltiris_cfg.get("factor", 4.0)),
+            "iris_window_ms": int(ltiris_cfg.get("iris_window_ms", 200)),
+            "lt_signature":   list(ltiris_cfg.get("lt_signature") or ["tunnelOut"]),
+        }
+        if os.environ.get("TTRMOD_TUNNEL_LT", "") in ("0", "false", "no"):
+            lt["enabled"] = False
+        if os.environ.get("TTRMOD_TUNNEL_LT_FACTOR"):
+            lt["factor"] = float(os.environ["TTRMOD_TUNNEL_LT_FACTOR"])
+        if os.environ.get("TTRMOD_TUNNEL_LT_WINDOW_MS"):
+            lt["iris_window_ms"] = int(os.environ["TTRMOD_TUNNEL_LT_WINDOW_MS"])
+        if os.environ.get("TTRMOD_TUNNEL_LT_SIG"):
+            lt["lt_signature"] = [s.strip() for s in os.environ["TTRMOD_TUNNEL_LT_SIG"].split(",") if s.strip()]
         MOD1["spec"] = {"mode": "modset", "entries": entries, "log": want_log,
-                        "spawn": spawn_context, "tunnel": tun}
+                        "spawn": spawn_context, "tunnel": tun, "ltiris": lt}
         # wrap-around CONTEXT targets (resolve owning class by the method signature; wrap wrap-around).
         MOD1["context"] = context
         print("[tramp-live] modset: %d active entries; groups=%s; log_unmatched=%s; table=%s" % (
@@ -1495,6 +1647,12 @@ def main():
                       tun["factor"], (tun["attr"] or "(auto-discover)"), tun["iris_window_ms"]))
         else:
             print("[tramp-live] modset tunnel-identity: DISABLED (TTRMOD_TUNNEL=0)")
+        if lt["enabled"]:
+            print("[tramp-live] modset tunnel-localtoon-iris (ARRIVAL): scale LocalToon-method-spawned, "
+                  "iris-correlated walk x%g; LocalToon resolved by signature %s; iris_window=%dms" % (
+                      lt["factor"], "+".join(lt["lt_signature"]), lt["iris_window_ms"]))
+        else:
+            print("[tramp-live] modset tunnel-localtoon-iris: DISABLED (TTRMOD_TUNNEL_LT=0)")
         if context:
             print("[tramp-live] modset context: %d wrap-around target(s) -> %s" % (
                 len(context), ", ".join("%s(x%g,%s)" % (c["method"], c["factor"], c["group"]) for c in context)))
@@ -1541,11 +1699,16 @@ def main():
                       "-- localAvatar's hashed tunnel-track attr; pin it in modset.json tunnel_identity.attr")
             elif pl.get("t") == "avatar":
                 print("[avatar] localAvatar resolved (%s)" % pl.get("tp"))
+            elif pl.get("t") == "ltmethods":
+                print("[LTMETHODS] LocalToon resolved by signature %s -> class %s (%d own methods) "
+                      "-- the deterministic tunnel-arrival gate" % (
+                          "+".join(pl.get("sig") or []), pl.get("cls"), pl.get("count") or 0))
             elif pl.get("t") == "scaled":
                 box.setdefault("scaled", []).append(pl.get("name"))
-                _ctx = pl.get("ctx"); _co = pl.get("co"); _tun = pl.get("tunnel")
+                _ctx = pl.get("ctx"); _co = pl.get("co"); _tun = pl.get("tunnel"); _via = pl.get("via")
                 print("[SCALED]", pl.get("name"), "x", pl.get("factor"),
                       ("(%s)" % pl.get("group")) if pl.get("group") else "",
+                      ("via=%s" % _via) if _via else "",
                       ("ctx=%s" % _ctx) if _ctx else "",
                       ("co=%s" % _co) if _co else "",
                       ("tunnel=%s" % _tun) if _tun else "")
