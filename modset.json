@@ -5,8 +5,8 @@
   "entries": [
     { "match": "teleportOut", "factor": 4.0, "group": "teleport",    "_note": "teleportOut-<doId>; confirmed live (first measured speedup ~4.9x at 5.0)" },
     { "match": "teleportIn",  "factor": 4.0, "group": "teleport",    "_note": "teleportIn-<doId>; confirmed live" },
-    { "match": "openBook",    "factor": 3.0, "group": "book",        "_note": "openBook-<doId>; confirmed live (scales; too fast to frame-measure)" },
-    { "match": "closeBook",   "factor": 3.0, "group": "book",        "_note": "closeBook-<doId>; confirmed live" },
+    { "match": "openBook",    "factor": 100.0, "group": "book",        "_note": "openBook-<doId>. factor 100 = effectively INSTANT (sub-frame) per user request -- no visible open animation. setPlayRate is applied same-frame as start(), so the book just snaps open." },
+    { "match": "closeBook",   "factor": 100.0, "group": "book",        "_note": "closeBook-<doId>. factor 100 = effectively INSTANT (sub-frame) per user request -- book snaps closed, no animation." },
     { "match": "irisTask",    "factor": 3.0, "group": "transitions", "_note": "the screen IRIS -- confirmed live to be the zone/tunnel/door transition (the circular iris that closes on every zone change; captured frame-by-frame on a tunnel entry). Intact literal name." },
     { "match": "tunnel",      "factor": 4.0, "group": "tunnel",      "_note": "NAME-based fallback for any interval literally named '...tunnel...'. NB the actual street-tunnel WALK is NOT caught here -- its interval is auto-named 'vlt8e0d5a85-<n>' (confirmed live: this entry produced NO [SCALED] on a tunnel walk). The walk is now scaled by OBJECT IDENTITY (`tunnel_identity` below: it IS localAvatar.tunnelTrack), NOT by name. Kept intact in case a tunnel-named interval ever appears." },
 
