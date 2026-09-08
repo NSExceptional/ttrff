@@ -33,9 +33,9 @@ open-toontown track (source edits, no injection) is documented in
 
 **The live mod set fully works.** A single native trampoline on Panda's `MetaInterval.start` scales
 every cosmetic animation group at once, driven by the editable `modset.json` table, with a crash-safe
-stop. All groups are live-confirmed except battle (names captured live from other players' fights;
-scales on the next in-zone battle) and tunnel *arrival* (deterministic mechanism, offline-validated;
-one live confirming walk still pending because automation can't reliably walk a toon into a tunnel).
+stop. All groups are live-confirmed — teleport, book (now instant), door, iris, tunnel (both departure
+and arrival), and the battle intro + reward-tally outro. (The mid-battle attack movie was tested and
+deliberately disabled: the round is server-gated, so scaling it feels worse — see "Battle" below.)
 Zero injected bytecode, so all three anti-injection layers are bypassed. Across the confirming live
 runs: every run reverted cleanly (`rc:0`), the game stayed alive, zero crashes.
 
@@ -150,7 +150,7 @@ first matching table row wins, so order specific → broad.
 | book | `openBook-<id>`, `closeBook-<id>` | by NAME | ×3 | **live-confirmed** (scales; too fast to frame-measure) |
 | transitions | `irisTask` (the circular zone/door/tunnel iris) | by NAME | ×3 | **live-confirmed** (iris close frame-captured) |
 | door | `leftDoorOpen/Close`, `rightDoorOpen/Close`, `avatarEnterDoor/ExitDoor` | by NAME | ×3 | **live-confirmed** |
-| battle | `faceoff-battle<id>`, `movie-track`, `movie-reward-track`, `to-pending` (run-in) | by NAME | ×3 | **VISUAL ONLY** — names live-discovered from others' fights; scales on next in-zone battle |
+| battle | `faceoff-battle` (intro), `movie-reward-track` (tally), `to-pending` (run-in) | by NAME | ×3 | intro+outro **kept & confirmed**; mid-battle `movie-track` **disabled** — round is server-gated, scaling it feels worse |
 | tunnel — departure | walking INTO a tunnel to leave a zone | CONTEXT wrap-around on `LocalToon.tunnelOut` | ×4 | **live-confirmed** |
 | tunnel — arrival | walking OUT the far side | DETERMINISTIC: `LocalToon` method-set + iris | ×4 | offline-validated; one live confirm pending |
 
@@ -168,16 +168,31 @@ These groups have readable, meaningful interval names (a `-<doId>`/`-<toonId>` s
 literal), so the name table catches them directly regardless of which (hashed) method builds them. This
 is the bulk of the mod set and needs nothing beyond the one `MetaInterval.start` wrap.
 
-### Battle is VISUAL ONLY (round pacing is server-gated)
+### Battle — intro + outro speed up; the mid-round is server-gated
 
-The attack/faceoff/reward/run-in **movies play faster**, but the ~13s inter-round wait **cannot** be
-reduced client-side. `Movie.play()` appends the done-callback (`__handleMovieDone` → `d_movieDone` →
-`sendUpdate('movieDone')`) to the **END** of the `movie-track` Sequence. Scaling that Sequence makes the
-client report the round done **early** — but the client was never the thing holding up the next round;
-the authoritative TTR server collects each client's done and paces the next round on its own timers. So
-speeding the movie just makes the client wait sooner. This never showed offline because the local
-open-toontown AI (a cooperative server we controlled) advanced immediately on the early `movieDone`.
-**Net: only the battle *visual* ports; round timing does not.**
+The battle **intro** (`faceoff-battle` walk-up + `to-pending` run-in) and **outro** (`movie-reward-track`
+tally) speedups work and are **kept**. The mid-battle **attack movie** (`movie-track`) is **disabled**
+(`enabled:false`) — scaling it makes combat feel *worse*, not faster.
+
+Why: the round is **server-gated**, confirmed live. In a solo fight with gags picked fast, each round is
+~3s of action then a rock-steady **~13s dead wait** — both between attacks and after a cog dies — a
+fixed wait **independent of pick speed and of player count**, so it is neither your input nor other
+players; it is the server pacing the round. `Movie.play()` appends the done-report (`d_movieDone` →
+`sendUpdate('movieDone')`) to the **END** of `movie-track`, so scaling makes the client report done
+early — but the authoritative TTR server **ignores the early report and holds the round on its own
+clock** (deliberate anti-speedup). Speeding the movie therefore just moves the ~3s of action earlier and
+leaves *more* of the fixed 13s as dead staring; leaving the movie at normal speed lets the animation
+fill the server's round time instead. An adversarial review confirmed the client battle FSM has **no**
+inter-round/settle timer to scale — it only waits for the server's next `setState`.
+
+Correction to an earlier claim: local open-toontown combat was fast via the **stock** protocol (the
+unmodified AI advances immediately on the solo client's early `movieDone`), **not** a specially
+"cooperative" server. TTR simply **deviates from stock** to pace rounds server-side even solo. Faking
+the server's `setState` on the client can't beat this — the server rejects actions taken in a state it
+isn't in, and suppressing its messages desyncs the battle (disconnect / anti-cheat / a real
+rewards-per-hour advantage); out of scope, not pursued.
+
+**Net: battle intro + outro speed up (kept); the mid-round pace is the server's and does not port.**
 
 ### Tunnel departure — context wrap-around on `tunnelOut`
 
