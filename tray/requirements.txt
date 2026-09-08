@@ -1,0 +1,8 @@
+# ttrff tray -- run-from-source dependencies.
+#   pip install -r tray/requirements.txt   then   python tray/ttrff_tray.py
+pystray>=0.19
+pillow>=9
+psutil>=5.9
+# Windows only: the injector runs under this Python, so it needs frida here.
+# (macOS launches the bundled, signed frida runner instead -- no pip frida needed.)
+frida>=16; sys_platform == "win32"

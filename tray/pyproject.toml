@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttrff-tray"
+version = "0.1.0"
+description = "Menu-bar / system-tray controller that auto-attaches the ttrff cosmetic mods to Toontown Rewritten."
+requires-python = ">=3.8"
+dependencies = [
+    "pystray>=0.19",
+    "pillow>=9",
+    "psutil>=5.9",
+    # Windows only: the injector runs under this same Python and needs frida.
+    # macOS doesn't list it here -- it launches the bundled, signed frida runner instead.
+    "frida>=16; sys_platform == 'win32'",
+]
+
+[project.scripts]
+ttrff-tray = "ttrff_tray:main"
+
+[tool.setuptools]
+py-modules = ["ttrff_tray"]
