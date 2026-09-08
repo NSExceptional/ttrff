@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# frida/inject.py -- runs the ttr-mods payload inside the live TTREngine via FRIDA,
+# frida/inject.py -- runs the ttrff payload inside the live TTREngine via FRIDA,
 # instead of lldb (whose debugserver SIGSEGVs attaching to this engine).
 #
 # Run as root (task_for_pid on the hardened engine needs it here):
-#   sudo /Users/tanner/Developer/ttr-mods/frida/run-injector.sh [--probe|--apply|--revert]
+#   sudo /Users/tanner/Developer/ttrff/frida/run-injector.sh [--probe|--apply|--revert]
 #
 # APPROACH -- PyEval_EvalCode INTERCEPTOR (replaces the old GIL-polling recipe):
 #   The earlier driver read _PyThreadState_Current and then PyGILState_Ensure()'d to

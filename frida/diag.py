@@ -5,7 +5,7 @@
 # live globals dict is reachable from it. Cannot run the payload; cannot storm; the
 # counters are cheap. Use this to choose the real injection hook.
 #
-#   sudo -n TTRMOD_SCRIPT=frida/diag.py /Users/tanner/Developer/ttr-mods/frida/run-injector.sh
+#   sudo -n TTRMOD_SCRIPT=frida/diag.py /Users/tanner/Developer/ttrff/frida/run-injector.sh
 #
 # Reports, after WINDOW seconds:
 #   eval_code   : how many PyEval_EvalCode calls (module exec/import)

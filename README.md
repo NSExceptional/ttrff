@@ -1,4 +1,4 @@
-# ttr-mods
+# ttrff
 
 Personal, cosmetic quality-of-life tweaks for the owner's **own** Toontown Rewritten
 client, on the owner's own machine and account. It attaches to the running game at

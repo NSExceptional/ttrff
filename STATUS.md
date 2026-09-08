@@ -1,4 +1,4 @@
-# ttr-mods — live TTR injection: technical status
+# ttrff — live TTR injection: technical status
 
 _Living technical doc for the **LIVE official-client** injection track (this repo), organized by
 topic, not by date. The mod set is fully working live. The separate, already-shipping local

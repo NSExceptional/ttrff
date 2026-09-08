@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ttr-mods driver -- host side.
+ttrff driver -- host side.
 
 Finds the running TTREngine, looks up the CPython C-API function addresses for
 this exact binary build (keyed by its arm64 Mach-O UUID in offsets.json), then
