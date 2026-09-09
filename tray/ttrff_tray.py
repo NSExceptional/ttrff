@@ -47,7 +47,10 @@ def _repo_root():
 REPO = _repo_root()
 RUN_INJECTOR_SH = os.path.join(REPO, "frida", "run-injector.sh")
 TRAMPOLINE_PY = os.path.join(REPO, "frida", "trampoline_inject.py")
-MODSET_PATH = os.environ.get("TTRMOD_MODSET") or os.path.join(REPO, "modset.json")
+DEFAULT_MODSET = os.path.join(REPO, "modset.json")   # the shipped default (read-only under Homebrew)
+# The editable mod table. Under Homebrew the wrapper points TTRMOD_MODSET at a user-writable copy
+# (the repo's modset.json lives in a read-only Cellar); it is seeded from DEFAULT_MODSET on first run.
+MODSET_PATH = os.environ.get("TTRMOD_MODSET") or DEFAULT_MODSET
 LOGFILE = os.environ.get("TTRFF_LOG") or os.path.join(tempfile.gettempdir(), "ttrff-tray-injector.log")
 
 # Stop-file: keep the established /tmp default on posix (matches scripts/tt-mod-stop and the
@@ -132,6 +135,21 @@ def _group_switches(spec, group):
             if isinstance(spec.get(key), dict):
                 out.append(spec[key])
     return out
+
+def seed_modset():
+    """Under Homebrew, MODSET_PATH is a user-writable copy that may not exist yet -- create it from
+    the shipped read-only default on first run. No-op when they're the same file (dev checkout)."""
+    if MODSET_PATH == DEFAULT_MODSET or os.path.exists(MODSET_PATH):
+        return
+    try:
+        import shutil
+        d = os.path.dirname(MODSET_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        shutil.copyfile(DEFAULT_MODSET, MODSET_PATH)
+    except Exception:
+        pass
+
 
 def load_modset():
     with open(MODSET_PATH) as f:
