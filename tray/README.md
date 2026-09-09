@@ -39,7 +39,19 @@ row is *pinned* — turning the Battle group off and back on never resurrects it
 
 **Dependencies:** `pystray`, `pillow`, `psutil` (plus `frida` on Windows).
 
-### Run from source (simplest)
+### macOS — Homebrew (recommended)
+
+```sh
+brew install --HEAD nscake/tap/ttrff
+ttrff-tray
+```
+
+Installs the menu-bar deps + the whole injector toolset and gives you a `ttrff-tray` command.
+Your editable mod table is seeded to `~/Library/Application Support/ttrff/modset.json` on first
+run (menu toggles edit that copy). Update later with `brew uninstall ttrff && brew install --HEAD
+nscake/tap/ttrff`.
+
+### Run from source (simplest, and the Windows path)
 
 ```sh
 pip install -r tray/requirements.txt
