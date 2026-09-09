@@ -549,7 +549,7 @@ def selftest():
                   % (key, label, "ON " if group_is_on(spec, key) else "off", n, "" if n == 1 else "es"))
     except Exception as e:
         print("  groups        : ERROR reading modset.json:", e)
-    print("\nOK -- selftest complete (nothing was launched or modified).")
+    print("\nOK -- selftest complete (no injector launched).")
 
 
 def _dep_ok(mod):
@@ -564,8 +564,10 @@ def main():
     ap = argparse.ArgumentParser(description="ttrff tray -- menu-bar/tray controller for the ttrff mods.")
     ap.add_argument("--selftest", action="store_true",
                     help="print resolved paths, launch command, engine + group status, then exit "
-                         "(launches nothing, changes nothing)")
+                         "(launches no injector; seeds the mod table on first run)")
     args = ap.parse_args()
+
+    seed_modset()   # first run: create the user-writable mod table from the shipped default
 
     if args.selftest:
         selftest()
