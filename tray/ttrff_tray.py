@@ -435,6 +435,55 @@ def _make_image(color):
     return img
 
 
+def _patch_pystray_hidpi():
+    """Make pystray's macOS backend render the menu-bar icon at Retina resolution.
+
+    pystray 0.19.x resizes the icon to the status-bar thickness in *pixels* (e.g. 22x22)
+    and builds the NSImage from a PNG with no DPI metadata, so it renders @1x and looks
+    blurry on @2x displays. Replace its _assert_image with a HiDPI-aware version that
+    adds a 2x representation via NSBitmapImageRep.
+    """
+    try:
+        import io as _io
+        import PIL.Image as _PILImage
+        import pystray._darwin as _darwin
+        import AppKit
+        import Foundation
+    except Exception:
+        return
+
+    def _assert_image(self):
+        thickness = self._status_bar.thickness()
+        size = (int(thickness), int(thickness))
+        if self._icon_image and self._icon_image.size() == size:
+            return
+
+        def _png_at(px):
+            im = self._icon
+            if im.size != px:
+                im = im.resize(px, _PILImage.Resampling.LANCZOS)
+            b = _io.BytesIO()
+            im.save(b, "png")
+            return b.getvalue()
+
+        icon = AppKit.NSImage.alloc().initWithSize_(AppKit.NSSize(*size))
+        for scale in (2, 1):                       # 2x first: macOS picks the best match
+            px = (size[0] * scale, size[1] * scale)
+            data = _png_at(px)
+            nsdata = Foundation.NSData(data)
+            rep = AppKit.NSBitmapImageRep.imageRepWithData_(nsdata)
+            if rep is None:
+                continue
+            rep.setSize_(AppKit.NSSize(*size))
+            rep.setPixelsWide_(px[0])
+            rep.setPixelsHigh_(px[1])
+            icon.addRepresentation_(rep)
+        self._icon_image = icon
+        self._status_item.button().setImage_(icon)
+
+    _darwin.Icon._assert_image = _assert_image
+
+
 class TrayApp:
     def __init__(self):
         self.sup = Supervisor(on_change=self._refresh)
@@ -519,9 +568,11 @@ class TrayApp:
             try:
                 from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
                 NSApplication.sharedApplication().setActivationPolicy_(
-                    NSApplicationActivationPolicyProhibited)
+                    NSApplicationActivationPolicyProhibited
+                )
             except Exception:
                 pass
+            _patch_pystray_hidpi()
         self.icon = Icon("ttrff", icon=_make_image(STATUS_COLORS["off"]),
                          title=self._status_line(), menu=self._build_menu())
 
