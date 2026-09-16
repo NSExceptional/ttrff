@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ttrff-tray"
+name = "ttrff"
 version = "0.1.0"
 description = "Menu-bar / system-tray controller that auto-attaches the ttrff cosmetic mods to Toontown Rewritten."
 requires-python = ">=3.8"
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ttrff-tray = "ttrff_tray:main"
+ttrff = "ttrff_tray:main"
 
 [tool.setuptools]
 py-modules = ["ttrff_tray"]

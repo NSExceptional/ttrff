@@ -43,10 +43,10 @@ row is *pinned* — turning the Battle group off and back on never resurrects it
 
 ```sh
 brew install --HEAD nscake/tap/ttrff
-ttrff-tray
+ttrff
 ```
 
-Installs the menu-bar deps + the whole injector toolset and gives you a `ttrff-tray` command.
+Installs the menu-bar deps + the whole injector toolset and gives you a `ttrff` command.
 Your editable mod table is seeded to `~/Library/Application Support/ttrff/modset.json` on first
 run (menu toggles edit that copy). Update later with `brew uninstall ttrff && brew install --HEAD
 nscake/tap/ttrff`.
@@ -58,11 +58,11 @@ pip install -r tray/requirements.txt
 python tray/ttrff_tray.py
 ```
 
-### Or install a `ttrff-tray` command
+### Or install a `ttrff` command
 
 ```sh
 pip install -e ./tray      # editable, so it still finds the repo's frida/ and modset.json
-ttrff-tray
+ttrff
 ```
 
 Verify wiring without launching or changing anything:

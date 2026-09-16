@@ -400,6 +400,10 @@ class Supervisor:
 
 def _make_image(color):
     from PIL import Image, ImageDraw
+    # pystray 0.19.x calls PIL.Image.ANTIALIAS when it resizes the menu-bar icon, but Pillow >= 10
+    # removed that name (renamed to Resampling.LANCZOS). Restore the alias so the icon can render.
+    if not hasattr(Image, "ANTIALIAS"):
+        Image.ANTIALIAS = Image.Resampling.LANCZOS
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse([4, 4, 60, 60], fill=color + (255,))
