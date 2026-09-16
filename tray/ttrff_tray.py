@@ -404,6 +404,28 @@ def _make_image(color):
     # removed that name (renamed to Resampling.LANCZOS). Restore the alias so the icon can render.
     if not hasattr(Image, "ANTIALIAS"):
         Image.ANTIALIAS = Image.Resampling.LANCZOS
+    # The Toontown eyeballs (extracted from the official logo), tinted by status color.
+    eyes_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eyes.png")
+    try:
+        img = Image.open(eyes_path).convert("RGBA")
+    except Exception:
+        img = None
+    if img is not None:
+        # tint: recolor every opaque pixel with the status color, keep the pupils dark
+        px = img.load()
+        w, h = img.size
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = px[x, y]
+                if a == 0:
+                    continue
+                lum = (r + g + b) / 3.0
+                if lum < 128:
+                    px[x, y] = (0, 0, 0, a)          # pupil / outline stays black
+                else:
+                    px[x, y] = color + (a,)          # eye white takes the status tint
+        return img
+    # fallback: the old fast-forward glyph
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse([4, 4, 60, 60], fill=color + (255,))
@@ -492,6 +514,14 @@ class TrayApp:
 
     def run(self):
         from pystray import Icon
+        if IS_MAC:
+            # No dock icon: become a background/agent app (menu-bar item only).
+            try:
+                from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+                NSApplication.sharedApplication().setActivationPolicy_(
+                    NSApplicationActivationPolicyProhibited)
+            except Exception:
+                pass
         self.icon = Icon("ttrff", icon=_make_image(STATUS_COLORS["off"]),
                          title=self._status_line(), menu=self._build_menu())
 
