@@ -58,10 +58,10 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 
 ## Publishing / install (Windows)
 
-- Distribution is Scoop, and **the repo itself is the bucket** (the manifest lives at the repo root, `ttrff.json`): `scoop bucket add ttrff https://github.com/NSExceptional/ttrff` then `scoop install ttrff` — the Windows analog of `brew tap` + `brew install --HEAD`. A manifest-URL one-liner also works (`scoop install https://raw.githubusercontent.com/NSExceptional/ttrff/main/ttrff.json`). The manifest points at the rolling `windows-latest` release artifact (`ttrff-windows.zip`), rebuilt by `.github/workflows/windows-artifact.yml` on every push to `main`, which also commits the manifest's hash + `0.0.<run-number>` version in-repo (`[skip ci]`). "Publish" = push; "install/update" = `scoop update ttrff`.
+- Distribution is Scoop via the **NSCake/scoop-bucket** repo (the Windows analog of the nscake Homebrew tap; one bucket for all NSCake packages): `scoop bucket add nscake https://github.com/NSCake/scoop-bucket` then `scoop install ttrff`. The manifest (`ttrff.json`) lives in that bucket repo and points at this repo's rolling `windows-latest` release artifact (`ttrff-windows.zip`), rebuilt by `.github/workflows/windows-artifact.yml` on every push to `main`. The bucket's own `sync-manifests` workflow refreshes the manifest hash + bumps a monotonic version on a schedule (every 6h) — no secrets, no cross-repo pushes. "Publish" = push; "install/update" = `scoop update ttrff`.
 - The artifact is built by `packaging/build-artifact.ps1` (same runtime tree as the formula's `libexec.install`, minus the macOS-only signed runner) and launched by `packaging/bin/ttrff.cmd` (private venv in the app dir on first run; deps pystray/pillow/psutil/frida).
 - The Windows editable mod table lives at `%LOCALAPPDATA%\ttrff\modset.json` (seeded on first run) — don't clobber it.
-- New runtime files must be added to `packaging/build-artifact.ps1`'s copy list (and the formula's `libexec.install`), or they won't ship on that platform.
+- New runtime files must be added to `packaging/build-artifact.ps1`'s copy list (and the formula's `libexec.install`), or they won't ship on that platform. New *packages* get a manifest dropped in the bucket repo root — the bucket's sync workflow picks them up automatically.
 
 ## Conventions
 

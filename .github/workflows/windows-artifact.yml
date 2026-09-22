@@ -1,10 +1,9 @@
 # Build the portable Windows artifact and publish it to the rolling "windows-latest"
-# release. The Scoop manifest (ttrff.json, at the repo root -- the repo doubles as the
-# bucket) points at releases/latest/download/ttrff-windows.zip, so a push -> new artifact
+# release. The Scoop manifest lives in the NSCake/scoop-bucket repo (the Windows analog
+# of the nscake homebrew tap) and points at releases/latest/download/ttrff-windows.zip;
+# that bucket's sync-manifests workflow refreshes the manifest hash/version on a
+# schedule. This workflow only builds + uploads: push -> new artifact -> the bucket syncs
 # -> `scoop update` picks it up -- the Windows counterpart of the Homebrew --HEAD flow.
-#
-# The manifest's `version` is a monotonic 0.0.<run-number> written by CI (below), so
-# Scoop sees an update on every push; the artifact itself always tracks HEAD.
 name: windows-artifact
 
 on:
@@ -17,14 +16,11 @@ on:
       - 'modset.json'
       - 'offsets.json'
       - 'capi-symbols*.json'
-      - 'ttrff.json'
       - 'packaging/**'
       - '.github/workflows/windows-artifact.yml'
   workflow_dispatch:
 
-# Serialize runs: two concurrent runs both try to commit the manifest hash and the
-# loser's push is rejected (observed with a manual dispatch racing a push run).
-# cancel-in-progress=false so a queued run still builds the artifact for its commit.
+# Serialize runs so overlapping builds don't race on the release upload.
 concurrency:
   group: windows-artifact
   cancel-in-progress: false
@@ -48,7 +44,7 @@ jobs:
           name: ttrff-windows
           path: dist/ttrff-windows.zip
 
-      - name: Publish to rolling release + update manifest
+      - name: Publish to rolling release
         shell: pwsh
         run: |
           $tag = "windows-latest"
@@ -56,29 +52,8 @@ jobs:
           if (-not $rel) {
             gh release create $tag --repo $env:GITHUB_REPOSITORY `
               --title "ttrff Windows (rolling)" `
-              --notes "Rolling build of main. Rebuilt on every push; the Scoop manifest points here. Not a versioned release."
+              --notes "Rolling build of main. Rebuilt on every push; the Scoop manifest (NSCake/scoop-bucket) points here. Not a versioned release."
           }
           gh release upload $tag dist/ttrff-windows.zip --repo $env:GITHUB_REPOSITORY --clobber
-
-          # Update the Scoop manifest in-repo with this build's hash + a monotonic
-          # version (the run number), so `scoop update` sees every push and the hash
-          # always matches the artifact. [skip ci] stops this commit re-triggering us.
-          $hash = (Get-FileHash dist/ttrff-windows.zip -Algorithm SHA256).Hash.ToLower()
-          $version = "0.0.$env:GITHUB_RUN_NUMBER"
-          $manifest = "ttrff.json"
-          $json = Get-Content $manifest -Raw | ConvertFrom-Json
-          $json.version = $version
-          $json.hash = $hash
-          $json | ConvertTo-Json -Depth 10 | Set-Content $manifest
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add $manifest
-          git commit -m "scoop manifest: version $version (hash of rolling artifact) [skip ci]"
-          # rebase-retry: a queued/overlapping run may have advanced main since checkout
-          for ($i = 0; $i -lt 3; $i++) {
-            git pull --rebase --autostash origin main
-            if ($LASTEXITCODE -eq 0) { git push; if ($LASTEXITCODE -eq 0) { break } }
-            else { git rebase --abort; Start-Sleep -Seconds 5 }
-          }
         env:
           GH_TOKEN: ${{ github.token }}
