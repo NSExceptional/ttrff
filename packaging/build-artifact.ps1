@@ -45,6 +45,8 @@ foreach ($f in $files) {
 # --- launcher ---
 New-Item -ItemType Directory -Force -Path (Join-Path $stage "bin") | Out-Null
 Copy-Item (Join-Path $repo "packaging\bin\ttrff.cmd") (Join-Path $stage "bin\ttrff.cmd")
+# the no-console launcher used by the Start Menu shortcut (Windows Search / Start Menu)
+Copy-Item (Join-Path $repo "packaging\bin\ttrff.vbs") (Join-Path $stage "bin\ttrff.vbs")
 
 # --- zip ---
 $zip = Join-Path $repo "$OutDir\ttrff-windows.zip"

@@ -9,6 +9,9 @@ rem pollution, `scoop uninstall ttrff` removes everything.
 rem
 rem The venv is created from the `python` on PATH (Scoop's python, if installed via
 rem Scoop, or any python 3.8+). If python is missing, print an actionable error.
+rem
+rem --hidden: run under pythonw (no console window) -- used by the Startup shortcut
+rem so logging in doesn't flash a terminal. The tray writes its own log either way.
 setlocal EnableExtensions
 set "APPDIR=%~dp0.."
 set "VENV=%APPDIR%\venv"
@@ -32,6 +35,13 @@ rem The editable mod table is seeded to %LOCALAPPDATA%\ttrff\modset.json on firs
 rem (TTRMOD_MODSET), so `scoop update` / reinstall never clobbers the user's factors.
 if "%TTRMOD_MODSET%"=="" set "TTRMOD_MODSET=%LOCALAPPDATA%\ttrff\modset.json"
 set "TTRFF_REPO=%APPDIR%"
+
+if "%1"=="--hidden" (
+    rem startup-item mode: pythonw detaches from the console; the tray keeps running
+    start "" /b "%VENV%\Scripts\pythonw.exe" "%APPDIR%\tray\ttrff_tray.py" %*
+    exit /b 0
+)
+
 "%PY%" "%APPDIR%\tray\ttrff_tray.py" %*
 exit /b %ERRORLEVEL%
 

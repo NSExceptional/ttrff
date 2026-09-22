@@ -763,11 +763,43 @@ def _dep_ok(mod):
         return "MISSING"
 
 
+def _acquire_single_instance():
+    """Single-instance lock: with several launch paths (shim, Start Menu shortcut, a login
+    item), a second tray would fight over the stop-file and spawn a second injector
+    supervisor. Cross-platform: a named POSIX semaphore / a Windows named mutex, held
+    for the process lifetime. Returns the handle to keep alive, or None if another
+    instance is already running (the caller exits silently -- the user just sees the
+    existing tray)."""
+    name = "ttrff-tray-singleton"
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            # CreateMutexW: ERROR_ALREADY_EXISTS (183) means another instance holds it
+            handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+            if handle == 0:
+                return None            # can't create -- fall back to running anyway
+            if ctypes.windll.kernel32.GetLastError() == 183:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return None            # already running
+            return handle
+        import posix_ipc                # optional dep; if absent, skip the guard
+        return posix_ipc.Semaphore(name, flags=posix_ipc.O_CREAT | posix_ipc.O_EXCL)
+    except ImportError:
+        return "no-lock"               # guard unavailable -- run anyway
+    except FileExistsError:
+        return None                    # already running (posix semaphore exists)
+    except Exception:
+        return "no-lock"               # never block startup on the guard itself
+
+
 def main():
     ap = argparse.ArgumentParser(description="ttrff tray -- menu-bar/tray controller for the ttrff mods.")
     ap.add_argument("--selftest", action="store_true",
                     help="print resolved paths, launch command, engine + group status, then exit "
                          "(launches no injector; seeds the mod table on first run)")
+    ap.add_argument("--hidden", action="store_true",
+                    help="no-op marker passed by the no-console launcher (Start Menu shortcut / "
+                         "login item); the tray behaves identically either way")
     args = ap.parse_args()
 
     seed_modset()   # first run: create the user-writable mod table from the shipped default
@@ -781,6 +813,10 @@ def main():
         sys.exit("missing dependencies: %s\n  pip install pystray pillow psutil"
                  % ", ".join("pillow" if m == "PIL" else m for m in missing))
 
+    lock = _acquire_single_instance()
+    if lock is None:
+        # another tray is already running -- it owns the stop-file + supervisor
+        sys.exit(0)
     TrayApp().run()
 
 
