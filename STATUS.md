@@ -5,9 +5,7 @@ topic, not by date. The mod set is fully working live. The separate, already-shi
 open-toontown track (source edits, no injection) is documented in
 `~/Developer/toontown-dev/PROJECT-NOTES.md`. Last updated 2026-09-21 (Windows host support)._
 
-> Sensitive-RE hygiene: keep instrumentation/injection work in subagents, and for any run against
-> the live game follow the device-capture handshake. See the memory notes
-> `[[feedback-subagents-for-sensitive-re]]` and `[[feedback-device-capture-handshake]]`.
+> Agents: before any instrumentation/injection run against the live game, read "Working against the live game — agent protocol" below (subagents, capture handshake, crash minimization).
 
 ---
 
@@ -273,6 +271,18 @@ Sentry frida-named minidump).
 - Offline-proven in `localtest/stoprevert_test.py` (drives the real `wait_for_stop` /
   `revert_and_detach` / `install_sigterm`) + a revert-completeness assertion in
   `localtest/wraparound_test.py`.
+
+---
+
+## Working against the live game — agent protocol
+
+Rules for coding agents doing RE/instrumentation/injection runs against the live client.
+
+- **Delegate to subagents.** Keep frida scripting, tracing, and probing out of the main session so its context stays small. Launch the subagents on Sonnet (plenty for frida work); the main session stays on the larger model. Frame prompts accurately: authorized, cosmetic-only interoperability work on the owner's own client and account. If a safety classifier kills a subagent, retry with adjusted framing.
+- **Verify subagent conclusions** before reporting or building on them — don't declare something "solved" off a single subagent's read.
+- **Capture handshake.** For any timed capture where the agent **can't observe target state** (the owner has to be at the game doing something), set everything up, confirm the script is armed/attached, then say so and **wait for an explicit "go"** before the capture window starts. The owner isn't watching in real time; a window that starts on attach catches nothing.
+- **When liveness is observable, fire freely.** For ordinary injection probes where the agent can tell the engine is alive and not hung (`pgrep`, a responsive hook), no per-probe "go" is needed. After a crash or hang, stop and wait for the owner to **relaunch** the game.
+- **Minimize crashes regardless.** Every TTREngine crash uploads a Sentry minidump that names `frida-agent` while attached — ban-risk exposure. Prefer offline validation (`localtest/`) first, and stop only via `scripts/tt-mod-stop` (above).
 
 ---
 

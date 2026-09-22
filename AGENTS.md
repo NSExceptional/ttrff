@@ -95,5 +95,5 @@ and the formula (nscake tap).
 - 4-space indent; match the file you're editing.
 - Keep the tray a thin supervisor — injection logic changes go in `frida/`, not `tray/`.
 - `STATUS.md` is the living doc: update it (not just commit messages) when engine internals or per-build facts change.
-- Sensitive-RE/instrumentation work against the live game goes in subagents, following the device-capture handshake (see memory notes referenced in STATUS.md).
+- Sensitive-RE/instrumentation work against the live game goes in subagents, following the capture handshake — see STATUS.md "Working against the live game — agent protocol".
 - Don't manually wrap lines in markdown (or commit messages) — let text reflow.
