@@ -10,8 +10,5 @@
     "checkver": {
         "url": "https://raw.githubusercontent.com/NSExceptional/ttrff/main/packaging/ttrff.json",
         "jsonpath": "$.version"
-    },
-    "autoupdate": {
-        "url": "https://github.com/NSExceptional/ttrff/releases/latest/download/ttrff-windows.zip"
     }
 }

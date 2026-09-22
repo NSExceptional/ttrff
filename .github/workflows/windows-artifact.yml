@@ -41,7 +41,7 @@ jobs:
           name: ttrff-windows
           path: dist/ttrff-windows.zip
 
-      - name: Publish to rolling release
+      - name: Publish to rolling release + update manifest
         shell: pwsh
         run: |
           $tag = "windows-latest"
@@ -49,9 +49,24 @@ jobs:
           if (-not $rel) {
             gh release create $tag --repo $env:GITHUB_REPOSITORY `
               --title "ttrff Windows (rolling)" `
-              --notes "Rolling build of main. Rebuilt on every push; the Scoop manifest points here. Not a versioned release." `
-              --prerelease
+              --notes "Rolling build of main. Rebuilt on every push; the Scoop manifest points here. Not a versioned release."
           }
           gh release upload $tag dist/ttrff-windows.zip --repo $env:GITHUB_REPOSITORY --clobber
+
+          # Update the Scoop manifest in-repo with this build's hash + a monotonic
+          # version (the run number), so `scoop update` sees every push and the hash
+          # always matches the artifact. [skip ci] stops this commit re-triggering us.
+          $hash = (Get-FileHash dist/ttrff-windows.zip -Algorithm SHA256).Hash.ToLower()
+          $version = "0.0.$env:GITHUB_RUN_NUMBER"
+          $manifest = "packaging/ttrff.json"
+          $json = Get-Content $manifest -Raw | ConvertFrom-Json
+          $json.version = $version
+          $json.hash = $hash
+          $json | ConvertTo-Json -Depth 10 | Set-Content $manifest
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add $manifest
+          git commit -m "scoop manifest: version $version (hash of rolling artifact) [skip ci]"
+          git push
         env:
           GH_TOKEN: ${{ github.token }}
