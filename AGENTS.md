@@ -49,25 +49,46 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 - The tray launches the injector **detached** (own process group) so a tray crash can't kill it mid-hook; it only ever stops via the stop-file.
 - Env overrides for retargeting (Windows agent, moved checkouts): `TTRFF_REPO`, `TTRMOD_MODSET`, `TTRFF_ENGINE_NAMES`, `TTRFF_INJECTOR_PYTHON`, `TTRFF_STOPFILE`, `TTRFF_LOG`. No code edits should be needed to retarget.
 
-## Publishing / install (macOS, this machine)
+## How to publish an update (both platforms)
+
+**The one rule: `git push` to `origin/main` IS the publish.** There is no build step, no
+release, no artifact to upload — both package managers consume the repo directly:
+
+- **macOS (Homebrew):** the `--HEAD` formula clones this repo at install time and builds
+  on the user's Mac. Nothing to do after pushing except reinstall locally:
+  `brew uninstall ttrff && brew install --HEAD nscake/tap/ttrff`.
+- **Windows (Scoop):** the manifest's `url` is GitHub's auto-generated **branch archive**
+  (`https://github.com/NSExceptional/ttrff/archive/refs/heads/main.zip`) — the same
+  mechanism the tap uses, no CI-built zip. Scoop decides "is there an update" by the
+  manifest's `version` string, so the **NSCake/scoop-bucket** repo's `sync-manifests`
+  workflow (runs every 6h + on bucket pushes) records the latest `main` commit sha as
+  the version. After pushing here, that's it — users get it on their next
+  `scoop update ttrff` (up to ~6h later, or immediately after a bucket push/dispatch).
+
+**When you add a file the tray/injector needs at runtime**, it must be added to the
+formula's `libexec.install` list in the nscake tap (macOS) — the Scoop side needs nothing,
+since it installs the whole repo tree. **When you change the packaging layout** (paths the
+launcher/manifest reference), update: `packaging/bin/ttrff.cmd` + `ttrff.vbs` (path
+resolution), the bucket manifest's `extract_dir`/`bin`/`shortcuts` (NSCake/scoop-bucket),
+and the formula (nscake tap).
+
+## Publishing / install (macOS)
 
 - Distribution is Homebrew: `brew install --HEAD nscake/tap/ttrff` (HEAD-only formula; it pip-installs pinned prebuilt wheels into a private venv and copies `tray/`, `frida/`, `scripts/`, the RE data tables, and `modset.json` into `libexec`).
-- "Publish" = commit + push to `origin/main` (`NSExceptional/ttrff`). "Install" = `brew uninstall ttrff && brew install --HEAD nscake/tap/ttrff`. Verify with `ttrff --selftest` and check the Cellar is at the new commit.
+- The formula also installs a **`ttrff.app` bundle into `~/Applications`** via the `app` stanza (source: `packaging/app/Info.plist`; `LSBackgroundOnly` — menu-bar app, no Dock icon). Spotlight-launchable; the executable execs the `bin/ttrff` launcher, so the .app and the command are the same app.
+- "Install/update" = `brew uninstall ttrff && brew install --HEAD nscake/tap/ttrff`. Verify with `ttrff --selftest` and check the Cellar is at the new commit.
 - The user's editable mod table lives at `~/Library/Application Support/ttrff/modset.json` (seeded from the read-only Cellar default on first run) — don't clobber it.
 - New files the tray/injector need at runtime must be added to the formula's `libexec.install` list in the nscake tap, or they won't ship.
 
 ## Publishing / install (Windows)
 
-- Distribution is Scoop via the **NSCake/scoop-bucket** repo (the Windows analog of the nscake Homebrew tap; one bucket for all NSCake packages): `scoop bucket add nscake https://github.com/NSCake/scoop-bucket` then `scoop install ttrff`. The manifest (`ttrff.json`) lives in that bucket repo and points at this repo's rolling `windows-latest` release. The bucket's own `sync-manifests` workflow discovers the newest run-numbered asset, records url+hash from the same bytes, and bumps a monotonic version (every 6h + push + dispatch) — no secrets, no cross-repo pushes. "Publish" = push; "install/update" = `scoop update ttrff`.
-- **App-like launch:** the manifest's `shortcuts` field creates a Start Menu shortcut to `bin/ttrff.vbs` (no-console launcher → pythonw), so Windows Search finds "ttrff" like a normal app. The tray has a single-instance guard (named mutex) so double-launching is a no-op.
-- **Immutable assets:** CI uploads one `ttrff-windows-<run>.zip` per build (never clobbered — a fixed-name asset caused hash-check failures on back-to-back pushes) and prunes to the newest 5. `gh release upload`'s `file#label` syntax sets a display LABEL, not the asset name — rename the file before upload.
-- The artifact is built by `packaging/build-artifact.ps1` (same runtime tree as the formula's `libexec.install`, minus the macOS-only signed runner) and launched by `packaging/bin/ttrff.cmd` (private venv in the app dir on first run; deps pystray/pillow/psutil/frida).
+- Distribution is Scoop via the **NSCake/scoop-bucket** repo (the Windows analog of the nscake Homebrew tap; one bucket for all NSCake packages): `scoop bucket add nscake https://github.com/NSCake/scoop-bucket` then `scoop install ttrff`. The manifest (`ttrff.json`) lives in that bucket repo.
+- **No CI, no built artifact:** the manifest's `url` is GitHub's auto-generated branch archive of `main` (with `extract_dir: ttrff-main`), and there is deliberately **no `hash`** — a branch archive's bytes change on every push, so a pinned hash would go stale instantly (this exact failure was observed with a fixed-name release asset). Scoop warns and the user confirms on install; that is the accepted trade-off for a HEAD-tracking personal tool, same trust model as the brew `--HEAD` formula.
+- **Version = the `main` commit sha** (short form), recorded by the bucket's `sync-manifests` workflow (every 6h + push + dispatch). That's the ONLY thing that ever needs updating in the bucket — no bytes are published anywhere.
+- **App-like launch:** the manifest's `shortcuts` field creates a Start Menu shortcut to `packaging/bin/ttrff.vbs` (no-console launcher → `ttrff.cmd --hidden` → pythonw), so Windows Search finds "ttrff" like a normal app. The tray has a single-instance guard (named mutex) so double-launching is a no-op.
+- The launcher is `packaging/bin/ttrff.cmd` (private venv in the app dir on first run; deps pystray/pillow/psutil/frida; needs `python` on PATH). It resolves all paths relative to its own location, so it works from the Scoop install (repo tree) and a plain checkout alike.
 - The Windows editable mod table lives at `%LOCALAPPDATA%\ttrff\modset.json` (seeded on first run) — don't clobber it.
-- New runtime files must be added to `packaging/build-artifact.ps1`'s copy list (and the formula's `libexec.install`), or they won't ship on that platform. New *packages* get a manifest dropped in the bucket repo root with `release_repo`/`release_tag` keys — the bucket's sync workflow picks them up automatically.
-
-## Publishing / install (macOS) — app bundle
-
-- The formula (nscake tap) also installs a **`ttrff.app` bundle into `~/Applications`** via the `app` stanza (source: `packaging/app/Info.plist`; `LSBackgroundOnly` — menu-bar app, no Dock icon). Spotlight-launchable; the executable execs the `bin/ttrff` launcher, so the .app and the command are the same app.
+- New *packages* get a manifest dropped in the bucket repo root with a `source_repo` key — the bucket's sync workflow records its latest commit sha as the version automatically.
 
 ## Conventions
 

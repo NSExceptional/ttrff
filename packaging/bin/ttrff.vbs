@@ -2,15 +2,18 @@
 '
 ' Used by the Start Menu shortcut (Scoop `shortcuts`) so launching from Windows
 ' Search / the Start Menu doesn't flash a console window: WScript.Shell.Run with
-' the window style 0 (hidden) starts bin\ttrff.cmd --hidden, which runs the tray
-' under pythonw (no console). The tray itself is a single-instance app -- a second
-' launch just exits, so double-clicking the shortcut repeatedly is harmless.
+' the window style 0 (hidden) starts packaging\bin\ttrff.cmd --hidden, which runs
+' the tray under pythonw (no console). The tray itself is a single-instance app --
+' a second launch just exits, so double-clicking the shortcut repeatedly is harmless.
 '
+' Works from BOTH install layouts: the Scoop install (this file at <app>\packaging\bin\)
+' and a plain repo checkout -- paths are resolved relative to this file's location.
 ' Deliberately plain VBScript (no args parsing): the shortcut always launches the
 ' tray the same way. For a console run with output (e.g. --selftest), use the
 ' `ttrff` shim on PATH instead.
 Dim appdir, shell, fso
 Set fso = CreateObject("Scripting.FileSystemObject")
-appdir = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
+' appdir = the repo/app root (two levels up from packaging\bin\)
+appdir = fso.GetParentFolderName(fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName)))
 Set shell = CreateObject("WScript.Shell")
-shell.Run """" & appdir & "\bin\ttrff.cmd"" --hidden", 0, False
+shell.Run """" & appdir & "\packaging\bin\ttrff.cmd"" --hidden", 0, False
