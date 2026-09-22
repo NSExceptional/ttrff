@@ -58,10 +58,16 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 
 ## Publishing / install (Windows)
 
-- Distribution is Scoop via the **NSCake/scoop-bucket** repo (the Windows analog of the nscake Homebrew tap; one bucket for all NSCake packages): `scoop bucket add nscake https://github.com/NSCake/scoop-bucket` then `scoop install ttrff`. The manifest (`ttrff.json`) lives in that bucket repo and points at this repo's rolling `windows-latest` release artifact (`ttrff-windows.zip`), rebuilt by `.github/workflows/windows-artifact.yml` on every push to `main`. The bucket's own `sync-manifests` workflow refreshes the manifest hash + bumps a monotonic version on a schedule (every 6h) — no secrets, no cross-repo pushes. "Publish" = push; "install/update" = `scoop update ttrff`.
+- Distribution is Scoop via the **NSCake/scoop-bucket** repo (the Windows analog of the nscake Homebrew tap; one bucket for all NSCake packages): `scoop bucket add nscake https://github.com/NSCake/scoop-bucket` then `scoop install ttrff`. The manifest (`ttrff.json`) lives in that bucket repo and points at this repo's rolling `windows-latest` release. The bucket's own `sync-manifests` workflow discovers the newest run-numbered asset, records url+hash from the same bytes, and bumps a monotonic version (every 6h + push + dispatch) — no secrets, no cross-repo pushes. "Publish" = push; "install/update" = `scoop update ttrff`.
+- **App-like launch:** the manifest's `shortcuts` field creates a Start Menu shortcut to `bin/ttrff.vbs` (no-console launcher → pythonw), so Windows Search finds "ttrff" like a normal app. The tray has a single-instance guard (named mutex) so double-launching is a no-op.
+- **Immutable assets:** CI uploads one `ttrff-windows-<run>.zip` per build (never clobbered — a fixed-name asset caused hash-check failures on back-to-back pushes) and prunes to the newest 5. `gh release upload`'s `file#label` syntax sets a display LABEL, not the asset name — rename the file before upload.
 - The artifact is built by `packaging/build-artifact.ps1` (same runtime tree as the formula's `libexec.install`, minus the macOS-only signed runner) and launched by `packaging/bin/ttrff.cmd` (private venv in the app dir on first run; deps pystray/pillow/psutil/frida).
 - The Windows editable mod table lives at `%LOCALAPPDATA%\ttrff\modset.json` (seeded on first run) — don't clobber it.
-- New runtime files must be added to `packaging/build-artifact.ps1`'s copy list (and the formula's `libexec.install`), or they won't ship on that platform. New *packages* get a manifest dropped in the bucket repo root — the bucket's sync workflow picks them up automatically.
+- New runtime files must be added to `packaging/build-artifact.ps1`'s copy list (and the formula's `libexec.install`), or they won't ship on that platform. New *packages* get a manifest dropped in the bucket repo root with `release_repo`/`release_tag` keys — the bucket's sync workflow picks them up automatically.
+
+## Publishing / install (macOS) — app bundle
+
+- The formula (nscake tap) also installs a **`ttrff.app` bundle into `~/Applications`** via the `app` stanza (source: `packaging/app/Info.plist`; `LSBackgroundOnly` — menu-bar app, no Dock icon). Spotlight-launchable; the executable execs the `bin/ttrff` launcher, so the .app and the command are the same app.
 
 ## Conventions
 

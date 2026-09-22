@@ -40,21 +40,24 @@ a change to *your* client's rendering.
 
 ```sh
 brew install --HEAD nscake/tap/ttrff
-ttrff
 ```
+
+Installs a `ttrff` command **and a `ttrff.app` in `~/Applications`** — launch it from
+Spotlight like any normal app.
 
 ### Windows — Scoop
 
 ```powershell
 scoop bucket add nscake https://github.com/NSCake/scoop-bucket
 scoop install ttrff
-ttrff
 ```
 
+A **ttrff** shortcut appears in the **Start Menu** — launch it from Windows Search like
+any normal app (no console window).
+
 Both install the tray app (see [`tray/README.md`](tray/README.md)) plus the whole injector
-toolset, tracking `main` — update with `brew reinstall` / `scoop update ttrff`. Start it with
-`ttrff` on either platform (on Windows the first run also creates the app's venv, ~a minute).
-Or run from source: `pip install -r tray/requirements.txt && python tray/ttrff_tray.py`.
+toolset, tracking `main` — update with `brew reinstall` / `scoop update ttrff`. Or run from
+source: `pip install -r tray/requirements.txt && python tray/ttrff_tray.py`.
 
 ## Running it
 
