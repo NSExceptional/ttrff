@@ -56,8 +56,10 @@ A **ttrff** shortcut appears in the **Start Menu** — launch it from Windows Se
 any normal app (no console window).
 
 Both install the tray app (see [`tray/README.md`](tray/README.md)) plus the whole injector
-toolset, tracking `main` — update with `brew reinstall` / `scoop update ttrff`. Or run from
-source: `pip install -r tray/requirements.txt && python tray/ttrff_tray.py`.
+toolset, tracking `main` — update with `brew reinstall` / `scoop update ttrff`. Both consume
+the repo directly (the brew formula clones it; the Scoop manifest installs the GitHub branch
+archive) — no CI-built artifacts anywhere. Or run from source:
+`pip install -r tray/requirements.txt && python tray/ttrff_tray.py`.
 
 ## Running it
 

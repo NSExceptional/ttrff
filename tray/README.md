@@ -62,13 +62,12 @@ Then start it like any normal app: a **ttrff** shortcut appears in the **Start M
 Windows Search finds it — type `ttrff`, Enter; no console window flashes). The `ttrff`
 command works too. First run creates the app's private venv (~a minute); after that it
 starts instantly. Installs from the **NSCake scoop-bucket** (the Windows analog of the
-`nscake` Homebrew tap — one bucket for all NSCake packages). The manifest points at this
-repo's rolling release — rebuilt on every push to `main`, so it tracks HEAD like the
-Homebrew `--HEAD` formula. The launcher needs `python` on PATH (`scoop install python`).
-Your editable mod table is seeded to `%LOCALAPPDATA%\ttrff\modset.json` on first run (menu
-toggles edit that copy); `scoop update ttrff` never clobbers it. Update =
-`scoop update ttrff` (new artifact) — or `scoop uninstall ttrff` + reinstall for a fully
-clean slate.
+`nscake` Homebrew tap — one bucket for all NSCake packages). The manifest installs this
+repo's GitHub branch archive of `main` — the same HEAD-tracking mechanism as the Homebrew
+`--HEAD` formula, with no CI-built artifacts. The launcher needs `python` on PATH
+(`scoop install python`). Your editable mod table is seeded to `%LOCALAPPDATA%\ttrff\modset.json`
+on first run (menu toggles edit that copy); `scoop update ttrff` never clobbers it. Update =
+`scoop update ttrff` — or `scoop uninstall ttrff` + reinstall for a fully clean slate.
 
 ### Run from source (simplest)
 
