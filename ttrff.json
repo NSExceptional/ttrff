@@ -9,4 +9,7 @@
   "bin": "bin\\ttrff.cmd",
   "checkver": {
         "url": "https://raw.githubusercontent.com/NSExceptional/ttrff/main/ttrff.json",
+        "jsonpath": "$.version"
+    }
 }
+
