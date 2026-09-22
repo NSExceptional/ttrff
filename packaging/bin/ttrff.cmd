@@ -12,8 +12,12 @@ rem Scoop, or any python 3.8+). If python is missing, print an actionable error.
 rem
 rem --hidden: run under pythonw (no console window) -- used by the Startup shortcut
 rem so logging in doesn't flash a terminal. The tray writes its own log either way.
+rem
+rem APPDIR = the repo/app ROOT (two levels up from packaging\bin\). The Scoop install
+rem is the repo tree itself (branch archive), so this resolves identically from the
+rem Scoop install and a plain checkout.
 setlocal EnableExtensions
-set "APPDIR=%~dp0.."
+set "APPDIR=%~dp0..\.."
 set "VENV=%APPDIR%\venv"
 set "PY=%VENV%\Scripts\python.exe"
 
