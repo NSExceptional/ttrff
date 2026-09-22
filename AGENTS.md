@@ -56,6 +56,13 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 - The user's editable mod table lives at `~/Library/Application Support/ttrff/modset.json` (seeded from the read-only Cellar default on first run) — don't clobber it.
 - New files the tray/injector need at runtime must be added to the formula's `libexec.install` list in the nscake tap, or they won't ship.
 
+## Publishing / install (Windows)
+
+- Distribution is Scoop via a manifest URL (no bucket): `scoop install https://raw.githubusercontent.com/NSExceptional/ttrff/main/packaging/ttrff.json`. The manifest points at the rolling `windows-latest` release artifact (`ttrff-windows.zip`), rebuilt by `.github/workflows/windows-artifact.yml` on every push to `main` — the Windows counterpart of the `--HEAD` formula. "Publish" = push; "install/update" = `scoop update ttrff`.
+- The artifact is built by `packaging/build-artifact.ps1` (same runtime tree as the formula's `libexec.install`, minus the macOS-only signed runner) and launched by `packaging/bin/ttrff.cmd` (private venv in the app dir on first run; deps pystray/pillow/psutil/frida).
+- The Windows editable mod table lives at `%LOCALAPPDATA%\ttrff\modset.json` (seeded on first run) — don't clobber it.
+- New runtime files must be added to `packaging/build-artifact.ps1`'s copy list (and the formula's `libexec.install`), or they won't ship on that platform.
+
 ## Conventions
 
 - 4-space indent; match the file you're editing.

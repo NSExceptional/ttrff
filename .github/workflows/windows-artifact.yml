@@ -1,0 +1,57 @@
+# Build the portable Windows artifact and publish it to the rolling "windows-latest"
+# release. The Scoop manifest (packaging/ttrff.json) points at
+# releases/latest/download/ttrff-windows.zip, so a push -> new artifact -> `scoop update`
+# picks it up -- the Windows counterpart of the Homebrew --HEAD flow.
+#
+# The manifest's `version` is a rolling date stamp (9999.MM.DD of the last packaging
+# change) so Scoop sees an update whenever the packaging changes; the artifact itself
+# always tracks HEAD.
+name: windows-artifact
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tray/**'
+      - 'frida/**'
+      - 'scripts/tt-mod-stop.cmd'
+      - 'modset.json'
+      - 'offsets.json'
+      - 'capi-symbols*.json'
+      - 'packaging/**'
+      - '.github/workflows/windows-artifact.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build artifact
+        shell: pwsh
+        run: ./packaging/build-artifact.ps1
+
+      - name: Upload artifact (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttrff-windows
+          path: dist/ttrff-windows.zip
+
+      - name: Publish to rolling release
+        shell: pwsh
+        run: |
+          $tag = "windows-latest"
+          $rel = gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if (-not $rel) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY `
+              --title "ttrff Windows (rolling)" `
+              --notes "Rolling build of main. Rebuilt on every push; the Scoop manifest points here. Not a versioned release." `
+              --prerelease
+          }
+          gh release upload $tag dist/ttrff-windows.zip --repo $env:GITHUB_REPOSITORY --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

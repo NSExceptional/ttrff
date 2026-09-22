@@ -719,7 +719,8 @@ def selftest():
     print("  platform      :", sys.platform, "(mac)" if IS_MAC else ("(windows)" if IS_WINDOWS else "(other)"))
     print("  repo          :", REPO)
     print("  modset.json   :", MODSET_PATH, "OK" if os.path.exists(MODSET_PATH) else "MISSING!")
-    print("  run-injector  :", RUN_INJECTOR_SH, "OK" if os.path.exists(RUN_INJECTOR_SH) else "MISSING")
+    if IS_MAC:
+        print("  run-injector  :", RUN_INJECTOR_SH, "OK" if os.path.exists(RUN_INJECTOR_SH) else "MISSING")
     print("  trampoline.py :", TRAMPOLINE_PY, "OK" if os.path.exists(TRAMPOLINE_PY) else "MISSING")
     print("  stop-file     :", STOPFILE)
     print("  log-file      :", LOGFILE)

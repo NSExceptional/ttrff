@@ -51,7 +51,22 @@ Your editable mod table is seeded to `~/Library/Application Support/ttrff/modset
 run (menu toggles edit that copy). Update later with `brew uninstall ttrff && brew install --HEAD
 nscake/tap/ttrff`.
 
-### Run from source (simplest, and the Windows path)
+### Windows — Scoop (recommended)
+
+```powershell
+scoop install https://raw.githubusercontent.com/NSExceptional/ttrff/main/packaging/ttrff.json
+ttrff
+```
+
+Installs the portable artifact (tray + injector toolset + RE tables) from the repo's rolling
+`windows-latest` release — rebuilt on every push to `main`, so it tracks HEAD like the Homebrew
+`--HEAD` formula. The `ttrff` launcher creates a private venv (pystray/pillow/psutil/frida) inside
+the app dir on first run; it needs `python` on PATH (`scoop install python`). Your editable mod
+table is seeded to `%LOCALAPPDATA%\ttrff\modset.json` on first run (menu toggles edit that copy);
+`scoop update ttrff` never clobbers it. Update = `scoop update ttrff` (new artifact) — or
+`scoop uninstall ttrff` + reinstall for a fully clean slate.
+
+### Run from source (simplest)
 
 ```sh
 pip install -r tray/requirements.txt
