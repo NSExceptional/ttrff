@@ -57,10 +57,16 @@ jobs:
           # IMMUTABLE per-run asset: never clobber a fixed-name zip (a concurrent build
           # would change the bytes under a hash the bucket already recorded -- observed as
           # a hash-check failure). The bucket sync discovers the newest run-numbered asset.
-          gh release upload $tag "dist/ttrff-windows.zip#ttrff-windows-$env:GITHUB_RUN_NUMBER.zip" --repo $env:GITHUB_REPOSITORY
-          # prune: keep only the newest 5 assets so the release doesn't grow forever
+          # NB: gh's `file#label` syntax sets a display LABEL, not the asset name -- so
+          # rename the file itself before upload.
+          Copy-Item dist/ttrff-windows.zip "dist/ttrff-windows-$env:GITHUB_RUN_NUMBER.zip"
+          gh release upload $tag "dist/ttrff-windows-$env:GITHUB_RUN_NUMBER.zip" --repo $env:GITHUB_REPOSITORY
+          # remove the legacy fixed-name asset (superseded by the run-numbered ones) and
+          # prune: keep only the newest 5 run-numbered assets so the release doesn't grow.
+          gh release delete-asset $tag ttrff-windows.zip --repo $env:GITHUB_REPOSITORY --yes 2>$null
           gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets -q '.assets[].name' |
-            Sort-Object { [int]($_ -replace '\D+(\d+)\.zip','$1') } -Descending |
+            Where-Object { $_ -match '^ttrff-windows-(\d+)\.zip$' } |
+            Sort-Object { [int]($_ -replace '^ttrff-windows-(\d+)\.zip$','$1') } -Descending |
             Select-Object -Skip 5 |
             ForEach-Object { gh release delete-asset $tag $_ --repo $env:GITHUB_REPOSITORY --yes }
         env:
