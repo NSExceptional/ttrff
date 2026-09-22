@@ -34,6 +34,26 @@ Because animations like teleport, book, doors, and battle are broadcast to every
 the same hook also speeds those up when other toons trigger them in your zone — still purely
 a change to *your* client's rendering.
 
+## Installing
+
+### macOS — Homebrew
+
+```sh
+brew install --HEAD nscake/tap/ttrff
+ttrff
+```
+
+### Windows — Scoop
+
+```powershell
+scoop bucket add nscake https://github.com/NSCake/scoop-bucket
+scoop install ttrff
+```
+
+Both install the tray app (see [`tray/README.md`](tray/README.md)) plus the whole injector
+toolset, tracking `main` — update with `brew reinstall` / `scoop update ttrff`. Or run from
+source: `pip install -r tray/requirements.txt && python tray/ttrff_tray.py`.
+
 ## Running it
 
 The config lives in [`modset.json`](modset.json) — a list of `{ "match", "factor", "group" }`
