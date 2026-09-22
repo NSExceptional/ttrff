@@ -22,6 +22,13 @@ on:
       - '.github/workflows/windows-artifact.yml'
   workflow_dispatch:
 
+# Serialize runs: two concurrent runs both try to commit the manifest hash and the
+# loser's push is rejected (observed with a manual dispatch racing a push run).
+# cancel-in-progress=false so a queued run still builds the artifact for its commit.
+concurrency:
+  group: windows-artifact
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -67,6 +74,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add $manifest
           git commit -m "scoop manifest: version $version (hash of rolling artifact) [skip ci]"
-          git push
+          # rebase-retry: a queued/overlapping run may have advanced main since checkout
+          for ($i = 0; $i -lt 3; $i++) {
+            git pull --rebase --autostash origin main
+            if ($LASTEXITCODE -eq 0) { git push; if ($LASTEXITCODE -eq 0) { break } }
+            else { git rebase --abort; Start-Sleep -Seconds 5 }
+          }
         env:
           GH_TOKEN: ${{ github.token }}
