@@ -1,11 +1,10 @@
 # Build the portable Windows artifact and publish it to the rolling "windows-latest"
-# release. The Scoop manifest (packaging/ttrff.json) points at
-# releases/latest/download/ttrff-windows.zip, so a push -> new artifact -> `scoop update`
-# picks it up -- the Windows counterpart of the Homebrew --HEAD flow.
+# release. The Scoop manifest (ttrff.json, at the repo root -- the repo doubles as the
+# bucket) points at releases/latest/download/ttrff-windows.zip, so a push -> new artifact
+# -> `scoop update` picks it up -- the Windows counterpart of the Homebrew --HEAD flow.
 #
-# The manifest's `version` is a rolling date stamp (9999.MM.DD of the last packaging
-# change) so Scoop sees an update whenever the packaging changes; the artifact itself
-# always tracks HEAD.
+# The manifest's `version` is a monotonic 0.0.<run-number> written by CI (below), so
+# Scoop sees an update on every push; the artifact itself always tracks HEAD.
 name: windows-artifact
 
 on:
@@ -18,6 +17,7 @@ on:
       - 'modset.json'
       - 'offsets.json'
       - 'capi-symbols*.json'
+      - 'ttrff.json'
       - 'packaging/**'
       - '.github/workflows/windows-artifact.yml'
   workflow_dispatch:
