@@ -54,17 +54,20 @@ nscake/tap/ttrff`.
 ### Windows — Scoop (recommended)
 
 ```powershell
-scoop install https://raw.githubusercontent.com/NSExceptional/ttrff/main/packaging/ttrff.json
-ttrff
+scoop bucket add ttrff https://github.com/NSExceptional/ttrff
+scoop install ttrff
 ```
 
-Installs the portable artifact (tray + injector toolset + RE tables) from the repo's rolling
-`windows-latest` release — rebuilt on every push to `main`, so it tracks HEAD like the Homebrew
-`--HEAD` formula. The `ttrff` launcher creates a private venv (pystray/pillow/psutil/frida) inside
-the app dir on first run; it needs `python` on PATH (`scoop install python`). Your editable mod
-table is seeded to `%LOCALAPPDATA%\ttrff\modset.json` on first run (menu toggles edit that copy);
-`scoop update ttrff` never clobbers it. Update = `scoop update ttrff` (new artifact) — or
-`scoop uninstall ttrff` + reinstall for a fully clean slate.
+The repo doubles as a Scoop bucket (the manifest lives at the repo root), so this is the Windows
+analog of `brew tap` + `brew install`. It installs the portable artifact (tray + injector toolset
++ RE tables) from the repo's rolling `windows-latest` release — rebuilt on every push to `main`,
+so it tracks HEAD like the Homebrew `--HEAD` formula. The `ttrff` launcher creates a private venv
+(pystray/pillow/psutil/frida) inside the app dir on first run; it needs `python` on PATH
+(`scoop install python`). Your editable mod table is seeded to `%LOCALAPPDATA%\ttrff\modset.json`
+on first run (menu toggles edit that copy); `scoop update ttrff` never clobbers it. Update =
+`scoop update ttrff` (new artifact) — or `scoop uninstall ttrff` + reinstall for a fully clean
+slate. (A one-liner also works without adding the bucket:
+`scoop install https://raw.githubusercontent.com/NSExceptional/ttrff/main/ttrff.json`.)
 
 ### Run from source (simplest)
 

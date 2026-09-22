@@ -58,7 +58,7 @@ jobs:
           # always matches the artifact. [skip ci] stops this commit re-triggering us.
           $hash = (Get-FileHash dist/ttrff-windows.zip -Algorithm SHA256).Hash.ToLower()
           $version = "0.0.$env:GITHUB_RUN_NUMBER"
-          $manifest = "packaging/ttrff.json"
+          $manifest = "ttrff.json"
           $json = Get-Content $manifest -Raw | ConvertFrom-Json
           $json.version = $version
           $json.hash = $hash

@@ -8,7 +8,5 @@
   "hash": "27f37992d0c814741f433e81d9a86a5be20622b5936bc96a75aa307854079b12",
   "bin": "bin\\ttrff.cmd",
   "checkver": {
-    "url": "https://raw.githubusercontent.com/NSExceptional/ttrff/main/packaging/ttrff.json",
-    "jsonpath": "$.version"
-  }
+        "url": "https://raw.githubusercontent.com/NSExceptional/ttrff/main/ttrff.json",
 }
