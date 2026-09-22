@@ -484,6 +484,119 @@ def _patch_pystray_hidpi():
     _darwin.Icon._assert_image = _assert_image
 
 
+def _patch_pystray_win32_hicon():
+    """Make pystray's Windows backend render the tray icon like the macOS one.
+
+    pystray 0.19.x writes the icon to a single-frame .ico (Pillow writes a 128x128
+    frame for a 128px source... but a SMALLER source gets ONE frame at ITS size) and
+    loads it with LoadImage(LR_DEFAULTSIZE), so the shell -- not us -- picks the frame
+    and scales it for the notification area. On a 100% DPI desktop the small-tray size
+    is typically 16x16/24x24 logical px; with only a 128x128 (or 32x32) frame present,
+    the shell's downscale is blurry and inconsistent.
+
+    Replace _assert_image_handle with a version that builds a proper multi-size ICO
+    (16/20/24/32/40/48/64 at 1x, plus 20/24/32/40/48/64 at 2x = 32..128 physical px,
+    so 150%/200% scaled displays get a crisp frame too -- the same idea as the macOS
+    2x representation in _patch_pystray_hidpi) and loads it with an EXPLICIT
+    SM_CXSMICON-size LoadImage instead of LR_DEFAULTSIZE, so Windows selects a sharp
+    frame at exactly the tray size. The eyes.png source is 128px, so every frame is a
+    high-quality LANCZOS downscale, identical pixels to the macOS icon.
+    """
+    try:
+        import io as _io
+        import ctypes as _ctypes
+        import PIL.Image as _PILImage
+        import pystray._win32 as _win32mod
+        import pystray._util.win32 as _u
+    except Exception:
+        return
+
+    # Python has no DPI-awareness manifest, so the process is DPI-UNAWARE: GetDpiForSystem()
+    # would return a virtualized 96 and the shell would upscale our 16px frame on scaled
+    # displays -- exactly the blur we are fixing. Opt into per-monitor-v2 awareness BEFORE any
+    # window exists (this patch runs in run(), before the Icon is constructed). Harmless if it
+    # fails (already set / old Windows): every step below then falls back gracefully.
+    try:
+        _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = _ctypes.c_void_p(-4)
+        _ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    except Exception:
+        pass
+
+    _FRAME_SIZES = [(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48),
+                    (64, 64), (128, 128)]
+
+    def _frames_for(im):
+        """Multi-resolution frame list: every size up to the source, each rendered from
+        the 128px source with LANCZOS (never a rescale of a rescale)."""
+        base = im if im.size[0] >= 128 else im.resize((128, 128), _PILImage.Resampling.LANCZOS)
+        frames = []
+        for sz in _FRAME_SIZES:
+            if sz[0] > base.size[0]:
+                continue
+            frames.append(base.resize(sz, _PILImage.Resampling.LANCZOS))
+        return frames
+
+    def _assert_icon_handle(self):
+        if self._icon_handle:
+            return
+
+        im = self.icon
+        im.load()
+        im = im.convert("RGBA") if im.mode != "RGBA" else im
+        frames = _frames_for(im)
+        b = _io.BytesIO()
+        # Pillow's ICO writer: sizes= picks frame sizes; frames matching a requested
+        # size are used as-is (no double-rescale), so our pre-rendered LANCZOS frames
+        # land in the file untouched.
+        im.save(b, "ICO", sizes=[f.size for f in frames], append_images=frames[1:])
+        data = b.getvalue()
+
+        # write the ICO once to %TEMP% (LoadImage needs a file; the pystray default
+        # writes a NEW temp file per update -- reuse ours to avoid churn) then load it
+        # at the exact small-icon size for the tray.
+        import os as _os
+        import tempfile as _tempfile
+        ico_path = _os.path.join(_tempfile.gettempdir(), "ttrff-tray.ico")
+        try:
+            with open(ico_path, "wb") as f:
+                f.write(data)
+            sm = _ctypes.windll.user32.GetSystemMetrics(49)  # SM_CXSMICON
+            if sm <= 0:
+                sm = 16
+            # scale by the process DPI so the loaded frame matches the physical tray
+            # size (LoadImage sizes are in physical px once we are DPI-aware; fallbacks
+            # keep it sane on pre-Win10 or if the API is unavailable).
+            try:
+                dpi = _ctypes.windll.user32.GetDpiForSystem()
+                if dpi and dpi != 96:
+                    sm = sm * dpi // 96
+            except Exception:
+                pass
+            self._icon_handle = _u.LoadImage(
+                None,
+                ico_path,
+                _u.IMAGE_ICON,
+                sm,
+                sm,
+                _u.LR_LOADFROMFILE)
+        except Exception:
+            # total fallback: pystray's stock behavior via a temp ICO
+            try:
+                with _win32mod.serialized_image(im, "ICO") as icon_path:
+                    self._icon_handle = _u.LoadImage(
+                        None,
+                        icon_path,
+                        _u.IMAGE_ICON,
+                        0,
+                        0,
+                        _u.LR_DEFAULTSIZE | _u.LR_LOADFROMFILE)
+            except Exception:
+                self._icon_handle = None
+
+    _win32mod.Icon._assert_icon_handle = _assert_icon_handle
+
+
 class TrayApp:
     def __init__(self):
         self.sup = Supervisor(on_change=self._refresh)
@@ -573,6 +686,10 @@ class TrayApp:
             except Exception:
                 pass
             _patch_pystray_hidpi()
+        elif IS_WINDOWS:
+            # Crisp tray icon at every DPI (multi-size ICO + exact-size LoadImage), matching
+            # the macOS Retina treatment of the same eyes.png source.
+            _patch_pystray_win32_hicon()
         self.icon = Icon("ttrff", icon=_make_image(STATUS_COLORS["off"]),
                          title=self._status_line(), menu=self._build_menu())
 

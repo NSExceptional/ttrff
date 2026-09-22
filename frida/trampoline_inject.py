@@ -29,10 +29,20 @@ import sys
 import json
 import signal
 import subprocess
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 IMAGE_BASE = 0x100000000
+
+# Host platform (the AGENT runs inside the target and is per-build; this only gates HOST plumbing).
+IS_WINDOWS = sys.platform.startswith("win")
+# Substring(s) that identify the engine process by name (frida's Windows enumeration exposes the
+# exe name, e.g. TTREngine.exe; posix keeps the proven `pgrep -f TTREngine`). Env-overridable so the
+# Windows agent can retarget with no code edits (mirrors the tray's TTRFF_ENGINE_NAMES).
+ENGINE_NEEDLES = [s.strip().lower() for s in
+                  os.environ.get("TTRMOD_ENGINE_NAMES", "TTREngine,Toontown Rewritten").split(",")
+                  if s.strip()]
 
 # milestone-1 target (env-overridable): a class that is always loaded and easy to trigger.
 T_MODULE = os.environ.get("TTRMOD_TMOD", "direct.showbase.Transitions")
@@ -1597,11 +1607,66 @@ function rpcHook(){ return ST.hook; }
 # These helpers are module-level (not nested in main) so localtest/stoprevert_test.py can drive the
 # REAL logic offline with a faithful fake agent -- no frida, no root, no live game.
 
-DEFAULT_STOPFILE = "/tmp/ttrmod-stop"
+# The stop file lives in the system temp dir on Windows (no /tmp); the tray already agrees on this
+# default (TTRFF_STOPFILE / %TEMP%\ttrmod-stop), and scripts/tt-mod-stop.cmd does too.
+DEFAULT_STOPFILE = os.path.join(tempfile.gettempdir(), "ttrmod-stop") if IS_WINDOWS else "/tmp/ttrmod-stop"
+
+
+def find_engine_pids():
+    """PIDs of running engine processes, via pgrep (posix) or psutil/tasklist (Windows). Raises on
+    no match so callers can surface it exactly like the old pgrep failure. psutil is a hard dep of
+    the tray; on Windows the injector runs under the same Python (TTRFF_INJECTOR_PYTHON)."""
+    if not IS_WINDOWS:
+        out = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()
+        return [int(p) for p in out]
+    try:
+        import psutil
+    except ImportError:
+        # tasklist fallback: name-only match (TTREngine.exe), fine for a same-user process
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq TTREngine.exe", "/FO", "CSV", "/NH"],
+            text=True, stderr=subprocess.DEVNULL)
+        pids = []
+        for line in out.splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2 and parts[0].lower().startswith("ttrengine"):
+                try:
+                    pids.append(int(parts[1]))
+                except ValueError:
+                    pass
+        if not pids:
+            raise RuntimeError("no TTREngine.exe found (tasklist)")
+        return pids
+    pids = []
+    for p in psutil.process_iter(["name", "exe", "cmdline"]):
+        try:
+            info = p.info
+            hay = " ".join(filter(None, [
+                info.get("name") or "",
+                info.get("exe") or "",
+                " ".join(info.get("cmdline") or []),
+            ])).lower()
+        except Exception:
+            continue
+        if any(n in hay for n in ENGINE_NEEDLES):
+            pids.append(p.pid)
+    if not pids:
+        raise RuntimeError("no engine process found for names: %s" % ",".join(ENGINE_NEEDLES))
+    return pids
+
+
+def engine_alive():
+    """True if any engine process is running (drives the revert-confirmation alive_check)."""
+    try:
+        return bool(find_engine_pids())
+    except Exception:
+        return False
 
 
 def stopfile_path():
-    """The stop file the resident loop watches: $TTRMOD_STOPFILE, else /tmp/ttrmod-stop."""
+    """The stop file the resident loop watches: $TTRMOD_STOPFILE, else the platform default
+    (/tmp/ttrmod-stop on posix; %TEMP%\\ttrmod-stop on Windows -- the same file the tray and
+    scripts/tt-mod-stop watch)."""
     return os.environ.get("TTRMOD_STOPFILE") or DEFAULT_STOPFILE
 
 
@@ -1686,7 +1751,7 @@ def revert_and_detach(ex, session, box, rev, target_label, alive_check=None,
     crash the game on the next interval start. Returns True if reverted+detached, False if it gave up
     because the game process is gone (trampolines then moot) or the session detached under us."""
     if alive_check is None:
-        alive_check = lambda: subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
+        alive_check = engine_alive
     if box.get("detached"):
         return False
     if not alive_check():
@@ -1742,6 +1807,18 @@ def main():
         print("[tramp-live] NOT READY — missing for milestone-1 pass-through: %s" % ", ".join(missing))
         print("[tramp-live] (these come from capi-symbols2.json — the running symbol hunt)")
         return
+    if IS_WINDOWS:
+        # The RE tables are macOS arm64 (May-2024 TTREngine) vmaddrs. The Windows engine is a
+        # different binary (x64, different layout + per-build hashes); attaching with these tables
+        # would read garbage addresses and crash the client. A Windows engine build must be
+        # re-derived first (STATUS.md "Fragility") and shipped as its own per-build entry. The
+        # TTRMOD_WIN_TABLE=1 escape hatch forces a run against a derived-but-unshipped table.
+        if os.environ.get("TTRMOD_WIN_TABLE", "") not in ("1", "true", "yes"):
+            print("[tramp-live] NOT READY — the bundled capi-symbols/offsets tables cover the macOS "
+                  "arm64 engine only; the Windows engine needs its own re-derived per-build entry "
+                  "(see STATUS.md 'Fragility'). Refusing to attach to avoid crashing the client. "
+                  "Set TTRMOD_WIN_TABLE=1 to override once a Windows table is derived.")
+            return
     import frida
     # add the frame-eval hook addr (from offsets.json) to syms passing
     off = json.load(open(os.path.join(ROOT, "offsets.json")))
@@ -1879,7 +1956,7 @@ def main():
             print("[tramp-live] modset spawn_context: %d co_name target(s) -> %s" % (
                 len(spawn_context), ", ".join("%s(x%g,%s)" % (s["co_name"], s["factor"], s["group"]) for s in spawn_context)))
 
-    pid = subprocess.check_output(["pgrep", "-f", "TTREngine"]).split()[0].decode()
+    pid = str(find_engine_pids()[0])
     if mode == "findcls":
         print("[tramp-live] attaching pid=%s mode=findcls methods=%s" % (pid, "+".join(methods)))
     elif mode == "findmeth":
@@ -2101,7 +2178,7 @@ def main():
         final_fires = ex.fires()
     except Exception:
         final_fires = -1
-    alive = subprocess.call(["pgrep", "-qf", "TTREngine"]) == 0
+    alive = engine_alive()
     print("[tramp-live] final fires=%d  game_alive=%s" % (final_fires, alive))
     # MUST revert before detaching: the trampolines' native code dies with the session, so any wrap
     # still installed would crash on the next call. revert_and_detach restores EVERY installed wrap

@@ -56,11 +56,12 @@ a cog battle, walk through a street tunnel) to see them speed up. Add `TTRMOD_LO
 started interval's name (`[IVALNAME]`) — so you can discover new ones — plus a `[SCALED] <name>
 x<factor> (<group>)` line each time a match is scaled.
 
-**Stop it with `scripts/tt-mod-stop` (from another terminal) — NOT Ctrl+C.** The tool must restore
-the original game methods *before* it detaches; if the frida session drops while the wrapper is still
-installed, the game crashes on the next animation. `tt-mod-stop` triggers that clean revert and waits
-for it. Do **not** use Ctrl+C: the runner dies too hard on SIGINT for the revert to run (`kill -TERM`
-also works). For a time-boxed run that reverts on its own after N seconds, add `TTRMOD_POLL=<seconds>`.
+**Stop it with `scripts/tt-mod-stop` (`scripts\tt-mod-stop.cmd` on Windows), from another
+terminal — NOT Ctrl+C.** The tool must restore the original game methods *before* it detaches; if
+the frida session drops while the wrapper is still installed, the game crashes on the next
+animation. `tt-mod-stop` triggers that clean revert and waits for it. Do **not** use Ctrl+C: the
+runner dies too hard on SIGINT for the revert to run (`kill -TERM` also works on macOS). For a
+time-boxed run that reverts on its own after N seconds, add `TTRMOD_POLL=<seconds>`.
 
 ## Group coverage
 

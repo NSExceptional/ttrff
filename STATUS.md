@@ -3,7 +3,7 @@
 _Living technical doc for the **LIVE official-client** injection track (this repo), organized by
 topic, not by date. The mod set is fully working live. The separate, already-shipping local
 open-toontown track (source edits, no injection) is documented in
-`~/Developer/toontown-dev/PROJECT-NOTES.md`. Last updated 2026-09-07._
+`~/Developer/toontown-dev/PROJECT-NOTES.md`. Last updated 2026-09-21 (Windows host support)._
 
 > Sensitive-RE hygiene: keep instrumentation/injection work in subagents, and for any run against
 > the live game follow the device-capture handshake. See the memory notes
@@ -38,6 +38,17 @@ and arrival), and the battle intro + reward-tally outro. (The mid-battle attack 
 deliberately disabled: the round is server-gated, so scaling it feels worse — see "Battle" below.)
 Zero injected bytecode, so all three anti-injection layers are bypassed. Across the confirming live
 runs: every run reverted cleanly (`rc:0`), the game stayed alive, zero crashes.
+
+**Windows (2026-09-21): host plumbing ported; live attach still macOS-only.** The injector host,
+the crash-safe stop/revert path, the stop script (`scripts/tt-mod-stop.cmd`), and the tray app all
+run on Windows (offline-tested 24/24; tray icon renders the same tinted `eyes.png` as a multi-size
+ICO at exact small-icon size — the Windows counterpart of the Retina patch). Windows deltas: no
+`pgrep` (psutil or tasklist), stop file at `%TEMP%\ttrmod-stop` (shared with the tray), no elevation
+needed (same-user attach), SIGTERM is an unconditional TerminateProcess so the stop file is the ONLY
+reliable stop on Windows. The injector REFUSES to attach on Windows by default: the bundled
+`capi-symbols*.json`/`offsets.json` cover the macOS arm64 May-2024 build only — the Windows engine
+is a different binary and needs its own re-derived per-build entry (image base will differ; the
+ASLR-slide model stays). `TTRMOD_WIN_TABLE=1` overrides once a Windows table exists.
 
 ---
 

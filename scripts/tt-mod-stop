@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tt-mod-stop -- cleanly STOP the resident TTR mod injector (frida/trampoline_inject.py) so it
 # REVERTS every installed wrap BEFORE the frida session drops. THIS IS THE RELIABLE STOP.
+# On Windows use scripts/tt-mod-stop.cmd (same stop file, same semantics).
 #
 # Why not Ctrl+C: the injector runs under the compiled runner (frida/ttr-frida-runner, launched by
 # frida/run-injector.sh under sudo), which dies HARD on SIGINT -- the process is torn down before the

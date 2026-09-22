@@ -255,10 +255,19 @@ def case_sigterm_triggers_stop():
     stop = ti.make_stop_state()
     prev = ti.install_sigterm(stop, log=lambda *a: None)   # must run on the main thread
     try:
-        def _fire():
+        def _deliver():
             time.sleep(0.15)
-            os.kill(os.getpid(), signal.SIGTERM)
-        th = threading.Thread(target=_fire, daemon=True)
+            if sys.platform.startswith("win"):
+                # Windows cannot deliver SIGTERM (os.kill(pid, SIGTERM) is an unconditional
+                # TerminateProcess, not a signal) -- invoke the REGISTERED handler directly, the
+                # same function the OS would call on posix. The stop FILE (the primary path on
+                # Windows, dropped by scripts/tt-mod-stop.cmd) is covered by the cases above.
+                handler = signal.getsignal(signal.SIGTERM)
+                if callable(handler):
+                    handler(signal.SIGTERM, None)
+            else:
+                os.kill(os.getpid(), signal.SIGTERM)
+        th = threading.Thread(target=_deliver, daemon=True)
         th.start()
         t0 = time.time()
         # persist=False with poll_s=5.0 as a HARD safety timeout (returns 'timeout' if the signal

@@ -18,6 +18,7 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 | `tray/ttrff_tray.py` | menu-bar supervisor app; shells out to the injector, never touches internals |
 | `localtest/` | offline tests against a local open-toontown client (`rig.py` is the shared harness) |
 | `scripts/tt-*` | window-driver helpers (winctl + OCR); `tt-lib` is sourced by the others |
+| `scripts/tt-mod-stop` / `.cmd` | clean-stop via the stop file — the RELIABLE stop on both platforms (never Ctrl+C) |
 | `capi-symbols*.json`, `offsets.json`, `opcode_map.json` | per-build RE data the injector loads at runtime |
 | `STATUS.md` | the living technical doc — engine internals, per-build addresses, fragility notes |
 
@@ -30,7 +31,8 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 
 ## Hard rules & gotchas
 
-- **NEVER stop the injector with Ctrl+C or SIGINT** — the runner dies too hard for the clean revert to run and the game crashes on the next animation. Use `scripts/tt-mod-stop` (drop-file → revert → wait) or `kill -TERM`. The tray app already does this correctly.
+- **NEVER stop the injector with Ctrl+C or SIGINT** — the runner dies too hard for the clean revert to run and the game crashes on the next animation. Use `scripts/tt-mod-stop` (drop-file → revert → wait) or `kill -TERM`. The tray app already does this correctly. On Windows the stop FILE is the only reliable stop (SIGTERM = TerminateProcess there): `scripts\tt-mod-stop.cmd`.
+- **Windows host support (2026-09):** the tray, injector host, stop/revert path, and `tt-mod-stop.cmd` run on Windows, but the injector refuses to ATTACH there by default — the RE tables cover the macOS arm64 build only and a Windows engine needs its own re-derived per-build entry (`TTRMOD_WIN_TABLE=1` overrides once derived). Windows specifics: stop file `%TEMP%\ttrmod-stop`, same-user attach (no sudo), engine found via psutil/tasklist instead of pgrep.
 - **lldb is dead on TTREngine** — `debugserver` reliably SIGSEGVs on attach (TTR-specific). Don't retry it; use frida/`task_for_pid`/`vmmap` instead.
 - **Attaching needs root on macOS** (`task_for_pid`), via the signed `run-injector.sh` + passwordless sudo. AMFI-off does not help.
 - **Every hardcoded address is per-build.** The engine auto-patches; re-derive offsets/UUIDs on each new build (see STATUS.md "Fragility"). Engine is CPython 3.8.17, arm64, image base `0x100000000`.
@@ -42,6 +44,7 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 
 - `tray/eyes.png` is the menu-bar icon (Toontown eyeballs, extracted from the official logo SVG); `_make_image()` tints it by status color and falls back to a drawn glyph if the file is missing. Regenerate/replace it as a 64×64 RGBA with transparency.
 - macOS dock icon is hidden via `NSApplicationActivationPolicyProhibited` (PyObjC, a pystray dependency) in `TrayApp.run()`.
+- Windows tray icon: `_patch_pystray_win32_hicon()` (in `TrayApp.run()`) replaces pystray's single-frame ICO + `LR_DEFAULTSIZE` load with a multi-size ICO (16→128, LANCZOS from the same tinted source) loaded at the exact `SM_CXSMICON` size — the counterpart of the macOS Retina patch, so both platforms show the same crisp icon.
 - Pillow ≥ 10 removed `Image.ANTIALIAS`, which pystray 0.19.x calls — `_make_image()` restores the alias. Keep that shim.
 - The tray launches the injector **detached** (own process group) so a tray crash can't kill it mid-hook; it only ever stops via the stop-file.
 - Env overrides for retargeting (Windows agent, moved checkouts): `TTRFF_REPO`, `TTRMOD_MODSET`, `TTRFF_ENGINE_NAMES`, `TTRFF_INJECTOR_PYTHON`, `TTRFF_STOPFILE`, `TTRFF_LOG`. No code edits should be needed to retarget.

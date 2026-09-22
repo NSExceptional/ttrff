@@ -83,12 +83,19 @@ it.
 
 Attaching to a same-user process needs **no** elevation, so the tray runs the injector directly
 under the Python that launched the tray (`sys.executable`) — that Python needs `frida`
-(the `pip install` above pulls it in on Windows). See "Retargeting" if your setup differs.
+(the `pip install` above pulls it in on Windows). The clean-stop path is the same stop-file
+mechanism (`%TEMP%\ttrmod-stop`), now also drivable via `scripts\tt-mod-stop.cmd`.
 
-> Windows support for the *injector* itself is a separate milestone — the per-build vault hashes
-> and CPython-3.8 struct offsets must be re-derived on the Windows engine (see `../STATUS.md`).
-> This tray app is ready for it: once the injector attaches on Windows, the tray drives it with
-> no changes.
+The tray icon matches the macOS one: same tinted `eyes.png` source, rendered as a multi-size
+ICO (16→128 px, LANCZOS) and loaded at the exact small-icon size for the tray, so it stays crisp
+at 100–200% display scaling (the Windows counterpart of the macOS Retina patch).
+
+> Windows support for the *injector* itself: the tray app and all host plumbing (stop-file,
+> process detection, detached launch, revert logic) now run on Windows and are offline-tested
+> (24/24 in `localtest/stoprevert_test.py`). **Attaching to the live engine is still macOS-only**
+> until the per-build vault hashes and CPython-3.8 struct offsets are re-derived for the Windows
+> engine binary (see `../STATUS.md`) — the injector refuses to attach on Windows with the
+> bundled macOS-arm64 tables (override with `TTRMOD_WIN_TABLE=1` once a Windows table is derived).
 
 ## How it stays crash-safe
 
