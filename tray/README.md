@@ -56,10 +56,12 @@ nscake/tap/ttrff`.
 ```powershell
 scoop bucket add nscake https://github.com/NSCake/scoop-bucket
 scoop install ttrff
+ttrff
 ```
 
-Installs from the **NSCake scoop-bucket** (the Windows analog of the `nscake` Homebrew tap —
-one bucket for all NSCake packages). The manifest points at this repo's rolling
+Then start it any time with `ttrff` (first run creates the venv, ~a minute; after that it's
+instant). Installs from the **NSCake scoop-bucket** (the Windows analog of the `nscake`
+Homebrew tap — one bucket for all NSCake packages). The manifest points at this repo's rolling
 `windows-latest` release — rebuilt on every push to `main`, so it tracks HEAD like the
 Homebrew `--HEAD` formula. The `ttrff` launcher creates a private venv
 (pystray/pillow/psutil/frida) inside the app dir on first run; it needs `python` on PATH
