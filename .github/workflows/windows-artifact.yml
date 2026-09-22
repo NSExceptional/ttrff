@@ -52,8 +52,16 @@ jobs:
           if (-not $rel) {
             gh release create $tag --repo $env:GITHUB_REPOSITORY `
               --title "ttrff Windows (rolling)" `
-              --notes "Rolling build of main. Rebuilt on every push; the Scoop manifest (NSCake/scoop-bucket) points here. Not a versioned release."
+              --notes "Rolling builds of main. One IMMUTABLE zip per CI run (ttrff-windows-<run>.zip); the Scoop manifest (NSCake/scoop-bucket) points at the newest. Old assets are pruned to the latest 5."
           }
-          gh release upload $tag dist/ttrff-windows.zip --repo $env:GITHUB_REPOSITORY --clobber
+          # IMMUTABLE per-run asset: never clobber a fixed-name zip (a concurrent build
+          # would change the bytes under a hash the bucket already recorded -- observed as
+          # a hash-check failure). The bucket sync discovers the newest run-numbered asset.
+          gh release upload $tag "dist/ttrff-windows.zip#ttrff-windows-$env:GITHUB_RUN_NUMBER.zip" --repo $env:GITHUB_REPOSITORY
+          # prune: keep only the newest 5 assets so the release doesn't grow forever
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets -q '.assets[].name' |
+            Sort-Object { [int]($_ -replace '\D+(\d+)\.zip','$1') } -Descending |
+            Select-Object -Skip 5 |
+            ForEach-Object { gh release delete-asset $tag $_ --repo $env:GITHUB_REPOSITORY --yes }
         env:
           GH_TOKEN: ${{ github.token }}
