@@ -395,6 +395,20 @@ So the agent now falls back to reading the str's bytes straight out of the objec
 
 Captured names match arm64 exactly (`vlt8e0d5a85-<n>`, `vlt2eae0fcc-<n>`, `stareAt-ToonEyes-*`), so `modset.json` transfers unchanged.
 
+**Measured before/after on Windows (Shticker Book teleport, frame-timed at 82 Hz):**
+
+| phase | baseline | modded | |
+|---|---|---|---|
+| iris-in | 0.206 s | 0.060 s | 3.4x faster; `transitions` is configured x3 |
+| held dark (zone load) | 0.522 s | 0.571 s | **unchanged**, as it must be |
+| blackout total | 0.740 s | 0.630 s | |
+
+That is the README's central claim demonstrated on Windows: the cosmetic timing shrinks by the configured factor while the server/disk-gated load does not move.
+
+**Groups confirmed scaling live:** `{"book": 4, "teleport": 3, "transitions": 1, "door": 6}` over a 243-fire session, clean revert, client alive. `tunnel` and `battle` are still unexercised here -- they need their specific in-world triggers (walking a street tunnel; a cog battle), not further porting work. Note `ctx_wired` reported `tunnelOut`/`tunnelIn` as "no class matched signature ... class not in-world yet", which is expected while the toon is in a playground rather than a street.
+
+**Driving the client for these runs:** `scripts/ttdrive.py` (winctl). Two gotchas it now encodes: the book's action button is "Go Home" at x=0.545 in a playground but "Back to Playground" at x=0.662 at the estate, so it must be located by colour rather than a fixed fraction; and the client idle-logs-out after roughly half an hour, so any unattended measurement must re-check state and re-enter first.
+
 **Superseded — the original analysis, kept because the constraint is still real:** The eval-frame hook exists only to get a moment where the GIL is held and a Python frame is live, so the `setattr` can run safely. `PyGILState_Ensure` / `PyGILState_Release` (already recorded for arm64 in `offsets.json` as `gil_ensure`/`gil_release`) would let a frida thread take the GIL and do the install with **no Interceptor and no code patching** — which is exactly the operation that trips the guard. Deriving them on Windows looks tractable: `Python/pystate.c` is one of the 31 source paths present, and its `Py_FatalError` strings are xref anchors. Untested.
 
 **Build key.** Key the Windows entry on the PDB GUID (`51124cdfd7dac3164c4c44205044422e`, age 1) — the direct analogue of the Mach-O UUID. PE timestamp `1717007375`, file version `3.2.0.609`.

@@ -1944,6 +1944,9 @@ def main():
         print("[tramp-live] NOT READY — missing for milestone-1 pass-through: %s" % ", ".join(missing))
         print("[tramp-live] (these come from capi-symbols2.json — the running symbol hunt)")
         return
+    if IS_WINDOWS and os.environ.get("TTRMOD_NO_WIN_TABLE", "") in ("1", "true", "yes"):
+        print("[tramp-live] refusing to attach: TTRMOD_NO_WIN_TABLE is set.")
+        return
     if IS_WINDOWS:
         # The RE tables are macOS arm64 (May-2024 TTREngine) vmaddrs. The Windows engine is a
         # different binary (x64, different layout + per-build hashes); attaching with these tables
@@ -1957,11 +1960,13 @@ def main():
                   "setPlayRate cannot be called without one of those. NOT overridable by "
                   "TTRMOD_WIN_TABLE. See STATUS.md 'Windows per-build derivation'." % ", ".join(gap))
             return
-        if os.environ.get("TTRMOD_WIN_TABLE", "") not in ("1", "true", "yes"):
-            print("[tramp-live] NOT READY — a Windows per-build table is present and complete, but "
-                  "has never been validated against a live client. Set TTRMOD_WIN_TABLE=1 to take "
-                  "that first attach (expect to need scripts/ttdrive.py to recover if it crashes).")
-            return
+        # The "never validated" gate is retired: the Windows table HAS now been validated live
+        # (install via the GIL bootstrap, 214+ fires, doors x3 and teleportIn x4 scaled, clean
+        # revert, client alive, zero crash events). Running by default is what makes the tray work,
+        # and the real safety net is unchanged and stronger than an env var: init() memcmp's every
+        # symbol's prologue at its slid address and main() aborts unless `verified` -- so when TTR
+        # auto-patches the engine this refuses to attach instead of calling moved code.
+        # TTRMOD_NO_WIN_TABLE=1 forces the old refusal back if a build ever looks suspect.
     import frida
     # add the frame-eval hook addr (from offsets.json) to syms passing
     off = json.load(open(os.path.join(ROOT, "offsets.json")))
