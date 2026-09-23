@@ -407,7 +407,22 @@ That is the README's central claim demonstrated on Windows: the cosmetic timing 
 
 **Groups confirmed scaling live: 5 of 6** -- `battle` 4, `book` 10, `door` 26, `teleport` 27, `transitions` 1, across several sessions with clean reverts and the client alive. `battle` was caught by an unplanned cog fight (`faceoff-battle2 x3`, `to-pending-toon-... x3`), which also proves the intro/outro path works.
 
-**`tunnel` is the one group NOT yet observed scaling, and it is not a porting gap.** Both tunnel mechanisms correlate on the screen iris within `iris_window_ms: 200`: `tunnel_identity` (`attr: null`, so the first walk is spent auto-discovering `localAvatar.tunnelTrack`) and `tunnel_localtoon_iris` (needs `LocalToon` resolved by its `tunnelOut` signature, reported `resolved: false` at install with "class not in-world yet"). The decisive observation is that **`irisTask` scaled exactly ONCE across the whole log** despite several tunnel transitions whose iris was plainly visible in the frame captures (measured iris-out 0.049 s / iris-in 0.075 s). So the iris stamp is almost never being set, the 200 ms correlation window almost never opens, and neither tunnel path can fire. Whether the tunnel iris is a different interval name, or not a `MetaInterval` at all on this build, is the thing to establish next -- `TTRMOD_LOGNAMES=1` around a tunnel walk should settle it.
+**ALL SIX GROUPS NOW CONFIRMED LIVE ON WINDOWS.** Final session: `{"door": 61, "teleport": 17, "book": 9, "tunnel": 4, "transitions": 2}` over 1060 fires, clean revert, client alive; `battle` was confirmed in an earlier session (`faceoff-battle2 x3`).
+
+**The tunnel blocker was a missing symbol, not the iris.** `scanBySignature` -- which resolves `LocalToon` and therefore BOTH tunnel mechanisms -- opens with `if (!(ST.GetIter && ST.IterNext && ST.AsUTF8 && ...)) return []`. `PyObject_GetIter` and `PyIter_Next` were absent from the Windows table, so it returned an empty list silently and no class ever matched any signature. `MetaInterval` resolved only because it uses the hardcoded `override` path rather than the scan. This is the THIRD bug of the same shape (after `PyUnicode_AsUTF8`): an optional-symbol guard plus a broad `catch`/empty-return turns a missing symbol into a silent no-op rather than an error. **When porting, diff the agent's `F['...']` set against the table before trusting any "nothing matched" result.**
+
+With `PyObject_GetIter` `0x1400e4af0` and `PyIter_Next` `0x1400e4b90` added, `LocalToon` resolves immediately: `cls: vlt725d40df, all_direct: true, method_count: 177` -- the **same class hash as arm64**, and both tunnel paths arm.
+
+**Tunnel arrival is now LIVE-CONFIRMED -- the first time on either platform.** This doc previously recorded it as "offline-validated; one live confirm pending". Observed on Windows:
+
+```
+[SCALED] vlt8e0d5a85-5685 x 4 (tunnel)  ctx=tunnel                            <- departure, context wrap on tunnelOut
+[SCALED] vlt8e0d5a85-5728 x 4 (tunnel) via=localtoon-method co=vlt89637416    <- arrival, LocalToon method-set + iris
+```
+
+So the deterministic LocalToon+iris arrival mechanism works exactly as designed, and the auto-named walk Sequence (`vlt8e0d5a85-<n>`) is caught by spawner+iris as intended.
+
+**Superseded (kept for the reasoning) -- the earlier iris theory:** Both tunnel mechanisms correlate on the screen iris within `iris_window_ms: 200`: `tunnel_identity` (`attr: null`, so the first walk is spent auto-discovering `localAvatar.tunnelTrack`) and `tunnel_localtoon_iris` (needs `LocalToon` resolved by its `tunnelOut` signature, reported `resolved: false` at install with "class not in-world yet"). The decisive observation is that **`irisTask` scaled exactly ONCE across the whole log** despite several tunnel transitions whose iris was plainly visible in the frame captures (measured iris-out 0.049 s / iris-in 0.075 s). So the iris stamp is almost never being set, the 200 ms correlation window almost never opens, and neither tunnel path can fire. Whether the tunnel iris is a different interval name, or not a `MetaInterval` at all on this build, is the thing to establish next -- `TTRMOD_LOGNAMES=1` around a tunnel walk should settle it.
 
 **Measured tunnel transition (mods live), for reference:** iris-out 0.181 s -> 0.049 s (3.7x) and iris-in 0.183 s -> 0.075 s (2.4x) against the unmodded baseline, with held-dark 1.055 s -> 1.210 s (unchanged). So `transitions` IS scaling the tunnel's iris even though the tunnel WALK is not. Do not trust the harness's "walk-out" figure: it measures the last frame with motion, which on a populated street is ambient traffic, not the toon.
 

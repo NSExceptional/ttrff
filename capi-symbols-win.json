@@ -23,7 +23,8 @@
   "tstate_cell": "0x1420d2fb8",
   "float_construction": "PyFloat_FromDouble exists OUT-OF-LINE here, so the agent calls it directly instead of the hand-built makeFloat recipe the arm64 build needs. That removes the need for FLOAT_FREELIST / FLOAT_NUMFREE / PYMALLOC_FN / PYMALLOC_CTX entirely -- and with them the only WRITE targets, so we no longer poke CPython's allocator bookkeeping ourselves. Recorded for reference: freelist head 0x141fc3838, numfree 0x141fc3840.",
   "status": "Complete for the injector's NEED list + tuple builder + hook site + float construction. NEVER validated against a live client -- the first attach is still unproven.",
-  "bootstrap": "Interceptor.attach on engine code FAIL-FASTS this client (0xc0000409 at ntdll+0xa1a21, the same guard that fires on a bulk read of the packed region). PyGILState_Ensure/Release let a frida thread take the GIL and run the install directly, patching nothing. The Interceptor hook was only ever a bootstrap to reach a GIL-held moment -- the mod itself (a PyCFunction trampoline setattr'd onto the interval class) is pure C-API and patches no code, so it is unaffected."
+  "bootstrap": "Interceptor.attach on engine code FAIL-FASTS this client (0xc0000409 at ntdll+0xa1a21, the same guard that fires on a bulk read of the packed region). PyGILState_Ensure/Release let a frida thread take the GIL and run the install directly, patching nothing. The Interceptor hook was only ever a bootstrap to reach a GIL-held moment -- the mod itself (a PyCFunction trampoline setattr'd onto the interval class) is pure C-API and patches no code, so it is unaffected.",
+  "signature_scan": "scanBySignature (which resolves LocalToon, and therefore BOTH tunnel mechanisms) bails immediately unless GetIter+IterNext+AsUTF8+DictGetStr+DictGetItem+GetAttrStr are ALL bound. Missing PyObject_GetIter/PyIter_Next made it return [] silently, so no class ever matched any signature. MetaInterval resolved only because it uses the hardcoded override path, not the scan."
  },
  "PyCFunction_NewEx": {
   "found": "yes",
@@ -162,5 +163,23 @@
   "vmaddr": "0x14015d8a0",
   "prologue16": "48 83 ec 28 48 8b 05 0d 57 f7 01 48 85 c0 74 05",
   "evidence": "sole xref to \"PyThreadState_Get: no current thread\""
+ },
+ "PyObject_GetIter": {
+  "found": "yes",
+  "vmaddr": "0x1400e4af0",
+  "prologue16": "56 48 83 ec 20 48 89 ce 48 8b 49 08 48 8b 81 d8",
+  "evidence": "reads tp_iter @+0xd8, then PyIter_Check's the result against tp_iternext @+0xe0 and &_PyObject_NextNotImplemented (0x140105850); raises \"'%.200s' object is not iterable\""
+ },
+ "PyIter_Next": {
+  "found": "yes",
+  "vmaddr": "0x1400e4b90",
+  "prologue16": "56 48 83 ec 20 48 8b 41 08 ff 90 e0 00 00 00 48",
+  "evidence": "tail of PyObject_GetIter in layout; calls tp_iternext @[type+0xe0], then PyErr_Occurred -> PyErr_ExceptionMatches(StopIteration) -> PyErr_Clear"
+ },
+ "PyObject_GetItem": {
+  "found": "yes",
+  "vmaddr": "0x1400e2720",
+  "prologue16": "56 57 53 48 83 ec 40 48 8b 05 aa 49 db 01 48 31",
+  "evidence": "sole xref to \"'%.200s' object is not subscriptable\""
  }
 }
