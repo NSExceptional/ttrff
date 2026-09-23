@@ -22,7 +22,8 @@
   },
   "tstate_cell": "0x1420d2fb8",
   "float_construction": "PyFloat_FromDouble exists OUT-OF-LINE here, so the agent calls it directly instead of the hand-built makeFloat recipe the arm64 build needs. That removes the need for FLOAT_FREELIST / FLOAT_NUMFREE / PYMALLOC_FN / PYMALLOC_CTX entirely -- and with them the only WRITE targets, so we no longer poke CPython's allocator bookkeeping ourselves. Recorded for reference: freelist head 0x141fc3838, numfree 0x141fc3840.",
-  "status": "Complete for the injector's NEED list + tuple builder + hook site + float construction. NEVER validated against a live client -- the first attach is still unproven."
+  "status": "Complete for the injector's NEED list + tuple builder + hook site + float construction. NEVER validated against a live client -- the first attach is still unproven.",
+  "bootstrap": "Interceptor.attach on engine code FAIL-FASTS this client (0xc0000409 at ntdll+0xa1a21, the same guard that fires on a bulk read of the packed region). PyGILState_Ensure/Release let a frida thread take the GIL and run the install directly, patching nothing. The Interceptor hook was only ever a bootstrap to reach a GIL-held moment -- the mod itself (a PyCFunction trampoline setattr'd onto the interval class) is pure C-API and patches no code, so it is unaffected."
  },
  "PyCFunction_NewEx": {
   "found": "yes",
@@ -131,5 +132,35 @@
   "vmaddr": "0x1402a8880",
   "prologue16": "48 85 c9 78 14 48 89 ca 48 8b 05 29 60 c0 01 48",
   "evidence": "callee of PyFloat_FromDouble's else branch, called with ecx=0x18 (one arg, MS x64 ABI)"
+ },
+ "PyGILState_Ensure": {
+  "found": "yes",
+  "vmaddr": "0x14015db10",
+  "prologue16": "56 57 48 83 ec 28 48 8d 0d b3 54 f7 01 e8 1e 33",
+  "evidence": "sole xref to \"Couldn't create thread-state for new thread\" (pystate.c); adjacent to PyGILState_Release as in source"
+ },
+ "PyGILState_Release": {
+  "found": "yes",
+  "vmaddr": "0x14015dbb0",
+  "prologue16": "56 57 48 83 ec 28 89 ce 48 8d 0d 11 54 f7 01 e8",
+  "evidence": "sole xref to \"auto-releasing thread-state, but no thread-state for this thread\" (pystate.c)"
+ },
+ "PyEval_SaveThread": {
+  "found": "yes",
+  "vmaddr": "0x140147b30",
+  "prologue16": "56 48 83 ec 20 31 c9 e8 24 56 01 00 48 85 c0 74",
+  "evidence": "sole xref to \"PyEval_SaveThread: NULL tstate\""
+ },
+ "PyEval_RestoreThread": {
+  "found": "yes",
+  "vmaddr": "0x140147b70",
+  "prologue16": "56 57 48 83 ec 28 48 85 c9 74 3f 48 89 ce e8 d1",
+  "evidence": "sole xref to \"PyEval_RestoreThread: NULL tstate\""
+ },
+ "PyThreadState_Get": {
+  "found": "yes",
+  "vmaddr": "0x14015d8a0",
+  "prologue16": "48 83 ec 28 48 8b 05 0d 57 f7 01 48 85 c0 74 05",
+  "evidence": "sole xref to \"PyThreadState_Get: no current thread\""
  }
 }

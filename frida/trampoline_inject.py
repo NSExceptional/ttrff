@@ -350,6 +350,43 @@ rpc.exports = {
       };
       // clear-then-report-done: use for ALL onEnter exits so no exception ever leaks into the game.
       ST.fin = function(r){ ST.clearExc(); try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){} send({t:'done', r:r}); };
+
+      // ---- BOOTSTRAP: reach a moment where the GIL is held, so C-API calls are legal ----
+      // Two ways, and the choice is forced by the target, not by preference:
+      //   interceptor  hook _PyEval_EvalFrameDefault, run once on the game's own thread, detach.
+      //                Proven on macOS. PATCHES CODE.
+      //   gil          PyGILState_Ensure on frida's own thread, run, PyGILState_Release.
+      //                PATCHES NOTHING.
+      // The packed Windows build fail-fasts on any code patch (0xc0000409 at ntdll+0xa1a21 -- the
+      // same guard that fires on a bulk read of its packed region), so `interceptor` is not
+      // available there. Note the hook was only ever a BOOTSTRAP: the mod itself is a PyCFunction
+      // trampoline setattr'd onto the interval class, pure C-API, patching nothing -- so it is
+      // unaffected either way. macOS ships no GIL symbols in its table and so keeps the proven
+      // Interceptor path unchanged.
+      ST.GilEnsure = null; ST.GilRelease = null;
+      try {
+        if (F['PyGILState_Ensure'] && F['PyGILState_Release']){
+          ST.GilEnsure  = new NativeFunction(F['PyGILState_Ensure'],  'int',  []);
+          ST.GilRelease = new NativeFunction(F['PyGILState_Release'], 'void', ['int']);
+        }
+      } catch(e){ ST.GilEnsure = null; ST.GilRelease = null; }
+
+      // Run `fn` with the GIL held. Returns {ok, via, listener?}. On the Interceptor path `fn` runs
+      // LATER (on the next frame-eval); on the GIL path it runs SYNCHRONOUSLY before returning.
+      ST.bootstrap = function(fn, tag){
+        if (ST.GilEnsure && ST.GilRelease){
+          var st;
+          try { st = ST.GilEnsure(); }
+          catch(e){ return { ok:false, via:'gil', e:'PyGILState_Ensure: '+e }; }
+          var err = null;
+          try { fn(); } catch(e){ err = String(e); }
+          // release ALWAYS -- leaking the GIL would freeze the game outright
+          try { ST.GilRelease(st); } catch(e){ err = err || ('PyGILState_Release: '+e); }
+          return err ? { ok:false, via:'gil', e:tag+': '+err } : { ok:true, via:'gil' };
+        }
+        return { ok:true, via:'interceptor',
+                 listener: Interceptor.attach(ST.hook, { onEnter: function(){ fn(); } }) };
+      };
       // RECORD EVERY INSTALLED WRAP IN ONE PLACE. revert() restores exactly what is in ST.installed,
       // so any wrap that is SetAttrStr'd onto a class MUST be recorded here or revert will skip it --
       // and a skipped wrap leaves its trampoline (native agent memory) installed, so when the session
@@ -1253,9 +1290,8 @@ rpc.exports = {
 
   arm: function () {
     try {
-      ST.listener = Interceptor.attach(rpcHook(), {
-        onEnter: function () {
-          if (ST.done) return; ST.done = true;      // once, main thread, GIL held
+      ST.installOnce = function () {
+          if (ST.done) return; ST.done = true;      // once, GIL held (see ST.bootstrap)
           // read-only diagnostic: enumerate sys.modules to find the real names of our targets
           if (ST.mode === 'list') {
             try {
@@ -1604,9 +1640,10 @@ rpc.exports = {
                     target: ST.tmod+'.'+ST.tcls+'.'+ST.tmeth,
                     note:'trampoline live; trigger '+ST.tmeth+' in-game to see it fire'});
           } catch(e){ ST.fin({ok:false, stage:'install ex', e:String(e)}); }
-        }
-      });
-      return { ok:true };
+      };
+      var b = ST.bootstrap(ST.installOnce, 'install');
+      if (b.listener) ST.listener = b.listener;
+      return { ok:b.ok, via:b.via, e:b.e };
     } catch(e){ return { ok:false, notes:['arm ex: '+e] }; }
   },
   // report fire count on demand (host polls after the user triggers the target)
@@ -1629,9 +1666,8 @@ rpc.exports = {
       var items = (ST && ST.installed) ? ST.installed : null;
       if (!items || !items.length){ return { ok:false, e:'nothing installed' }; }
       ST.reverted = false;                              // allow a re-arm (host retries if a setattr fails)
-      ST.rlistener = Interceptor.attach(ST.hook, {
-        onEnter: function () {
-          if (ST.reverted) return; ST.reverted = true;  // one-shot, main thread, GIL held
+      ST.revertOnce = function () {
+          if (ST.reverted) return; ST.reverted = true;  // one-shot, GIL held (see ST.bootstrap)
           try {
             var rcs = [], allOk = true;
             for (var i=0;i<items.length;i++){
@@ -1644,9 +1680,11 @@ rpc.exports = {
             try { Interceptor.detachAll(); Interceptor.flush(); } catch(e){}
             send({t:'reverted', rc:rcs, n:items.length, all_ok:allOk});
           } catch(e){ send({t:'reverted', err:String(e)}); }
-        }
-      });
-      return { ok:true, n:items.length };
+      };
+      var rb = ST.bootstrap(ST.revertOnce, 'revert');
+      if (rb.listener) ST.rlistener = rb.listener;
+      if (!rb.ok) return { ok:false, n:items.length, e:rb.e };
+      return { ok:true, n:items.length, via:rb.via };
     } catch(e){ return { ok:false, e:String(e) }; }
   }
 };
@@ -2164,7 +2202,12 @@ def main():
             print("[tramp-live]   note: %s" % note)
         session.detach()
         return
-    ex.arm()
+    armed = ex.arm()
+    # via='gil' means the install ran synchronously under PyGILState_Ensure (no code patched);
+    # via='interceptor' means it is queued on the next frame-eval (macOS's proven path).
+    print("[tramp-live] arm: %s" % json.dumps(armed))
+    if isinstance(armed, dict) and armed.get("ok") is False:
+        print("[tramp-live] arm FAILED — nothing installed; detaching"); session.detach(); return
     if not done.wait(8.0):
         print("[tramp-live] install hook never fired in 8s (game idle/frozen?)"); session.detach(); return
     if box.get("detached"):

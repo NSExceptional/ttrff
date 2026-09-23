@@ -377,7 +377,17 @@ Then **confirm by disassembly** (capstone) before trusting anything. Heuristics 
 
 **But `Interceptor.attach` on `_PyEval_EvalFrameDefault` fail-fasts the client.** `ex.arm()` kills it with `0xc0000409` at **`ntdll+0xa1a21`** — byte-for-byte the SAME fault offset as the earlier bulk-read crash. So one ntdll fail-fast site answers both "bulk-read the packed region" and "patch code", which points at the packer guarding its memory rather than at anything CPython-specific. **Control Flow Guard is NOT the cause** — `DllCharacteristics = 0x8020` (no `GUARD_CF`) and the load-config directory is empty, so it was ruled out, not assumed.
 
-**Likely way forward: stop patching code at all.** The eval-frame hook exists only to get a moment where the GIL is held and a Python frame is live, so the `setattr` can run safely. `PyGILState_Ensure` / `PyGILState_Release` (already recorded for arm64 in `offsets.json` as `gil_ensure`/`gil_release`) would let a frida thread take the GIL and do the install with **no Interceptor and no code patching** — which is exactly the operation that trips the guard. Deriving them on Windows looks tractable: `Python/pystate.c` is one of the 31 source paths present, and its `Py_FatalError` strings are xref anchors. Untested.
+**SOLVED (2026-09-23) by not patching code at all.** `PyGILState_Ensure`/`Release` (derived below) let a frida thread take the GIL and run the install directly. `arm: {"ok": true, "via": "gil"}` — the trampoline installed (`setattr_rc: 0` on `vlt615404bc.start`), **fired 381 times**, and `revert` restored every original (`{"rc": [0], "n": 1, "all_ok": true}`) with a clean detach. Client alive throughout, zero crash events. Both install and revert now go through `ST.bootstrap`, which picks `gil` when the GIL symbols are present and otherwise keeps macOS's proven Interceptor path byte-for-byte.
+
+This works because the Interceptor hook was only ever a BOOTSTRAP — a way to reach a moment with the GIL held. The mod itself is a `PyCFunction` trampoline `setattr`'d onto the interval class: pure C-API, patching no code, so the packer's guard never sees it.
+
+Windows GIL symbols: `PyGILState_Ensure` `0x14015db10`, `PyGILState_Release` `0x14015dbb0`, `PyEval_SaveThread` `0x140147b30`, `PyEval_RestoreThread` `0x140147b70`, `PyThreadState_Get` `0x14015d8a0`.
+
+Also confirmed live: the Windows `TTRGame.vlt` uses the **same per-build name hashes as macOS** — the interval class resolved as `direct.vltf283acbe.vlt615404bc` / `vlt615404bc`, exactly the values this doc records for arm64.
+
+**Still to do:** the modset name matching produced no hits (`scaled by GROUP: {}` / `by NAME: {}`) even across 381 fires, and `TTRMOD_LOGNAMES=1` emitted no `[IVALNAME]` lines, so the run appears to have used the mod1 wrap-after spec (`factor: 5`) rather than the modset byname spec. That is configuration/tuning, not a platform blocker.
+
+**Superseded — the original analysis, kept because the constraint is still real:** The eval-frame hook exists only to get a moment where the GIL is held and a Python frame is live, so the `setattr` can run safely. `PyGILState_Ensure` / `PyGILState_Release` (already recorded for arm64 in `offsets.json` as `gil_ensure`/`gil_release`) would let a frida thread take the GIL and do the install with **no Interceptor and no code patching** — which is exactly the operation that trips the guard. Deriving them on Windows looks tractable: `Python/pystate.c` is one of the 31 source paths present, and its `Py_FatalError` strings are xref anchors. Untested.
 
 **Build key.** Key the Windows entry on the PDB GUID (`51124cdfd7dac3164c4c44205044422e`, age 1) — the direct analogue of the Mach-O UUID. PE timestamp `1717007375`, file version `3.2.0.609`.
 

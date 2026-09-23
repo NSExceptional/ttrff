@@ -21,6 +21,7 @@ States:
     crashdialog "Gadzooks!" crash prompt         -> press Yes (UI Automation)
     launcher    launcher up, no engine           -> press GO (UI Automation, geometry fallback)
     loading     engine up, window black/absent   -> wait
+    modal       a DirectGUI dialog is up          -> click cancel (red X), else ok (green check)
     title       "PRESS ANY KEY TO ENTER"         -> tap a key
     toonselect  toon picker                      -> click the toon slot
     ingame      3D scene                         -> done
@@ -124,7 +125,7 @@ def crash_dialog():
 
 # ---- screen classification -------------------------------------------------
 def _metrics(hwnd):
-    """(mean luma, distinct-colour count, per-slot 'is warm' flags) from one capture."""
+    """(mean luma, distinct-colour count, per-slot 'is warm' flags, blue-dominant fraction)."""
     im = capture.capture_printwindow(hwnd)
     # tobytes() rather than getdata(): getdata() is deprecated in Pillow >= 12 and warns on
     # every call, which would spam a polling loop.
@@ -132,6 +133,15 @@ def _metrics(hwnd):
     luma = sum(px) / float(len(px))
     raw = im.convert("RGB").resize((32, 20)).tobytes()
     variety = len({raw[i:i + 3] for i in range(0, len(raw), 3)})
+    # Blue dominance separates the 2D menus from a 3D scene. Colour variety ALONE is not enough:
+    # the title screen's animated fireworks push it past any useful threshold, and that screen was
+    # misclassified as `ingame` -- which matters, because the driver then taps keys at a screen
+    # whose buttons include QUIT. The menus are overwhelmingly the same blue; a rendered world is
+    # grass/pavement/sky and much less blue-dominant.
+    small = im.convert("RGB").resize((64, 40))
+    sb = small.tobytes()
+    n = len(sb) // 3
+    blue = sum(1 for i in range(0, len(sb), 3) if sb[i + 2] > sb[i] + 20) / float(n)
     rgb = im.convert("RGB")
     w, h = rgb.size
     warm = []
@@ -140,7 +150,72 @@ def _metrics(hwnd):
         y = min(max(int(fy * h), 0), h - 1)
         r, g_, b = rgb.getpixel((x, y))
         warm.append(r > b + 25)     # cards are warm (yellow/red/orange); background is blue
-    return luma, variety, warm
+    # TTR's DirectGUI dialogs are a pale cream/yellow rounded panel in the middle of the screen.
+    # Sampling the central band for that colour finds one without OCR.
+    panel = 0.0
+    x0, x1 = int(0.34 * w), int(0.67 * w)
+    y0, y1 = int(0.36 * h), int(0.62 * h)
+    seen = 0
+    for yy in range(y0, y1, max(1, (y1 - y0) // 24)):
+        for xx in range(x0, x1, max(1, (x1 - x0) // 24)):
+            r, g_, b = rgb.getpixel((xx, yy))
+            seen += 1
+            if r > 195 and g_ > 195 and b < r - 22:
+                panel += 1
+    panel = panel / float(seen or 1)
+    return luma, variety, warm, blue, panel
+
+
+def dialog_buttons(hwnd):
+    """Locate a dialog's buttons by COLOUR, so no OCR is needed.
+
+    TTR colour-codes them: a red X is cancel/no, a green check is ok/yes. That distinction is what
+    makes a generic dismissal safe -- on the title screen's "Are you ready to leave Toontown?" the
+    red X is the one you want, and blindly tapping return there hits OK and quits the game.
+    Returns {"cancel": (fx, fy) | None, "ok": (fx, fy) | None}.
+    """
+    im = capture.capture_printwindow(hwnd).convert("RGB")
+    w, h = im.size
+    # Search the BUTTON ROW only (buttons sit low in the panel). Searching the whole panel picked
+    # up its green border as an "ok" button, and red from the artwork behind it as a "cancel".
+    x0, x1 = int(0.34 * w), int(0.67 * w)
+    y0, y1 = int(0.55 * h), int(0.68 * h)
+    red, blue = [], []
+    for yy in range(y0, y1):
+        for xx in range(x0, x1):
+            r, g_, b = im.getpixel((xx, yy))
+            if r > 140 and g_ < 95 and b < 95:
+                red.append((xx, yy))          # red X = cancel / no
+            elif b > 130 and b > r + 45 and b > g_ + 25:
+                blue.append((xx, yy))         # blue check = ok / yes
+
+    def centroid(pts):
+        if len(pts) < 12:
+            return None
+        return (sum(p[0] for p in pts) / float(len(pts)) / w,
+                sum(p[1] for p in pts) / float(len(pts)) / h)
+
+    # Verified against real captures: on the quit confirm this yields ok=0.466,0.615 and
+    # cancel=0.533,0.617; on non-dialog screens it finds no red at all.
+    return {"cancel": centroid(red), "ok": centroid(blue)}
+
+
+def dismiss_modal(ew):
+    """Dismiss a dialog, preferring the NON-destructive button.
+
+    Prefer cancel (red X) when present -- the common blocking modal is the quit confirm, and OK
+    there leaves the game. Fall back to ok (green check) for one-button dialogs like a disconnect
+    notice, which can only be acknowledged.
+    """
+    b = dialog_buttons(ew["hwnd"])
+    for which in ("cancel", "ok"):
+        if b.get(which):
+            fx, fy = b[which]
+            inputs.click(ew["hwnd"], float(fx), float(fy))
+            log("modal: clicked %s at %.3f,%.3f" % (which, fx, fy))
+            return True
+    log("modal: no button located; leaving it alone rather than guessing")
+    return False
 
 
 def classify():
@@ -156,13 +231,17 @@ def classify():
             return "loading" if launcher_alive() else "dead"
         if ew.get("minimized") or not ew.get("clientW"):
             return "loading"
-        luma, variety, warm = _metrics(ew["hwnd"])
+        luma, variety, warm, blue, panel = _metrics(ew["hwnd"])
         if luma < 12:
             return "loading"
-        if variety > 300:
-            return "ingame"
+        # modal is checked BEFORE title/ingame on purpose: the title screen's quit confirm sits on
+        # top of the title art, and the `title` action taps return -- which would press OK and quit.
+        if panel > 0.45:
+            return "modal"
         if sum(warm) >= 4:
             return "toonselect"
+        if variety > 300 and blue < 0.55:
+            return "ingame"
         return "title"
     except Exception as e:
         log("classify failed (%r) -- treating as unknown" % (e,))
@@ -255,6 +334,11 @@ def enter(timeout=DEFAULT_TIMEOUT):
             if lw:
                 press_go(lw)
                 time.sleep(5)
+        elif s == "modal":
+            ew = engine_window()
+            if ew:
+                dismiss_modal(ew)
+                time.sleep(1.5)
         elif s == "title":
             ew = engine_window()
             if ew:
