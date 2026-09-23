@@ -200,6 +200,20 @@ def dialog_buttons(hwnd):
     return {"cancel": centroid(red), "ok": centroid(blue)}
 
 
+def click_fresh(hwnd, fx, fy, park=(0.20, 0.30)):
+    """Click a DirectGUI control, parking the cursor elsewhere first.
+
+    Panda3D's DirectGUI arms a button on mouse-ENTER. SendInput moves the cursor and clicks in one
+    go, so if the cursor is ALREADY on the control (e.g. from a previous click at the same spot) no
+    enter fires and the click does nothing -- silently, forever. Observed repeatedly: the first
+    click would only reveal a button's hover label, and further clicks at the same point were
+    ignored. Parking the cursor away first guarantees a fresh enter.
+    """
+    inputs.click(hwnd, float(park[0]), float(park[1]))
+    time.sleep(0.6)
+    return inputs.click(hwnd, float(fx), float(fy))
+
+
 def dismiss_modal(ew):
     """Dismiss a dialog, preferring the NON-destructive button.
 
@@ -211,7 +225,7 @@ def dismiss_modal(ew):
     for which in ("cancel", "ok"):
         if b.get(which):
             fx, fy = b[which]
-            inputs.click(ew["hwnd"], float(fx), float(fy))
+            click_fresh(ew["hwnd"], fx, fy)
             log("modal: clicked %s at %.3f,%.3f" % (which, fx, fy))
             return True
     log("modal: no button located; leaving it alone rather than guessing")
@@ -238,7 +252,10 @@ def classify():
         # top of the title art, and the `title` action taps return -- which would press OK and quit.
         if panel > 0.45:
             return "modal"
-        if sum(warm) >= 4:
+        # toonselect needs BOTH warm slot cards AND a blue background. Warm slots alone matched a
+        # tan tunnel arch in-game, and the driver then clicked the toon-slot fraction forever
+        # (250s timeout) at a screen that has no slots. The picker is warm cards ON blue.
+        if sum(warm) >= 4 and blue > 0.30:
             return "toonselect"
         if variety > 300 and blue < 0.55:
             return "ingame"
@@ -347,7 +364,7 @@ def enter(timeout=DEFAULT_TIMEOUT):
         elif s == "toonselect":
             ew = engine_window()
             if ew:
-                inputs.click(ew["hwnd"], *TOON_SLOT)
+                click_fresh(ew["hwnd"], TOON_SLOT[0], TOON_SLOT[1])
                 log("toonselect: clicked slot at %.3f,%.3f" % TOON_SLOT)
                 time.sleep(4)
         # `loading` and `unknown` just wait
