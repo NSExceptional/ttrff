@@ -385,7 +385,15 @@ Windows GIL symbols: `PyGILState_Ensure` `0x14015db10`, `PyGILState_Release` `0x
 
 Also confirmed live: the Windows `TTRGame.vlt` uses the **same per-build name hashes as macOS** — the interval class resolved as `direct.vltf283acbe.vlt615404bc` / `vlt615404bc`, exactly the values this doc records for arm64.
 
-**Still to do:** the modset name matching produced no hits (`scaled by GROUP: {}` / `by NAME: {}`) even across 381 fires, and `TTRMOD_LOGNAMES=1` emitted no `[IVALNAME]` lines, so the run appears to have used the mod1 wrap-after spec (`factor: 5`) rather than the modset byname spec. That is configuration/tuning, not a platform blocker.
+**MODS CONFIRMED SCALING (2026-09-23).** `modset scaled by GROUP: {"door": 6, "teleport": 1}` — `rightDoorOpen`/`rightDoorClose`/`leftDoorOpen`/`leftDoorClose`/`avatarEnterDoor`/`avatarExitDoor` at x3 and `teleportIn` at x4, then a clean revert with the client alive and zero crash events. The Windows port is functionally complete.
+
+The earlier "381 fires, nothing matched" was **not** a spec problem: the modset path reads each interval's name through `ST.AsUTF8`, which is bound only `if (F['PyUnicode_AsUTF8'])`. That symbol is absent from the Windows table, so every name read threw, the surrounding `catch` swallowed it, and the handler returned 0 — 381 silent misses. Worth remembering: an optional-symbol guard plus a broad `catch` turns a missing symbol into a silent no-op rather than an error.
+
+`PyUnicode_AsUTF8` could not be located by xref here, and the reason is itself worth recording: **this image has no ASLR** (`DllCharacteristics = 0x8020`, no `DYNAMIC_BASE`, and the observed slide is `0x0`), so the compiler is free to reference data by absolute immediate rather than RIP-relative — a RIP-relative xref scan sees only some references. `PyErr_BadArgument`'s unique string has *neither* RIP-relative nor absolute-immediate xrefs, i.e. it is fully inlined.
+
+So the agent now falls back to reading the str's bytes straight out of the object — **pure reads**, so a mistake cannot call a wrong function. CPython 3.8 layout: `state` @+0x20 (LSB-first bitfield `interned:2, kind:3, compact:1@bit5, ascii:1@bit6`), compact-ASCII bytes inline at +0x30, cached `utf8` pointer at +0x38. Interval names are ASCII, so the compact-ASCII path is the one that matters. macOS has the real symbol and is unaffected.
+
+Captured names match arm64 exactly (`vlt8e0d5a85-<n>`, `vlt2eae0fcc-<n>`, `stareAt-ToonEyes-*`), so `modset.json` transfers unchanged.
 
 **Superseded — the original analysis, kept because the constraint is still real:** The eval-frame hook exists only to get a moment where the GIL is held and a Python frame is live, so the `setattr` can run safely. `PyGILState_Ensure` / `PyGILState_Release` (already recorded for arm64 in `offsets.json` as `gil_ensure`/`gil_release`) would let a frida thread take the GIL and do the install with **no Interceptor and no code patching** — which is exactly the operation that trips the guard. Deriving them on Windows looks tractable: `Python/pystate.c` is one of the 31 source paths present, and its `Py_FatalError` strings are xref anchors. Untested.
 

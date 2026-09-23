@@ -308,6 +308,27 @@ rpc.exports = {
       if (F['PyObject_GetIter']) ST.GetIter = new NativeFunction(F['PyObject_GetIter'], 'pointer', ['pointer']);
       if (F['PyIter_Next'])      ST.IterNext = new NativeFunction(F['PyIter_Next'], 'pointer', ['pointer']);
       if (F['PyUnicode_AsUTF8']) ST.AsUTF8   = new NativeFunction(F['PyUnicode_AsUTF8'], 'pointer', ['pointer']);
+      // FALLBACK when the build has no out-of-line PyUnicode_AsUTF8 (the Windows engine inlines it
+      // and, with ASLR off, references it in ways a RIP-relative xref scan cannot see). Reads the
+      // str's bytes straight out of the object instead of calling anything -- PURE READS, so a
+      // mistake here cannot call a wrong function. CPython 3.8 layout (unicodeobject.h):
+      //   PyASCIIObject: length @+0x10, hash @+0x18, state @+0x20, wstr @+0x28   (size 0x30)
+      //   PyCompactUnicodeObject adds: utf8_length @+0x30, utf8 @+0x38           (size 0x48)
+      //   state bitfield, LSB first: interned:2, kind:3, compact:1(bit5), ascii:1(bit6), ready:1
+      // A compact-ASCII str stores its bytes inline right after PyASCIIObject, at +0x30, and they
+      // are already valid UTF-8. Otherwise fall back to the cached utf8 buffer at +0x38, which may
+      // be NULL -- callers already treat a null/garbage read as "no name" and clear the tstate.
+      // Interval names are ASCII, so the compact-ASCII path is the one that matters here.
+      if (!ST.AsUTF8) {
+        ST.AsUTF8 = function (o) {
+          try {
+            var state = o.add(0x20).readU32();
+            if (((state >> 5) & 1) && ((state >> 6) & 1)) return o.add(0x30);  // compact ASCII: inline
+            return o.add(0x38).readPointer();                                  // else cached utf8
+          } catch (e) { return ptr(0); }
+        };
+        ST.asutf8_fallback = true;
+      }
       if (F['PyObject_GetItem']) ST.GetItem  = new NativeFunction(F['PyObject_GetItem'], 'pointer', ['pointer','pointer']);
       if (F['PyDict_GetItem'])   ST.DictGetItem = new NativeFunction(F['PyDict_GetItem'], 'pointer', ['pointer','pointer']);
       ST.methods = p.methods || [];          // requested method-signature for findcls/mod1 self-discovery
