@@ -48,6 +48,8 @@ reliable stop on Windows. The injector REFUSES to attach on Windows by default: 
 is a different binary and needs its own re-derived per-build entry (image base will differ; the
 ASLR-slide model stays). `TTRMOD_WIN_TABLE=1` overrides once a Windows table exists.
 
+**Windows (2026-09-23): per-build table PARTLY derived; still NOT runnable.** `capi-symbols-win.json` now holds 16 confirmed symbols for TTREngine64.exe 3.2.0.609 (image base `0x140000000`), including the whole of the injector's `NEED` list and the frame-eval hook site. Still missing, and the ONLY thing blocking a first attach: `FLOAT_FREELIST`, `FLOAT_NUMFREE`, `PYMALLOC_FN`, `PYMALLOC_CTX`, needed by the agent's hand-built `makeFloat`. Those are **write** targets, so a wrong value corrupts the client rather than just failing — do not set `TTRMOD_WIN_TABLE=1` until they are derived and confirmed. See "Windows per-build derivation" below.
+
 ---
 
 ## The target — TTREngine
@@ -328,6 +330,8 @@ password-lock (`CGSSessionScreenIsLocked=Yes`) does the same; a screensaver with
 
 ## Dead ends (do not re-attempt)
 
+- **Windows: frida `Interceptor.attach` on the engine's code** — fail-fasts the client (`0xc0000409` at `ntdll+0xa1a21`, the same site as a bulk read of the packed region). Not CFG (it is off). Any approach that PATCHES engine code on Windows should be assumed to hit this until proven otherwise; prefer a GIL-based install that patches nothing.
+
 - **Injected bytecode / `marshal_evalcode`** — killed by the three anti-injection layers (TYPE_CODE
   disabled, read-only `f_builtins`, opcode cipher). This is *why* the C-API trampoline route was chosen.
 - **Static opcode-permutation map** — it's a position+key cipher, not a permutation; no
@@ -349,6 +353,33 @@ password-lock (`CGSSessionScreenIsLocked=Yes`) does the same; a screensaver with
 - **`base.transitions` iris/fade wrap** — TTR's zone changes don't route through it (`fires=0`); the
   visible fade comes from the zone loader. The `irisTask` interval name catches the iris instead.
 - **lldb / debugserver** — SIGSEGV on attach, TTR-specific.
+
+---
+
+## Windows per-build derivation (TTREngine64.exe)
+
+**The Windows engine is PACKED; the macOS static-analysis playbook does not transfer.** The on-disk PE has entropy ~7.98 across its text and a 12.9 MB `.boot` section, zero plaintext strings (not `Panda3D`, not even `KERNEL32` — the imports are encrypted), 12 exports (libffi + GPU hints, no CPython), and `.tdata` is 20 MB virtual / **0 raw**. Everything needed exists only in memory after the packer unpacks.
+
+**NEVER read this client's memory in-process.** frida's agent reads from *inside* the target, so touching a packer-protected page (`PAGE_GUARD` / `PAGE_NOACCESS` / decrypt-on-demand) raises in the target's own exception path, and `__fastfail` (`0xc0000409`) is uncatchable — frida cannot absorb it and the client dies. This killed the client twice: once via `Memory.scanSync` over all ranges, once via `readByteArray` over the module image (which died at ~32 MB of 66 MB, right where `.tdata` starts at 36.2 MB). A `readByteArray` dump that appears to "work" but yields all zeros means the legacy `Memory.readByteArray(ptr,len)` form was used — it was REMOVED in frida 17 and throws `not a function`; use `ptr(addr).readByteArray(len)`.
+
+**Dump OUT-OF-PROCESS instead.** `ReadProcessMemory` via ctypes, `OpenProcess` with only `PROCESS_QUERY_INFORMATION|PROCESS_VM_READ`, skipping `PAGE_GUARD`/`PAGE_NOACCESS`/uncommitted regions found by `VirtualQueryEx`. The kernel performs the copy and returns *us* the error, so nothing executes in the game. Result: all 66.3 MB in 0.1 s, one 4 KiB page skipped, client unaffected.
+
+**Then symbolicate offline, no IDA needed.** Three levers, in increasing power:
+1. **`.pdata`** — the x64 exception directory gives exact start/end for **92,035** functions. A string xref therefore lands *in* a function whose start IS the symbol address. This is strictly better than the arm64 prologue-walking above.
+2. **Unique error strings** — RIP-relative `lea` xrefs (`48 8d 0d disp32`). Finds `_PyEval_EvalFrameDefault` (`"unknown opcode"`), `PyObject_Call`, `PyCFunction_NewEx`.
+3. **`PyErr_BadInternalCall(__FILE__, __LINE__)`** — the engine keeps 31 full CPython source paths (`/builds/mirai/python/cpython/Objects/tupleobject.c`, …) and the line number as an immediate. Matched against real 3.8.17 source this **named 109 functions mechanically**. This is the same disambiguator `capi-symbols2.md` used on arm64.
+
+Then **confirm by disassembly** (capstone) before trusting anything. Heuristics were wrong twice here: `PyObject_IsTrue` masqueraded as `SetAttrString` via an `nb_bool` offset collision, and `PyEval_CallObjectWithKeywords` masqueraded as `PyObject_Call`.
+
+**Cross-architecture validation.** The tuple `BadInternalCall` line numbers (New=85, Size=142, GetItem=153, SetItem=169) match this doc's arm64 values exactly, and every struct offset (`tp_call`+0x80, `tp_getattr`+0x40, `tp_setattr`+0x48, `tp_vectorcall_offset`+0x38, `tp_flags` vectorcall byte@+0xa9 bit3, `ml_flags`@+0x10 mask 0x8F, `PyThreadState.recursion_depth`+0x20) was independently re-confirmed on x86-64. The offsets are CPython-version-specific, not architecture-specific, so they transfer as-is.
+
+**Where it stands (2026-09-23): the TABLE is proven, the HOOK is not.** `TTRMOD_DRYRUN=1` attaches, computes the ASLR slide, memcmp's every symbol's prologue at its slid address and detaches without installing anything. It passes: **18/18 verified, slide `0x0`, client unaffected**. So the derived addresses are right against the live process — that question is closed.
+
+**But `Interceptor.attach` on `_PyEval_EvalFrameDefault` fail-fasts the client.** `ex.arm()` kills it with `0xc0000409` at **`ntdll+0xa1a21`** — byte-for-byte the SAME fault offset as the earlier bulk-read crash. So one ntdll fail-fast site answers both "bulk-read the packed region" and "patch code", which points at the packer guarding its memory rather than at anything CPython-specific. **Control Flow Guard is NOT the cause** — `DllCharacteristics = 0x8020` (no `GUARD_CF`) and the load-config directory is empty, so it was ruled out, not assumed.
+
+**Likely way forward: stop patching code at all.** The eval-frame hook exists only to get a moment where the GIL is held and a Python frame is live, so the `setattr` can run safely. `PyGILState_Ensure` / `PyGILState_Release` (already recorded for arm64 in `offsets.json` as `gil_ensure`/`gil_release`) would let a frida thread take the GIL and do the install with **no Interceptor and no code patching** — which is exactly the operation that trips the guard. Deriving them on Windows looks tractable: `Python/pystate.c` is one of the 31 source paths present, and its `Py_FatalError` strings are xref anchors. Untested.
+
+**Build key.** Key the Windows entry on the PDB GUID (`51124cdfd7dac3164c4c44205044422e`, age 1) — the direct analogue of the Mach-O UUID. PE timestamp `1717007375`, file version `3.2.0.609`.
 
 ---
 

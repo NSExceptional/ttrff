@@ -1,0 +1,135 @@
+{
+ "_meta": {
+  "engine": "TTREngine64.exe (Toontown Rewritten), Windows x86-64, embedded CPython 3.8.17, packed + symbol-stripped (12 exports, none CPython)",
+  "build_key_pdb_guid": "51124cdfd7dac3164c4c44205044422e",
+  "build_key_pdb_age": 1,
+  "pdb_path": "/builds/mirai/client/build/mirai.pdb",
+  "pe_timestamp": 1717007375,
+  "file_version": "3.2.0.609",
+  "image_base": "0x140000000",
+  "derivation": "OUT-OF-PROCESS ReadProcessMemory dump of the UNPACKED image (the on-disk PE is packed: .tdata is 20MB virtual / 0 raw, entropy ~7.98, no plaintext strings). Symbols located by (a) the x64 exception directory .pdata giving exact bounds for 92035 functions, (b) unique error-string RIP-relative xrefs, (c) PyErr_BadInternalCall (__FILE__,__LINE__) pairs matched against real CPython 3.8.17 source -- the same disambiguator capi-symbols2.md used on arm64, (d) capstone disassembly to CONFIRM semantics. Every addr below was read, not inferred.",
+  "cross_validation": "tuple line numbers (New=85, Size=142, GetItem=153, SetItem=169) match capi-symbols2.md's arm64 values exactly; struct offsets (tp_call+0x80, tp_getattr+0x40, tp_setattr+0x48, tp_vectorcall_offset+0x38, tp_flags vectorcall byte@+0xa9 bit3, ml_flags@+0x10 mask 0x8F, PyThreadState.recursion_depth+0x20) all confirmed identical to the arm64 notes.",
+  "type_objects": {
+   "PyCFunction_Type": "0x141f4f828",
+   "PyInstanceMethod_Type": "0x141ea2950",
+   "PyTuple_Type": "0x141f76178",
+   "PyFloat_Type": "0x141f76c68"
+  },
+  "singletons": {
+   "Py_True": "0x141f754a8",
+   "Py_False": "0x141f754c8",
+   "Py_None": "0x141f77148"
+  },
+  "tstate_cell": "0x1420d2fb8",
+  "float_construction": "PyFloat_FromDouble exists OUT-OF-LINE here, so the agent calls it directly instead of the hand-built makeFloat recipe the arm64 build needs. That removes the need for FLOAT_FREELIST / FLOAT_NUMFREE / PYMALLOC_FN / PYMALLOC_CTX entirely -- and with them the only WRITE targets, so we no longer poke CPython's allocator bookkeeping ourselves. Recorded for reference: freelist head 0x141fc3838, numfree 0x141fc3840.",
+  "status": "Complete for the injector's NEED list + tuple builder + hook site + float construction. NEVER validated against a live client -- the first attach is still unproven."
+ },
+ "PyCFunction_NewEx": {
+  "found": "yes",
+  "vmaddr": "0x1401021f0",
+  "prologue16": "41 57 41 56 56 57 53 48 83 ec 20 4c 89 c6 48 89",
+  "evidence": "ml_flags read @ ml+0x10 masked 0x8F, switch on call flags, \"%s() method: bad call flags\""
+ },
+ "PyDict_GetItem": {
+  "found": "yes",
+  "vmaddr": "0x1400ee060",
+  "prologue16": "56 57 53 48 83 ec 50 48 8b 05 6a 90 da 01 48 31",
+  "evidence": "callee of PyDict_GetItemString"
+ },
+ "PyDict_GetItemString": {
+  "found": "yes",
+  "vmaddr": "0x1400ee900",
+  "prologue16": "56 57 48 83 ec 28 48 89 ce 48 89 d1 e8 7f a3 04",
+  "evidence": "PyUnicode_FromString -> PyDict_GetItem -> Py_DECREF; PyErr_Clear on ctor failure"
+ },
+ "PyErr_BadInternalCall": {
+  "found": "yes",
+  "vmaddr": "0x1401509c0",
+  "prologue16": "48 83 ec 28 49 89 c9 48 8b 0d ea 25 f8 01 89 54",
+  "evidence": "(file,line) callee that symbolicated 109 functions"
+ },
+ "PyErr_Clear": {
+  "found": "yes",
+  "vmaddr": "0x140150120",
+  "prologue16": "48 8b 0d 91 2e f8 01 e9 a4 fa ff ff cc cc cc cc",
+  "evidence": "callee on the failure path of PyDict_GetItemString / PyObject_HasAttrString"
+ },
+ "PyObject_Call": {
+  "found": "yes",
+  "vmaddr": "0x1400e0f10",
+  "prologue16": "41 56 56 57 53 48 83 ec 28 4c 89 c7 48 89 d3 48",
+  "evidence": "vectorcall flag byte@+0xa9 bit3, tp_vectorcall_offset@+0x38, tp_call@+0x80, &PyCFunction_Type; raises \"'%.200s' object is not callable\""
+ },
+ "PyObject_GetAttr": {
+  "found": "yes",
+  "vmaddr": "0x140105060",
+  "prologue16": "56 57 48 83 ec 28 48 8b 42 08 f6 80 ab 00 00 00",
+  "evidence": "callee of PyObject_GetAttrString"
+ },
+ "PyObject_GetAttrString": {
+  "found": "yes",
+  "vmaddr": "0x140105000",
+  "prologue16": "56 57 48 83 ec 28 48 89 ce 48 8b 41 08 48 8b 40",
+  "evidence": "tp_getattr@+0x40 fast path, else PyUnicode_FromString -> PyObject_GetAttr -> Py_DECREF"
+ },
+ "PyObject_SetAttr": {
+  "found": "yes",
+  "vmaddr": "0x1401051b0",
+  "prologue16": "41 56 56 57 53 48 83 ec 38 48 8b 05 18 1f d9 01",
+  "evidence": "callee of PyObject_SetAttrString"
+ },
+ "PyObject_SetAttrString": {
+  "found": "yes",
+  "vmaddr": "0x140105140",
+  "prologue16": "56 57 53 48 83 ec 20 4c 89 c6 48 89 cf 48 8b 41",
+  "evidence": "tp_setattr@+0x48 fast path, else PyUnicode_FromString -> PyObject_SetAttr"
+ },
+ "PyTuple_GetItem": {
+  "found": "yes",
+  "vmaddr": "0x14010b8f0",
+  "prologue16": "48 83 ec 28 48 8b 41 08 f6 80 ab 00 00 00 04 75",
+  "evidence": "tupleobject.c:153 BadInternalCall"
+ },
+ "PyTuple_New": {
+  "found": "yes",
+  "vmaddr": "0x14010ae60",
+  "prologue16": "56 57 48 83 ec 28 48 85 c9 78 19 48 89 cf 75 2c",
+  "evidence": "tupleobject.c:85 BadInternalCall on negative; cmp 0x13 size-indexed freelist; &PyTuple_Type"
+ },
+ "PyTuple_SetItem": {
+  "found": "yes",
+  "vmaddr": "0x14010b940",
+  "prologue16": "48 83 ec 28 48 8b 41 08 f6 80 ab 00 00 00 04 74",
+  "evidence": "tupleobject.c:169 BadInternalCall"
+ },
+ "PyTuple_Size": {
+  "found": "yes",
+  "vmaddr": "0x14010b8b0",
+  "prologue16": "48 83 ec 28 48 8b 41 08 f6 80 ab 00 00 00 04 75",
+  "evidence": "tupleobject.c:142 BadInternalCall"
+ },
+ "PyUnicode_FromString": {
+  "found": "yes",
+  "vmaddr": "0x140138c90",
+  "prologue16": "56 48 83 ec 20 48 89 ce e8 03 49 5d 01 48 85 c0",
+  "evidence": "callee of PyObject_GetAttrString and PyDict_GetItemString"
+ },
+ "_PyEval_EvalFrameDefault": {
+  "found": "yes",
+  "vmaddr": "0x140148d10",
+  "prologue16": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 ec e8",
+  "evidence": "sole xref to \"unknown opcode\"; 18644 bytes -- the frame-eval hook site"
+ },
+ "PyFloat_FromDouble": {
+  "found": "yes",
+  "vmaddr": "0x1402b2830",
+  "prologue16": "56 48 83 ec 30 0f 29 74 24 20 0f 28 f0 48 8b 35",
+  "evidence": "NOT inlined on Windows (unlike arm64): pops the float freelist head @0x141fc3838, decrements numfree @0x141fc3840, else PyObject_Malloc(0x18); sets ob_type=&PyFloat_Type, ob_refcnt=1, ob_fval@+0x10 from xmm0"
+ },
+ "PyObject_Malloc": {
+  "found": "yes",
+  "vmaddr": "0x1402a8880",
+  "prologue16": "48 85 c9 78 14 48 89 ca 48 8b 05 29 60 c0 01 48",
+  "evidence": "callee of PyFloat_FromDouble's else branch, called with ecx=0x18 (one arg, MS x64 ABI)"
+ }
+}

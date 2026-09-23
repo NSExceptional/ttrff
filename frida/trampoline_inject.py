@@ -72,6 +72,52 @@ FLOAT_NUMFREE   = 0x101be9590       # int32 numfree (8 after the head, MAXFREELI
 PYMALLOC_FN     = 0x101a7a668       # _PyObject allocator .malloc (fn ptr)
 PYMALLOC_CTX    = 0x101a7a660       # _PyObject allocator .ctx
 
+# ---- Windows per-build overrides (TTREngine64.exe 3.2.0.609, PDB GUID 51124cdf...) ----
+# Derived 2026-09-23 from an OUT-OF-PROCESS dump of the unpacked image; see STATUS.md
+# "Windows per-build derivation" and capi-symbols-win.json. Every value here was confirmed by
+# capstone disassembly, not inferred. The four `None`s below are the ONLY thing still blocking a
+# Windows attach -- and they are WRITE targets used by the agent's hand-built makeFloat(), so a
+# wrong value corrupts the client rather than merely failing. WIN_MISSING gates the attach on them.
+WIN_IMAGE_BASE          = 0x140000000
+WIN_INSTANCEMETHOD_TYPE = 0x141ea2950   # tp_name "instancemethod"
+WIN_TSTATE_CELL         = 0x1420d2fb8   # read out of PyObject_Call's _PyThreadState_GET()
+WIN_FLOAT_TYPE          = 0x141f76c68   # tp_name "float", tp_basicsize == 24 (unambiguous)
+# Not needed on Windows: PyFloat_FromDouble is OUT-OF-LINE in this build (it is inlined away on
+# arm64, which is the only reason the hand-built makeFloat recipe exists), so the agent calls it
+# and CPython does its own freelist bookkeeping. Left here, recorded, because they are the
+# arm64-style fallback inputs and are useful if a future Windows build inlines it after all:
+#   float freelist head 0x141fc3838, numfree 0x141fc3840 (verified: head non-NULL iff numfree > 0)
+WIN_FLOAT_FREELIST      = None
+WIN_FLOAT_NUMFREE       = None
+WIN_PYMALLOC_FN         = None
+WIN_PYMALLOC_CTX        = None
+# Struct offsets are CPython-version-specific, NOT architecture-specific: INTERP_OFF, MODULES_OFF,
+# FRAME_OFF, FCODE_OFF and CONAME_OFF above were re-confirmed unchanged on x86-64, so they stand.
+
+if IS_WINDOWS:
+    IMAGE_BASE          = WIN_IMAGE_BASE
+    INSTANCEMETHOD_TYPE = WIN_INSTANCEMETHOD_TYPE
+    TSTATE_CELL         = WIN_TSTATE_CELL
+    FLOAT_TYPE          = WIN_FLOAT_TYPE
+    FLOAT_FREELIST      = WIN_FLOAT_FREELIST
+    FLOAT_NUMFREE       = WIN_FLOAT_NUMFREE
+    PYMALLOC_FN         = WIN_PYMALLOC_FN
+    PYMALLOC_CTX        = WIN_PYMALLOC_CTX
+
+def win_float_gap(syms):
+    """[] when the Windows build can build a Python float, else the reason it cannot.
+
+    Two ways to satisfy it: a real PyFloat_FromDouble (preferred -- CPython does its own freelist
+    bookkeeping, so we never write to interpreter state), or the arm64-style hand-built recipe,
+    which needs all four allocator constants. Anything else and setPlayRate cannot be called."""
+    if "PyFloat_FromDouble" in syms:
+        return []
+    need = [n for n, v in (("FLOAT_FREELIST", WIN_FLOAT_FREELIST),
+                           ("FLOAT_NUMFREE", WIN_FLOAT_NUMFREE),
+                           ("PYMALLOC_FN", WIN_PYMALLOC_FN),
+                           ("PYMALLOC_CTX", WIN_PYMALLOC_CTX)) if v is None]
+    return need
+
 # mod1 -- the FIRST live target: the street tunnel walk, triggerable with pure keyboard movement
 # (walk the toon into/out of any street tunnel; no mouse). From inproc/payload.py's `tunnel` group:
 #   class LocalToon; methods handleTunnelIn/handleTunnelOut; wrap-after; interval attr 'tunnelTrack';
@@ -108,7 +154,10 @@ TUPLE_EITHER = ["PyTuple_New", "PyTuple_Pack"]
 
 def load_symbols():
     syms = {}
-    for fn in ("capi-symbols.json", "capi-symbols2.json"):
+    # Windows has its own per-build table (different binary, different image base); the macOS
+    # arm64 tables must never be loaded there -- their vmaddrs would be garbage.
+    tables = ("capi-symbols-win.json",) if IS_WINDOWS else ("capi-symbols.json", "capi-symbols2.json")
+    for fn in tables:
         p = os.path.join(ROOT, fn)
         if not os.path.exists(p):
             continue
@@ -310,12 +359,21 @@ rpc.exports = {
       ST.recordInstall = function(cls, mn, orig){ try { ST.installed.push({cls:cls, mn:mn, orig:orig}); } catch(e){} };
 
       // ---- milestone-2: manual PyFloat builder + generic wrap-after (payload.py port) ----
+      // PREFERRED: a real out-of-line PyFloat_FromDouble. It exists on the Windows build; on the
+      // arm64 build it is inlined away, which is the only reason the hand-built recipe below exists.
+      // Calling it lets CPython manage its own freelist, so we never WRITE to interpreter
+      // bookkeeping ourselves -- strictly safer than popping the freelist by hand.
+      ST.FloatFromDouble = null;
+      try {
+        if (F['PyFloat_FromDouble'])
+          ST.FloatFromDouble = new NativeFunction(F['PyFloat_FromDouble'], 'pointer', ['double']);
+      } catch(e){ ST.FloatFromDouble = null; }
       if (p.floatv){
-        ST.FloatType     = rt(p.floatv.type);
-        ST.floatFreelist = rt(p.floatv.freelist);
-        ST.floatNumfree  = rt(p.floatv.numfree);
-        ST.mallocFnPtr   = rt(p.floatv.malloc_fn);
-        ST.mallocCtxPtr  = rt(p.floatv.malloc_ctx);
+        ST.FloatType     = p.floatv.type      ? rt(p.floatv.type)      : null;
+        ST.floatFreelist = p.floatv.freelist  ? rt(p.floatv.freelist)  : null;
+        ST.floatNumfree  = p.floatv.numfree   ? rt(p.floatv.numfree)   : null;
+        ST.mallocFnPtr   = p.floatv.malloc_fn ? rt(p.floatv.malloc_fn) : null;
+        ST.mallocCtxPtr  = p.floatv.malloc_ctx ? rt(p.floatv.malloc_ctx) : null;
         ST.Malloc = null; ST.mallocCtx = null;
       }
       ST.mod1 = p.mod1 || null;
@@ -382,6 +440,14 @@ rpc.exports = {
       // build a float by hand (STATUS.md recipe): pop the free-list head (relink via +8, numfree--),
       // else pymalloc(24); then ob_refcnt=1 @+0, ob_type=&PyFloat_Type @+8, ob_fval @+0x10.
       ST.makeFloat = function(v){
+        // Real PyFloat_FromDouble when the build has one (Windows): CPython does the freelist
+        // bookkeeping itself, so nothing here writes to interpreter state.
+        if (ST.FloatFromDouble){
+          try { return ST.FloatFromDouble(v); } catch(e){ return ptr(0); }
+        }
+        // Fallback (arm64, where PyFloat_FromDouble is inlined): build one by hand per the
+        // STATUS.md recipe. Requires floatFreelist/floatNumfree/malloc pointers.
+        if (!ST.floatFreelist || !ST.FloatType) return ptr(0);
         try {
           var op = ptr(0);
           var head = ST.floatFreelist.readPointer();
@@ -1623,20 +1689,28 @@ def find_engine_pids():
         import psutil
     except ImportError:
         # tasklist fallback: name-only match (TTREngine.exe), fine for a same-user process
-        out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq TTREngine.exe", "/FO", "CSV", "/NH"],
-            text=True, stderr=subprocess.DEVNULL)
+        # IMAGENAME eq is an EXACT match, but the shipped Windows exe is TTREngine64.exe -- so
+        # filter with a trailing wildcard (tasklist supports it) per needle, and keep the
+        # substring re-check below as the real gate.
         pids = []
-        for line in out.splitlines():
-            parts = [p.strip('"') for p in line.split('","')]
-            if len(parts) >= 2 and parts[0].lower().startswith("ttrengine"):
-                try:
-                    pids.append(int(parts[1]))
-                except ValueError:
-                    pass
+        for needle in ENGINE_NEEDLES:
+            try:
+                out = subprocess.check_output(
+                    ["tasklist", "/FI", "IMAGENAME eq %s*" % needle, "/FO", "CSV", "/NH"],
+                    text=True, stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError:
+                continue
+            for line in out.splitlines():
+                parts = [p.strip('"') for p in line.split('","')]
+                if len(parts) >= 2 and needle in parts[0].lower():
+                    try:
+                        pids.append(int(parts[1]))
+                    except ValueError:
+                        pass
         if not pids:
-            raise RuntimeError("no TTREngine.exe found (tasklist)")
-        return pids
+            raise RuntimeError("no engine process found via tasklist for names: %s"
+                               % ",".join(ENGINE_NEEDLES))
+        return sorted(set(pids))
     pids = []
     for p in psutil.process_iter(["name", "exe", "cmdline"]):
         try:
@@ -1798,7 +1872,11 @@ def revert_and_detach(ex, session, box, rev, target_label, alive_check=None,
 
 
 def main():
-    try: sys.stdout.reconfigure(line_buffering=True)   # immediate logs even when the runner wraps/pipes stdout (belt-and-suspenders with PYTHONUNBUFFERED)
+    # UTF-8 + line-buffered: immediate logs even when the runner wraps/pipes stdout
+    # (belt-and-suspenders with PYTHONUNBUFFERED). encoding matters on Windows, where a piped
+    # stdout defaults to cp1252 and mangles the em-dashes in these messages -- the tray appends
+    # its own [tray] lines to the SAME file, so both sides must agree on UTF-8.
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except Exception: pass
     syms = load_symbols()
     missing, tuple_fn = readiness(syms)
@@ -1813,11 +1891,17 @@ def main():
         # would read garbage addresses and crash the client. A Windows engine build must be
         # re-derived first (STATUS.md "Fragility") and shipped as its own per-build entry. The
         # TTRMOD_WIN_TABLE=1 escape hatch forces a run against a derived-but-unshipped table.
+        gap = win_float_gap(syms)
+        if gap:
+            print("[tramp-live] NOT READY — the Windows table has no way to build a Python float: "
+                  "no PyFloat_FromDouble symbol, and the hand-built fallback is missing %s. "
+                  "setPlayRate cannot be called without one of those. NOT overridable by "
+                  "TTRMOD_WIN_TABLE. See STATUS.md 'Windows per-build derivation'." % ", ".join(gap))
+            return
         if os.environ.get("TTRMOD_WIN_TABLE", "") not in ("1", "true", "yes"):
-            print("[tramp-live] NOT READY — the bundled capi-symbols/offsets tables cover the macOS "
-                  "arm64 engine only; the Windows engine needs its own re-derived per-build entry "
-                  "(see STATUS.md 'Fragility'). Refusing to attach to avoid crashing the client. "
-                  "Set TTRMOD_WIN_TABLE=1 to override once a Windows table is derived.")
+            print("[tramp-live] NOT READY — a Windows per-build table is present and complete, but "
+                  "has never been validated against a live client. Set TTRMOD_WIN_TABLE=1 to take "
+                  "that first attach (expect to need scripts/ttdrive.py to recover if it crashes).")
             return
     import frida
     # add the frame-eval hook addr (from offsets.json) to syms passing
@@ -2068,6 +2152,18 @@ def main():
     print("[tramp-live] init:", json.dumps(init, indent=2))
     if not init.get("ok") or not init.get("verified"):
         print("[tramp-live] init failed/unverified — aborting"); session.detach(); return
+    # TTRMOD_DRYRUN=1: prove a per-build table against the LIVE process without installing anything.
+    # init() has already computed the ASLR slide and memcmp'd every symbol's prologue bytes at its
+    # slid address, which is the part a wrong table gets wrong. Stopping here installs no trampoline,
+    # so there is nothing that can dangle and crash the game on detach -- the right first step for a
+    # table that has never been run (see STATUS.md "Windows per-build derivation").
+    if os.environ.get("TTRMOD_DRYRUN", "") in ("1", "true", "yes"):
+        print("[tramp-live] DRY RUN — table verified against the live process; installing nothing.")
+        print("[tramp-live] slide=%s  symbols verified=%d" % (init.get("slide"), len(init.get("resolved") or {})))
+        for note in (init.get("notes") or []):
+            print("[tramp-live]   note: %s" % note)
+        session.detach()
+        return
     ex.arm()
     if not done.wait(8.0):
         print("[tramp-live] install hook never fired in 8s (game idle/frozen?)"); session.detach(); return

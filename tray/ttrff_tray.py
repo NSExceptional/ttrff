@@ -226,7 +226,9 @@ class Supervisor:
     def _launch_injector(self):
         argv, env = self._launch_cmd()
         try:
-            logf = open(LOGFILE, "a", buffering=1)
+            # UTF-8: the injector writes this same file (its stdout is redirected here) and
+            # logs em-dashes; a cp1252 default on Windows mangles them.
+            logf = open(LOGFILE, "a", buffering=1, encoding="utf-8", errors="replace")
         except Exception:
             logf = subprocess.DEVNULL
         try:
@@ -323,7 +325,7 @@ class Supervisor:
     # ---- error surfacing ----
     def _note_error(self, msg):
         try:
-            with open(LOGFILE, "a") as f:
+            with open(LOGFILE, "a", encoding="utf-8", errors="replace") as f:
                 f.write("[tray] %s\n" % msg)
         except Exception:
             pass
