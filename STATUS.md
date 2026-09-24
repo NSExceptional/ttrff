@@ -434,6 +434,55 @@ So the deterministic LocalToon+iris arrival mechanism works exactly as designed,
 
 ---
 
+## Reading world state — the vault hashes attribute names, not framework ones
+
+`frida/worldstate.py` is a READ-ONLY second script (no hooks, no setattr) that reports where the
+toon is and where the pickups are. It reuses the injector's per-build table and its two hard rules
+— reach the GIL via `PyGILState_Ensure`/`Release`, and clear the pending exception on every exit
+path — but installs nothing, so a bug in it cannot destabilise the mod.
+
+The thing worth recording is how objects are identified. **`base.localAvatar` does not exist.**
+`dir(base)` returns 567 attributes and not one contains "avatar": the vault renames TTR's own
+identifiers per build. What it cannot rename is anything inherited from Panda/DirectPython, which
+is why `base.cr.doId2do` reads fine. So every lookup here goes through a SIGNATURE, never a name
+and never a `vlt*` hash (hashes are per-build and change under you):
+
+| role | signature | this build |
+|---|---|---|
+| local toon | exposes `tunnelOut` | `vlt725d40df` ×1 — same hash as macOS |
+| jellybean bag | `treasure` **and** `value` | `vlt433b51a4` (value = bean count) |
+| plain treasure | `treasure`, no `value` | `vltb3cf91ab` |
+
+The signature probe costs several getattrs, so `roleOf` runs it once per CLASS and caches by
+`tp_name`; steady-state ticks are pure pointer reads. Two more details that cost time to find:
+
+- A treasure is **not** a NodePath, it HAS one (`.nodePath`). Calling `getX` on the object itself
+  silently yields nothing, so `posOf` falls through to `.nodePath` rather than dropping the object.
+- There is no `PyFloat_AsDouble` in the Windows table and none is needed — a float's `ob_fval` is
+  inline at `+0x10`, the same read-it-directly trick as the `AsUTF8` compact-ASCII fallback. Small
+  ints (the bean count) come from `ob_size` at `+0x10` and 30-bit digits from `+0x18`, guarded on
+  `tp_name == "int"`.
+
+**Obstacles are not available this way.** Walls, buildings and trees are scene-graph collision
+geometry, not distributed objects, so they never appear in `doId2do`. Anything needing them has to
+walk the scene graph instead; `scripts/beanbot.py` deliberately substitutes a "is the distance
+actually falling" test rather than pretending to know where the walls are.
+
+### Movement is measured, not guessed — `scripts/calibrate.py`
+
+Holding a key for a set time and reading the pose delta out of memory gives, on this client:
+
+```
+degrees = 93.6 * seconds + 0.7      (repeat spread < 1 deg, left/right within 1%)
+units   = 21.0 * seconds + 0.1      (fit on holds up to 1.2s)
+```
+
+Re-derive these when the client changes. Two traps: a walk sample of 1.8s reliably ends against
+scenery and reads LOW (it dragged a naive fit from 21.0 down to 19.6, so the durations are capped
+at 1.2s), and the first version of the bot held a turn key for a whole 500 ms tick regardless of
+the correction needed — i.e. ~47 degrees every time — which made it zig-zag violently past every
+target. Overshoot was a control bug, not a steering-logic bug.
+
 ## Fragility / re-deriving per build
 
 **Everything build-specific here is per-build.** The arm64 UUID pins the addresses; the tool's prologue
