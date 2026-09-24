@@ -200,6 +200,44 @@ def dialog_buttons(hwnd):
     return {"cancel": centroid(red), "ok": centroid(blue)}
 
 
+# The picker is a 3x2 grid of cards; these are their centres as client-area fractions.
+SLOT_GRID = [(0.25, 0.31), (0.50, 0.31), (0.76, 0.31),
+             (0.25, 0.73), (0.50, 0.73), (0.76, 0.73)]
+
+
+def find_occupied_slot(hwnd):
+    """Fraction coords of the picker card that actually HOLDS a toon, or None.
+
+    Clicking a fixed fraction landed on an empty card and dropped the driver into Make-a-Toon --
+    twice -- which is disruptive and has to be backed out of by hand. Position is the wrong thing
+    to trust: which cards are empty depends on the account, and an empty card looks nothing like an
+    occupied one. An occupied card renders a 3D toon head, so it carries many distinct colours; an
+    empty card is a flat pastel rectangle with "MAKE A TOON" on it, so it carries a handful.
+    Counting quantised colours separates them by a wide margin.
+
+    Returns None rather than a guess when no card clearly wins, so the caller can refuse to click.
+    """
+    im = capture.capture_printwindow(hwnd).convert("RGB")
+    w, h = im.size
+    scores = []
+    for fx, fy in SLOT_GRID:
+        cx, cy = int(fx * w), int(fy * h)
+        x0, x1 = max(cx - int(0.075 * w), 0), min(cx + int(0.075 * w), w)
+        y0, y1 = max(cy - int(0.10 * h), 0), min(cy + int(0.10 * h), h)
+        seen = set()
+        for yy in range(y0, y1, 3):
+            for xx in range(x0, x1, 3):
+                r, g, b = im.getpixel((xx, yy))
+                seen.add((r >> 4, g >> 4, b >> 4))     # quantise; exact shades are noise
+        scores.append(((fx, fy), len(seen)))
+    scores.sort(key=lambda kv: -kv[1])
+    (best, top), (_, second) = scores[0], scores[1]
+    log("toonselect: slot colour variety %s" % [(("%.2f,%.2f" % s[0]), s[1]) for s in scores])
+    if top < 1.5 * max(second, 1):
+        return None
+    return best
+
+
 def click_fresh(hwnd, fx, fy, park=(0.20, 0.30)):
     """Click a DirectGUI control, parking the cursor elsewhere first.
 
@@ -364,8 +402,15 @@ def enter(timeout=DEFAULT_TIMEOUT):
         elif s == "toonselect":
             ew = engine_window()
             if ew:
-                click_fresh(ew["hwnd"], TOON_SLOT[0], TOON_SLOT[1])
-                log("toonselect: clicked slot at %.3f,%.3f" % TOON_SLOT)
+                slot = find_occupied_slot(ew["hwnd"])
+                if slot is None:
+                    # Refuse to guess: a wrong click here enters Make-a-Toon, which is far worse
+                    # than waiting a tick for the picker to finish animating in.
+                    log("toonselect: no card clearly holds a toon yet -- waiting")
+                    time.sleep(1.0)
+                    continue
+                click_fresh(ew["hwnd"], slot[0], slot[1])
+                log("toonselect: clicked occupied slot at %.3f,%.3f" % slot)
                 time.sleep(4)
         # `loading` and `unknown` just wait
 

@@ -38,6 +38,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import trampoline_inject as TI          # noqa: E402  -- per-build tables + engine discovery
 
+# Py_True / Py_False live in the table's _meta block (they are data, not functions, so they are not
+# part of load_symbols' output). Used only to interpret a bool return such as NodePath.isHidden().
+_META = json.load(open(os.path.join(os.path.dirname(HERE), "capi-symbols-win.json"))).get("_meta", {})
+_SING = _META.get("singletons", {})
+TRUE_OBJ = _SING.get("Py_True")
+FALSE_OBJ = _SING.get("Py_False")
+
 JS = r"""
 var ST = null;
 
@@ -60,6 +67,8 @@ rpc.exports = {
         cell:       rt(p.tstate_cell),
         interp_off: p.interp_off, modules_off: p.modules_off,
         FloatType:  p.float_type ? rt(p.float_type) : null,
+        PyTrue:     p.py_true  ? rt(p.py_true)  : null,
+        PyFalse:    p.py_false ? rt(p.py_false) : null,
         keep: [], mcache: {}
       };
       if (F['PyObject_GetIter'])      ST.GetIter    = new NativeFunction(F['PyObject_GetIter'],      'pointer', ['pointer']);
@@ -114,6 +123,32 @@ rpc.exports = {
           if (p2.isNull()) return null;
           return p2.readCString();
         } catch (e) { return null; }
+      };
+      // obj.<name>() -> str, or null. Generic string-returning call (nodePath.getName() etc).
+      ST.callStr = function (o, name) {
+        try {
+          var m = ST.attr(o, name);
+          if (m.isNull()) return null;
+          var r = ST.Call(m, ST.TupleNew(0), ptr(0));
+          if (r.isNull()) { ST.clearExc(); return null; }
+          var s = ST.str(r);
+          ST.clearExc();
+          return s;
+        } catch (e) { ST.clearExc(); return null; }
+      };
+      // obj.<name>() -> true/false/null. Compared against the Py_True singleton rather than
+      // interpreting bytes, so a non-bool return simply yields null.
+      ST.callBool = function (o, name) {
+        try {
+          var m = ST.attr(o, name);
+          if (m.isNull()) return null;
+          var r = ST.Call(m, ST.TupleNew(0), ptr(0));
+          if (r.isNull()) { ST.clearExc(); return null; }
+          ST.clearExc();
+          if (ST.PyTrue && r.equals(ST.PyTrue)) return true;
+          if (ST.PyFalse && r.equals(ST.PyFalse)) return false;
+          return null;
+        } catch (e) { ST.clearExc(); return null; }
       };
       // Read a float object's ob_fval inline at +0x10. No PyFloat_AsDouble in the Windows table,
       // and none is needed -- same trick as the AsUTF8 compact-ASCII fallback.
@@ -215,8 +250,12 @@ rpc.exports = {
         }
         var y = ST.callFloat(src, 'getY', rargs, null);
         if (y === null) return null;
-        return { x: x, y: y, z: ST.callFloat(src, 'getZ', rargs, null) };
+        return { x: x, y: y, z: ST.callFloat(src, 'getZ', rargs, null), src: src };
       };
+      // NOTE: node names do NOT identify a pickup's kind. A DistributedObject names its own node
+      // 'treasure-<doId>' and the child holding the model is named just 'treasure', so neither
+      // says whether it is an ice cream, a jellybean bag or a coin bag. `value` is the only
+      // discriminator that works -- see the role table above. Do not retry the node-name route.
       // Small non-negative int attribute (the bag's bean count). Guarded on tp_name so this never
       // reinterprets some other object's bytes as a PyLong; CPython 3.8: ob_size @+0x10, digits
       // (30 bits each) from +0x18.
@@ -258,6 +297,109 @@ rpc.exports = {
         tally[t] = (tally[t] || 0) + 1;
       }, 8000);
       return { count: n, classes: tally };
+    });
+  },
+
+  // --- every TextNode under aspect2d, with its text --------------------------------------------
+  // Diagnostic for the button-label path: if this finds nothing, the problem is reading text at
+  // all; if it finds text but the buttons do not, the problem is the parent/child relationship.
+  guitext: function () {
+    return ST.gil(function () {
+      var bi = ST.builtins();
+      if (bi.isNull()) return { err: 'no builtins' };
+      var a2d = ST.attr(bi, 'aspect2d');
+      if (a2d.isNull()) return { err: 'no aspect2d' };
+      var fam = ST.attr(a2d, 'findAllMatches');
+      var pat = ST.mkstr('**/+TextNode');
+      if (fam.isNull() || pat.isNull()) return { err: 'cannot search' };
+      var t = ST.TupleNew(1);
+      ST.TupleSet(t, 0, pat);
+      var col = ST.Call(fam, t, ptr(0));
+      if (col.isNull()) { ST.clearExc(); return { err: 'findAllMatches(+TextNode) failed' }; }
+      var out = [];
+      ST.each(col, function (np) {
+        if (out.length >= 60) return;
+        var ent = { np_name: ST.callStr(np, 'getName'), tp: null, text: null, via: null };
+        var nodef = ST.attr(np, 'node');
+        if (!nodef.isNull()) {
+          var n = ST.Call(nodef, ST.TupleNew(0), ptr(0));
+          if (n.isNull()) { ST.clearExc(); }
+          else {
+            ent.tp = ST.tpname(n);
+            ent.text = ST.callStr(n, 'getText');
+            if (ent.text !== null) ent.via = 'node().getText()';
+            if (ent.text === null) {
+              ent.text = ST.callStr(n, 'getWtext');
+              if (ent.text !== null) ent.via = 'node().getWtext()';
+            }
+          }
+        }
+        out.push(ent);
+      }, 500);
+      return { found: out.length, items: out };
+    });
+  },
+
+  // --- on-screen DirectGUI buttons ------------------------------------------------------------
+  // Clickable widgets read from the SCENE GRAPH rather than guessed from pixels. Panda puts 2-D UI
+  // under aspect2d, and a DirectGUI button is a PGButton node, so `**/+PGButton` enumerates every
+  // one of them with its real name -- and the TextNode beneath it carries the visible label.
+  //
+  // Coordinates come back in aspect2d space (x in [-aspect, +aspect], z in [-1, 1], origin centre)
+  // because the agent has no idea how big the window is; the host converts to fractions.
+  buttons: function () {
+    return ST.gil(function () {
+      var bi = ST.builtins();
+      if (bi.isNull()) return { err: 'no builtins' };
+      var a2d = ST.attr(bi, 'aspect2d');
+      if (a2d.isNull()) return { err: 'no aspect2d' };
+      var fam = ST.attr(a2d, 'findAllMatches');
+      if (fam.isNull()) return { err: 'aspect2d has no findAllMatches' };
+      var pat = ST.mkstr('**/+PGButton');
+      if (pat.isNull()) return { err: 'no PyUnicode_FromString' };
+      var t = ST.TupleNew(1);
+      ST.TupleSet(t, 0, pat);
+      var col = ST.Call(fam, t, ptr(0));
+      if (col.isNull()) { ST.clearExc(); return { err: 'findAllMatches(+PGButton) failed' }; }
+
+      var out = [];
+      ST.each(col, function (np) {
+        if (out.length >= 80) return;
+        // Hidden widgets outnumber visible ones -- every closed panel leaves its buttons parented
+        // but stashed -- so a list that ignored visibility would be mostly noise.
+        var hidden = ST.callBool(np, 'isHidden');
+        if (hidden === true) return;
+        var ent = {
+          name: ST.callStr(np, 'getName'),
+          x: ST.callFloat(np, 'getX', [a2d], null),
+          z: ST.callFloat(np, 'getZ', [a2d], null),
+          text: null
+        };
+        // The visible label is a TextNode somewhere beneath the button.
+        var tfam = ST.attr(np, 'findAllMatches');
+        if (!tfam.isNull()) {
+          var tp = ST.mkstr('**/+TextNode');
+          if (!tp.isNull()) {
+            var tt = ST.TupleNew(1);
+            ST.TupleSet(tt, 0, tp);
+            var tcol = ST.Call(tfam, tt, ptr(0));
+            if (tcol.isNull()) { ST.clearExc(); }
+            else {
+              ST.each(tcol, function (tn) {
+                if (ent.text) return;
+                var node = ST.attr(tn, 'node');
+                if (node.isNull()) return;
+                var n = ST.Call(node, ST.TupleNew(0), ptr(0));
+                if (n.isNull()) { ST.clearExc(); return; }
+                var s = ST.callStr(n, 'getText');
+                if (s && s.replace(/\s/g, '').length) ent.text = s;
+              }, 12);
+            }
+          }
+        }
+        out.push(ent);
+      }, 400);
+      return { buttons: out };
     });
   },
 
@@ -354,8 +496,11 @@ rpc.exports = {
   // identifier per build (that is why base.localAvatar does not exist -- 'localAvatar' is hashed),
   // but it cannot rename inherited framework attributes. So:
   //    local toon  = the object exposing `tunnelOut`      (LocalToon; vlt725d40df on this build)
-  //    bean bag    = a treasure that also has `value`     (vlt433b51a4 -- value is the bean count)
-  //    treasure    = `treasure` without `value`           (vltb3cf91ab -- chased too, value null)
+  //    bag         = a treasure that also has `value`     (vlt433b51a4) -- BOTH the jellybean bags
+  //                  and the Cartoonival coin bags land here; they share one class and differ
+  //                  only in `value`, so nothing distinguishes them and nothing needs to
+  //    treasure    = `treasure` WITHOUT `value`           (vltb3cf91ab) -- ice cream / laff
+  //                  restores. Not worth chasing: a toon at full laff walks straight through.
   // The signature test costs several getattrs, so it runs ONCE PER CLASS and is then cached by
   // tp_name; steady-state ticks are pure pointer reads.
   state: function (cfg) {
@@ -420,6 +565,7 @@ def attach(verbose=True):
         "tstate_cell": TI.TSTATE_CELL,
         "interp_off": TI.INTERP_OFF, "modules_off": TI.MODULES_OFF,
         "float_type": TI.FLOAT_TYPE,
+        "py_true": TRUE_OBJ, "py_false": FALSE_OBJ,
     })
     if not init.get("ok"):
         session.detach()
@@ -427,6 +573,33 @@ def attach(verbose=True):
     if verbose:
         print("[ws] attached pid %d, slide %s" % (pid, init.get("slide")), file=sys.stderr)
     return session, ex
+
+
+def a2d_to_fraction(x, z, aspect):
+    """aspect2d coords -> client-area fractions, ready for winctl.inputs.click.
+
+    Panda's 2-D UI space has the origin at the CENTRE, x spanning [-aspect, +aspect] and z spanning
+    [-1, 1] with +z up. Screen fractions run [0, 1] from the top-left, hence the flip on z.
+
+    Cross-checked against a coordinate found the hard way months earlier: the Shticker Book button
+    reads (1.509, -0.830) here, which converts to (0.953, 0.915) -- the old empirically-tuned value
+    was (0.969, 0.924). Reading the widget beats eyeballing the screenshot, and agrees with it.
+    """
+    if x is None or z is None:
+        return None
+    return (0.5 + x / (2.0 * aspect), 0.5 - z / 2.0)
+
+
+def game_aspect(default=16.0 / 9.0):
+    """Client width/height of the live game window, or `default` if winctl is unavailable."""
+    try:
+        from winctl import windows
+        w = windows.list_windows(cls="WinGraphicsWindow0")
+        if w and w[0].get("clientH"):
+            return float(w[0]["clientW"]) / float(w[0]["clientH"])
+    except Exception:
+        pass
+    return default
 
 
 def unwrap(res, what):
@@ -440,7 +613,8 @@ def unwrap(res, what):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("mode", choices=["discover", "nodes", "state", "watch", "probe", "classes"])
+    ap.add_argument("mode", choices=["discover", "nodes", "state", "watch", "probe", "classes",
+                                     "buttons", "guitext"])
     ap.add_argument("--match", action="append", default=[],
                     help="substring of the pickup class name (repeatable)")
     ap.add_argument("--path", default="base", help="probe: dotted attribute path from builtins")
@@ -465,6 +639,33 @@ def main():
             print("%d nodes under render matching %s\n" % (r["count"], a.pattern))
             for nm, n in sorted(r["names"].items(), key=lambda kv: -kv[1])[:a.top]:
                 print("  %5d  %s" % (n, nm))
+        elif a.mode == "guitext":
+            r = unwrap(ex.guitext(), "guitext")
+            if r.get("err"):
+                raise SystemExit("worldstate: %s" % r["err"])
+            print("%d TextNodes under aspect2d" % r["found"])
+            print()
+            for it in r["items"]:
+                print("  %-26s %-20s via=%-20s %r"
+                      % (str(it.get("np_name"))[:26], str(it.get("tp"))[:20],
+                         it.get("via"), it.get("text")))
+        elif a.mode == "buttons":
+            r = unwrap(ex.buttons(), "buttons")
+            if r.get("err"):
+                raise SystemExit("worldstate: %s" % r["err"])
+            bs = r["buttons"]
+            print("%d visible DirectGUI buttons" % len(bs))
+            print()
+            asp = game_aspect()
+            print("aspect %.3f" % asp)
+            print("%-30s %-24s %8s %8s   %s" % ("name", "label", "x", "z", "click at"))
+            for b in bs:
+                f = a2d_to_fraction(b.get("x"), b.get("z"), asp)
+                print("%-30s %-24s %8s %8s   %s"
+                      % (str(b.get("name"))[:30], str(b.get("text"))[:24],
+                         "-" if b.get("x") is None else "%.3f" % b["x"],
+                         "-" if b.get("z") is None else "%.3f" % b["z"],
+                         "-" if f is None else "%.3f,%.3f" % f))
         elif a.mode == "probe":
             r = unwrap(ex.probe(a.path), "probe")
             if r.get("err"):

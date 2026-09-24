@@ -468,6 +468,26 @@ geometry, not distributed objects, so they never appear in `doId2do`. Anything n
 walk the scene graph instead; `scripts/beanbot.py` deliberately substitutes a "is the distance
 actually falling" test rather than pretending to know where the walls are.
 
+### On-screen buttons come from the scene graph, not from pixels
+
+`worldstate.py buttons` lists every visible DirectGUI button by walking `**/+PGButton` under
+`aspect2d`, returning each one's name, label and position. Coordinates are in Panda's 2-D space
+(x in [-aspect, +aspect], z in [-1, 1], origin centre); convert with
+`0.5 + x/(2*aspect)`, `0.5 - z/2`. Cross-check: the Shticker Book button reads (1.509, -0.830),
+converting to (0.953, 0.915) against the (0.969, 0.924) that had been tuned by hand months earlier.
+
+Labels come back only for text buttons. Icon-only controls -- including the close X and the OK
+check, i.e. exactly the ones worth pressing -- have none, so colour sampled AT the known button
+position still decides cancel-vs-confirm. That is a completely different proposition from hunting
+a red disc across the whole frame, which was tried first and needed four successive gates (fill,
+size, isolation, white-glyph) and still matched the gag HUD icon, the red toon-picker cards, the
+maroon floor and a single confetti flake. 141 lines of that were deleted for ~50 that read the
+truth. Filter against the permanent HUD (snapshot the button names while the toon is demonstrably
+moving) or the green chat icon reads as a confirm button.
+
+Text is readable: `NodePath.node().getText()` on a `**/+TextNode` returns real strings. Most
+TextNodes under aspect2d are empty placeholders.
+
 ### Movement is measured, not guessed — `scripts/calibrate.py`
 
 Holding a key for a set time and reading the pose delta out of memory gives, on this client:

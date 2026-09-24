@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Auto-walk to Cartoonival treasures, steered by a Jev decision model (classifier.dev).
+"""Auto-walk to Cartoonival bean/coin bags, steered by a Jev decision model (classifier.dev).
 
 Reads the world from the client's OWN MEMORY via `frida/worldstate.py` -- the toon's position and
-heading, and the position of every treasure -- converts that into toon-relative bearings, and asks
+heading, and the position of every pickup -- converts that into toon-relative bearings, and asks
 classifier.dev's System One endpoint which way to move. The answer is executed as a timed key hold.
+
+WHAT IT CHASES
+    Only the pickups carrying a `value`: both the jellybean bags and the Cartoonival coin bags are
+    that kind, and both are wanted. The valueless kind is ice cream (a laff restore), which a toon
+    at full health walks straight through without collecting -- chasing it looks exactly like a
+    navigation failure and wastes the whole run. --include-treasures opts back in.
+
+COLLECTION COOLDOWN
+    Bags are rate limited: past some number in a window, walking through one only plays a sound and
+    the bag stays put. That is temporary, so a bag that fails to collect goes on a SHORT retry
+    timer (--retry-after, 5s) rather than the long blacklist used for genuinely unreachable ones.
 
 CONTROL LAW: align, then advance
     Every action is a discrete pulse -- press a key, hold it for a MEASURED duration, release.
@@ -186,79 +197,108 @@ def jev_decide(state, timeout):
     return m["choice"], m.get("confidence", 0.0)
 
 
-def _densest_blob(im, box, match, cell=24):
-    """Fraction coords of the densest compact cluster of `match`-ing pixels inside `box`.
+def screen_buttons(ex, hwnd):
+    """Every visible DirectGUI button as {fx, fy, text, rgb}, read from the client's memory.
 
-    Returns None when the matching pixels are scattered rather than clustered. That check is what
-    stops confetti, grass and other toons' clothing from averaging out into a plausible-looking
-    button position somewhere in the middle of the screen.
+    This replaced a screen-wide colour hunt, which was the wrong tool. Searching pixels for "a red
+    disc" repeatedly matched the gag/pie HUD icon, the red toon-picker cards, a maroon floor and
+    even a single confetti flake, and each fix needed another gate (fill, size, isolation, glyph).
+    The scene graph simply *knows* where the buttons are: `**/+PGButton` under aspect2d lists them
+    with exact positions. Colour is still used, but only as a one-pixel-ish sample AT a known
+    button, which is a completely different proposition from finding one in a 1280x768 haystack.
+
+    Labels come back for text buttons and are None for the icon-only ones (the close X, the OK
+    check), which is why colour is still needed to tell cancel from confirm.
     """
-    w, h = im.size
-    x0, x1 = int(box[0] * w), int(box[2] * w)
-    y0, y1 = int(box[1] * h), int(box[3] * h)
-    pts, cells = [], {}
-    for yy in range(y0, y1, 2):
-        for xx in range(x0, x1, 2):
-            if match(*im.getpixel((xx, yy))):
-                pts.append((xx, yy))
-                k = (xx // cell, yy // cell)
-                cells[k] = cells.get(k, 0) + 1
-    if not cells:
-        return None
-    (cx, cy), n = max(cells.items(), key=lambda kv: kv[1])
-    if n < 8:
-        return None
-    ox, oy = cx * cell + cell // 2, cy * cell + cell // 2
-    near = [p for p in pts if abs(p[0] - ox) < 40 and abs(p[1] - oy) < 40]
-    if len(near) < 12 or len(near) < 0.35 * len(pts):
-        return None
-    return (sum(p[0] for p in near) / len(near) / w,
-            sum(p[1] for p in near) / len(near) / h)
-
-
-def find_close_button(hwnd):
-    """Fraction coords of whatever will dismiss the UI that is blocking input, or None.
-
-    Two different things block movement in this zone and they look nothing alike:
-      * a PANEL (the Cartoonival token shop, the cattlelog) -- closed by a red disc near its top
-      * a DIALOG (the trampoline minigame's "You earned N Tokens!") -- closed by a green OK
-        button low and centred, with no red anywhere on it
-    Only handling the red one left the bot frozen in front of the minigame results for the rest of
-    a run, so both are searched, red first. This is a different region from the confirm-dialog
-    button row that ttdrive.dialog_buttons scans, hence a separate finder.
-    """
-    from winctl import capture
+    from winctl import capture, windows
+    r = ex.buttons()
+    if not r.get("ok"):
+        return []
+    bs = (r.get("r") or {}).get("buttons") or []
+    if not bs:
+        return []
+    w = windows.list_windows(cls="WinGraphicsWindow0")
+    if not w or not w[0].get("clientH"):
+        return []
+    aspect = float(w[0]["clientW"]) / float(w[0]["clientH"])
     im = capture.capture_printwindow(hwnd).convert("RGB")
-    # The red band starts at x=0.25 and the hue test is strict because toon NAMETAGS are orange on
-    # a light plate and sit against both screen edges -- a looser test matched "Riggy Marole" at
-    # x=0.09 and returned it in preference to the green OK button that actually mattered.
-    red = _densest_blob(im, (0.25, 0.04, 0.72, 0.32),
-                        lambda r, g, b: r > 170 and g < 70 and b < 70 and r > 2.5 * max(g, b, 1))
-    if red:
-        return red
-    return _densest_blob(im, (0.20, 0.50, 0.80, 0.88),
-                         lambda r, g, b: g > 135 and r < 125 and b < 125 and g > 1.4 * max(r, b, 1))
+    iw, ih = im.size
+    out = []
+    for b in bs:
+        if b.get("x") is None or b.get("z") is None:
+            continue
+        fx = 0.5 + b["x"] / (2.0 * aspect)
+        fy = 0.5 - b["z"] / 2.0
+        px, py = int(fx * iw), int(fy * ih)
+        if not (0 <= px < iw and 0 <= py < ih):
+            continue
+        # median-ish sample over a small patch so one antialiased pixel cannot decide it
+        rs = gs = bs_ = n = 0
+        for dy in range(-6, 7, 3):
+            for dx in range(-6, 7, 3):
+                xx, yy = px + dx, py + dy
+                if 0 <= xx < iw and 0 <= yy < ih:
+                    pr, pg, pb = im.getpixel((xx, yy))
+                    rs += pr; gs += pg; bs_ += pb; n += 1
+        if not n:
+            continue
+        out.append({"fx": fx, "fy": fy, "text": b.get("text"), "name": b.get("name"),
+                    "rgb": (rs // n, gs // n, bs_ // n)})
+    return out
 
 
-def unwedge(hwnd):
-    """Try to clear a UI panel that is swallowing movement keys. True if something was clicked.
+def classify_button(btn):
+    """'cancel' (red X), 'ok' (green/blue check), or None -- from the colour at its own position."""
+    r, g, b = btn["rgb"]
+    txt = (btn.get("text") or "").strip().lower()
+    if txt in ("cancel", "no", "quit", "close", "back"):
+        return "cancel"
+    if txt in ("ok", "yes", "done", "continue"):
+        return "ok"
+    if r > 140 and r > 1.5 * max(g, b, 1):
+        return "cancel"
+    if g > 120 and g > 1.3 * max(r, b, 1):
+        return "ok"
+    if b > 120 and b > 1.25 * max(r, g, 1):
+        return "ok"
+    return None
 
-    Escape does NOT close these panels -- verified against the live token shop, which stayed open.
-    The red X does. The cursor is parked first because DirectGUI arms a control on mouse-ENTER, so
-    clicking where the pointer already rests fires nothing at all.
+
+def unwedge(ex, hwnd, hud_names=frozenset()):
+    """Clear a UI panel that is swallowing movement keys. True if something was dismissed.
+
+    Buttons come from memory, so the only question is WHICH to press. Prefer a cancel/close control
+    over a confirm one: on the title screen's "Are you ready to leave Toontown?" the red X is the
+    safe answer and OK quits the game outright.
+
+    Escape is not tried -- verified against the live token shop, which ignored it completely.
     """
     from winctl import inputs
-    btn = find_close_button(hwnd)
-    if not btn:
+    btns = screen_buttons(ex, hwnd)
+    if not btns:
         return False
-    inputs.click(hwnd, 0.20, 0.30)
+    # Ignore the permanent HUD. The chat bubble, gag, laff and book icons are DirectGUI buttons too
+    # and the green chat icon classifies as a confirm control, so without this the bot would press
+    # it, achieve nothing, and report that it had cleared a panel -- which also suppresses the wall
+    # recovery. A panel's buttons are by definition the ones that were not there a moment ago.
+    fresh = [b for b in btns if b.get("name") not in hud_names]
+    if not fresh:
+        return False
+    ranked = []
+    for b in fresh:
+        kind = classify_button(b)
+        if kind:
+            ranked.append((0 if kind == "cancel" else 1, b, kind))
+    if not ranked:
+        return False
+    ranked.sort(key=lambda t: t[0])
+    _, btn, kind = ranked[0]
+    inputs.click(hwnd, 0.20, 0.30)       # park: DirectGUI arms on mouse-ENTER
     time.sleep(0.4)
-    inputs.click(hwnd, float(btn[0]), float(btn[1]))
-    time.sleep(0.8)
-    # VERIFY. Red is common in this zone (confetti, other toons' outfits), so a blob that merely
-    # looked button-shaped would otherwise be reported as a closed panel on every tick while the
-    # toon was really just walking into a fence -- which is what happened live.
-    return find_close_button(hwnd) is None
+    inputs.click(hwnd, float(btn["fx"]), float(btn["fy"]))
+    print("[bot] pressed %s button at %.3f,%.3f (label=%r rgb=%s)"
+          % (kind, btn["fx"], btn["fy"], btn.get("text"), btn["rgb"]), flush=True)
+    return True
 
 
 class Keys(object):
@@ -320,6 +360,10 @@ def main():
                     help="distance counted as having touched a treasure")
     ap.add_argument("--max-walk-bearing", type=float, default=25.0,
                     help="never walk forward when the bearing is worse than this; realign instead")
+    ap.add_argument("--include-treasures", action="store_true",
+                    help="also chase the valueless treasures (ice cream); off by default")
+    ap.add_argument("--retry-after", type=float, default=5.0,
+                    help="seconds before re-approaching a bag that did not collect (cooldown)")
     ap.add_argument("--frozen-pulses", type=int, default=3,
                     help="pulses with zero movement before assuming a UI panel is blocking input")
     ap.add_argument("--stopfile", default=os.path.join(os.environ.get("TEMP", "/tmp"), "beanbot-stop"))
@@ -360,6 +404,8 @@ def main():
     last_progress = time.time()
     blacklist = []            # [(x, y, ignore_until)] -- treasures we could not reach
     backs = 0                 # consecutive reverses, to break the back-forever spiral
+    hud_names = set()         # DirectGUI buttons present while moving freely = the permanent HUD
+    hud_at = 0.0              # when that baseline was last refreshed
     closest = 1e9             # closest approach to the committed target, for fly-through detection
     last_pose = None          # (x, y, h) last tick, to notice a UI panel eating input
     frozen = 0                # consecutive pulses with no movement at all
@@ -396,11 +442,22 @@ def main():
             pose_now = (round(me["x"], 1), round(me["y"], 1), round(me["h"], 1))
             frozen = frozen + 1 if pose_now == last_pose else 0
             last_pose = pose_now
+            # Refresh the HUD baseline only while the toon is demonstrably moving, because that is
+            # the one moment we know nothing is blocking input and therefore that every button on
+            # screen is permanent furniture.
+            if frozen == 0 and not a.dry_run and time.time() - hud_at > 30.0:
+                try:
+                    seen = {b.get("name") for b in screen_buttons(ex, hwnd) if b.get("name")}
+                    if seen:
+                        hud_names = seen
+                        hud_at = time.time()
+                except Exception:
+                    pass
             if frozen >= a.frozen_pulses:
                 print("[bot] no movement for %d pulses -- looking for a blocking UI panel" % frozen,
                       flush=True)
                 frozen = 0
-                if not a.dry_run and unwedge(hwnd):
+                if not a.dry_run and unwedge(ex, hwnd, hud_names):
                     # A real panel was in the way and is now gone; give it a clean slate.
                     print("[bot] closed a panel", flush=True)
                     best_dist = None
@@ -414,6 +471,11 @@ def main():
 
             tg = []
             for t in st.get("targets", []):
+                # BAGS ONLY by default. Both the jellybean bags and the Cartoonival coin bags are
+                # the valued kind and both are wanted; the valueless kind is ice cream, which a
+                # toon at full laff walks straight through -- chasing it is pure wasted time.
+                if t["kind"] != "bag" and not a.include_treasures:
+                    continue
                 b, d, dz = bearing_to(me, t)
                 if abs(dz) > a.max_height:
                     continue              # another level: walking its ground position never touches it
@@ -468,9 +530,15 @@ def main():
             # fly-through needs no knowledge of WHY -- only that contact did not consume it.
             closest = min(closest, cur["distance"])
             if closest <= a.touch and cur["distance"] > a.touch * 3.0:
-                print("[bot] passed through %s at d=%.1f and it remains -- not collectible now, "
-                      "blacklisting for %.0fs" % (cur["kind"], closest, a.blacklist_for), flush=True)
-                blacklist.append((cur["x"], cur["y"], now + a.blacklist_for))
+                # Walked through it and it is still there. For a BAG this is almost always the
+                # collection cooldown -- you may only take so many in a window, and a bag taken
+                # during it just plays a sound and stays put. That is temporary, so back off for a
+                # few seconds and come again rather than writing the bag off for two minutes.
+                # (For ice cream it is permanent-ish, hence the longer wait when chasing those.)
+                wait = a.retry_after if cur["kind"] == "bag" else a.blacklist_for
+                print("[bot] passed through %s at d=%.1f and it remains (cooldown?) -- retrying in "
+                      "%.0fs" % (cur["kind"], closest, wait), flush=True)
+                blacklist.append((cur["x"], cur["y"], now + wait))
                 committed = None
                 continue
 
