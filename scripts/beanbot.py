@@ -143,14 +143,17 @@ CRITERIA = {
     "turn_right_slight": "the target bearing is between +8 and +20 degrees (slightly right)",
     "turn_right":        "the target bearing is between +20 and +60 degrees (clearly right)",
     "turn_right_far":    "the target bearing is greater than +60 degrees (far to the right or behind on the right)",
-    "back":              "the distance has stopped falling for several seconds, so we are walking into something and must reverse",
+    "back":              "clear_ahead is under 3 units, or the distance has stopped falling for several seconds, so we are up against something and must reverse",
 }
 INSTRUCTIONS = (
     "Steering a character toward treasure in a 3D game. Bearing is degrees relative to the way the "
     "character faces: negative is to the left, positive is to the right, 0 is dead ahead. Turns "
     "happen in place, then the character walks. NEVER choose a forward action unless the bearing "
-    "is already within 8 degrees of straight ahead -- turn to face the target first. Prefer the "
-    "target already being chased unless another is much closer. Pick the single best next action."
+    "is already within 8 degrees of straight ahead -- turn to face the target first. clear_ahead, "
+    "clear_left and clear_right are the measured free distance in units before hitting a wall in "
+    "that direction; under about 4 means blocked, so never walk forward on a small clear_ahead -- "
+    "turn toward whichever side has more clearance. Prefer the target already being chased unless "
+    "another is much closer. Pick the single best next action."
 )
 
 
@@ -176,6 +179,77 @@ def bearing_to(me, t):
     dy = t["y"] - me["y"]
     dz = t["z"] - me["z"] if t.get("z") is not None and me.get("z") is not None else 0.0
     return -norm180(math.degrees(math.atan2(-dx, dy)) - me["h"]), math.hypot(dx, dy), dz
+
+
+MAX_OBSTACLE_R = 15.0       # ignore colliders larger than this: zone-scale volumes, not
+                            # things you steer around
+BLOCKED_CLEARANCE = 4.0     # measured: at 1.4 the toon is stopped dead, at 3.1 it creeps,
+                            # at 13+ it walks a full 10.5-unit leg
+MAX_WHISKER = 60.0          # units; beyond this, nothing is "in the way" for steering purposes
+
+
+def fetch_obstacles(ex):
+    """Static collision geometry as [{x, y, z, r}] in world space, or [] if unavailable.
+
+    Walls, buildings, trees and picnic tables are CollisionNodes under `render` -- they are not
+    distributed objects, which is why the bot was blind to them. getTightBounds() is useless for
+    them (0 of 958 returned anything: it covers DRAWN geometry and collision solids are not drawn),
+    so position comes from the node plus its bounding volume's centre and radius.
+
+    CAVEAT: the centre is a LOCAL offset, added here without applying the node's rotation. 685 of
+    763 nodes have a non-trivial offset so ignoring it is clearly worse -- it moved the count of
+    obstacles within 60 units from 28 to 40 -- but a rotated parent would place it imprecisely.
+    Offsets run 0-5 units against radii of 2-12, so the error is small relative to what it decides.
+    """
+    try:
+        r = ex.collision({"static_only": True})
+        if not r.get("ok"):
+            return []
+        out = []
+        for o in (r.get("r") or {}).get("obstacles") or []:
+            m = o.get("mask")
+            if o.get("r") is None or m is None:
+                continue
+            # BARRIERS ONLY. Panda's standard bits: 0x1 wall, 0x2 floor, 0x4 camera. Without
+            # this the floor itself counted as an obstacle. Also drop the sky-dome tree
+            # colliders, whose bounding radius reaches 124 units and would report the whole
+            # playground as blocked. Together those two made clear_ahead read 0.0 while the
+            # toon walked freely -- the first version of this was measurably useless.
+            if not (int(m) & 0x1):
+                continue
+            if o["r"] > MAX_OBSTACLE_R or "sky" in (o.get("name") or ""):
+                continue
+            out.append({"x": o["x"] + (o.get("cx") or 0.0),
+                        "y": o["y"] + (o.get("cy") or 0.0),
+                        "z": o["z"] + (o.get("cz") or 0.0),
+                        "r": o["r"], "name": o.get("name")})
+        return out
+    except Exception:
+        return []
+
+
+def clearance(me, obstacles, offset_deg, max_range=MAX_WHISKER, max_dz=10.0):
+    """Distance to the nearest obstacle blocking a ray at (facing + offset), else max_range.
+
+    An obstacle of radius r at distance d subtends asin(r/d); it blocks the ray when the ray's
+    bearing falls inside that cone. This is the "whisker" a steering agent actually wants, and it
+    is pure arithmetic over a cached snapshot -- no C-API calls per tick.
+    """
+    best = max_range
+    for o in obstacles:
+        dz = o["z"] - me["z"]
+        if abs(dz) > max_dz:
+            continue                      # another floor; not in the way
+        b, d, _ = bearing_to(me, o)
+        if d > max_range:
+            continue
+        r = o["r"]
+        if d <= r:
+            return 0.0                    # already inside it
+        half = math.degrees(math.asin(min(r / d, 1.0)))
+        if abs(norm180(b - offset_deg)) <= half:
+            best = min(best, d - r)
+    return best
 
 
 def local_decide(bearing, distance, blocked):
@@ -385,6 +459,8 @@ def main():
                     help="also chase the valueless treasures (ice cream); off by default")
     ap.add_argument("--retry-after", type=float, default=5.0,
                     help="seconds before re-approaching a bag that did not collect (cooldown)")
+    ap.add_argument("--obstacle-refresh", type=float, default=30.0,
+                    help="seconds between re-snapshotting the static collision geometry")
     ap.add_argument("--frozen-pulses", type=int, default=3,
                     help="pulses with zero movement before assuming a UI panel is blocking input")
     ap.add_argument("--stopfile", default=os.path.join(os.environ.get("TEMP", "/tmp"), "beanbot-stop"))
@@ -423,6 +499,8 @@ def main():
     last_progress = time.time()
     blacklist = []            # [(x, y, ignore_until)] -- treasures we could not reach
     backs = 0                 # consecutive reverses, to break the back-forever spiral
+    obstacles = []            # static wall colliders, snapshotted (they do not move)
+    obs_at = 0.0              # when that snapshot was taken
     hud_names = set()         # DirectGUI buttons present while moving freely = the permanent HUD
     hud_at = 0.0              # when that baseline was last refreshed
     closest = 1e9             # closest approach to the committed target, for fly-through detection
@@ -451,6 +529,14 @@ def main():
                 continue
 
             me = st["me"]
+
+            # Static geometry does not move, so snapshot it rather than re-reading ~875
+            # colliders every tick. The scan costs ~0.04s, so refreshing periodically is cheap
+            # insurance against a zone change.
+            if time.time() - obs_at > a.obstacle_refresh:
+                obstacles = fetch_obstacles(ex)
+                obs_at = time.time()
+                print("[bot] %d wall colliders" % len(obstacles), file=sys.stderr)
 
             # WEDGED: a DirectGUI panel (the Cartoonival token shop, the cattlelog) swallows WASD
             # completely, so the toon freezes with position AND heading identical across pulses --
@@ -575,6 +661,10 @@ def main():
             stalled = time.time() - last_progress
             blocked = stalled >= a.stall_after
 
+            clear_a = clearance(me, obstacles, 0.0)
+            clear_l = clearance(me, obstacles, -45.0)
+            clear_r = clearance(me, obstacles, +45.0)
+
             payload = {
                 "target": {"bearing": cur["bearing"], "distance": cur["distance"],
                            "height_difference": cur["dz"],
@@ -583,6 +673,9 @@ def main():
                            for t in tg[1:4]],
                 "seconds_without_progress": round(stalled, 1),
                 "progress": "blocked" if blocked else "closing",
+                "clear_ahead": round(clear_a, 1),
+                "clear_left": round(clear_l, 1),
+                "clear_right": round(clear_r, 1),
             }
 
             if a.local:
@@ -619,7 +712,25 @@ def main():
             # forward_far at bearings of -96 and -144 degrees -- a 4 second run in almost the
             # opposite direction, the single worst outcome available. Offering a long leg is only
             # safe if a wrong pick degrades gracefully, so alignment decides how far we may commit.
-            if key == "w" and abs(cur["bearing"]) > a.max_walk_bearing:
+            # WALL GUARD, the counterpart of the alignment guard. Measured: at clear_ahead 1.4
+            # the toon is stopped dead, at 3.1 it barely creeps, at 13+ it walks a full leg. A
+            # forward action into a small clearance is therefore wasted time -- turn toward the
+            # side with more room instead. This is the capability the bot simply lacked: it
+            # could previously only discover a wall by failing to move for several seconds.
+            # Reversing is rarely the best answer when a side is plainly open. Observed live at
+            # clear L36 A3 R3: it backed up, crept forward, backed up again, and only escaped via
+            # the blind sidestep -- while 36 units of clearance sat to its left the whole time.
+            if key == "s":
+                side = max(clear_l, clear_r)
+                if side > 10.0 and side > 2.0 * clear_a:
+                    act = "turn_left" if clear_l >= clear_r else "turn_right"
+                    conf, via = 1.0, via + "+open"
+                    key, dur = ACTIONS[act]
+            if key == "w" and clear_a < BLOCKED_CLEARANCE:
+                act = "turn_left" if clear_l >= clear_r else "turn_right"
+                conf, via = 1.0, via + "+wall"
+                key, dur = ACTIONS[act]
+            elif key == "w" and abs(cur["bearing"]) > a.max_walk_bearing:
                 act, conf = local_decide(cur["bearing"], cur["distance"], blocked)
                 via += "+align"
                 key, dur = ACTIONS[act]
@@ -640,9 +751,11 @@ def main():
             # 20 units, it simply becomes a 1s walk instead of a 4s run into the scenery beyond.
             if key == "w":
                 dur = min(dur, walk_for(max(cur["distance"] - a.touch * 0.5, 1.0)))
-            print("[bot] %-17s conf=%.2f via=%-6s | %s d=%.0f dz=%+.1f brg=%+.0f val=%s | %s %.2fs stalled=%.1fs"
-                  % (act, conf, via, cur["kind"], cur["distance"], cur["dz"], cur["bearing"],
-                     cur["value"], key, dur, stalled), flush=True)
+                # and never walk further than the measured free space ahead
+                dur = min(dur, walk_for(max(clear_a - 1.0, 1.0)))
+            print("[bot] %-17s conf=%.2f via=%-11s | %s d=%.0f brg=%+.0f val=%s | clr L%.0f A%.0f R%.0f | %s %.2fs stall=%.1fs"
+                  % (act, conf, via, cur["kind"], cur["distance"], cur["bearing"],
+                     cur["value"], clear_l, clear_a, clear_r, key, dur, stalled), flush=True)
             keys.pulse(key, dur)
     finally:
         keys.release_all()

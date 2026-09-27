@@ -488,6 +488,39 @@ moving) or the green chat icon reads as a confirm button.
 Text is readable: `NodePath.node().getText()` on a `**/+TextNode` returns real strings. Most
 TextNodes under aspect2d are empty placeholders.
 
+### Obstacles: CollisionNodes under render, filtered by collide mask
+
+The bot had no obstacle awareness because walls are not distributed objects. They ARE reachable:
+`**/+CollisionNode` under `render` finds ~950 in a Cartoonival playground -- `collision_tree` x139,
+`booth_wall*_collision`, `picnicTable_sphere` x52, `sign_collision`, `NPCToon`. The scan costs
+~0.04s, so snapshot it per zone rather than per tick; the geometry is static.
+
+Three traps, each of which made the signal useless until fixed:
+
+1. **`getTightBounds()` returns nothing** -- 0 of 958 nodes. It covers DRAWN geometry and collision
+   solids are not drawn. Position comes from the node plus its BoundingVolume's centre and radius.
+2. **The node origin is not the solid's centre.** 685 of 763 carry a non-trivial local offset;
+   applying it moved the count of obstacles within 60 units from 28 to 40. The offset is in node
+   space and is added without applying rotation -- offsets run 0-5 units against radii of 2-12, so
+   the error is small relative to what it decides, but it is an approximation.
+3. **Filter by INTO collide mask**, read via `node().getIntoCollideMask().getWord()`. Panda's
+   standard bits: `0x1` wall, `0x2` floor, `0x4` camera. Without this the FLOOR counted as an
+   obstacle, and the sky-dome tree colliders (bounding radius up to 124 units) reported the whole
+   playground as blocked. Also exclude `GW.*` and `ccLineNode` -- those are the local toon's OWN
+   GravityWalker spheres, sitting exactly at the toon, so they make it permanently blocked by
+   itself. Note `getWord()` returns a Python int, which a float-typed reader rejects silently.
+
+**Validated, not assumed.** Walking straight into a picnic table:
+
+| clear_ahead | distance moved |
+|---|---|
+| 3.1 | 1.7 (creeping) |
+| 1.4 | 0.0 (stopped, x7) |
+| 35-60 | 10.5 (full leg) |
+
+Before the mask filter the same code reported `clear_ahead = 0.0` while the toon walked freely --
+worse than no signal at all, since it would have declared the bot permanently blocked.
+
 ### Movement is measured, not guessed — `scripts/calibrate.py`
 
 Holding a key for a set time and reading the pose delta out of memory gives, on this client:

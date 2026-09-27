@@ -269,6 +269,28 @@ rpc.exports = {
       // an origin at z=+0.16 while the green button is drawn near z=-0.45 -- clicking the origin
       // hits the dialog's background and does nothing, which left the bot frozen in front of it.
       // getTightBounds gives the drawn extent, whose midpoint is what a user would aim at.
+      // World-space axis-aligned bounds of a node, or null. getTightBounds(rel) returns a
+      // (Point3 min, Point3 max) tuple, or None when the subgraph has no geometry.
+      ST.boundsOf = function (np, rel) {
+        try {
+          if (!ST.TupleGet) return null;
+          var m = ST.attr(np, 'getTightBounds');
+          if (m.isNull()) return null;
+          var t = ST.TupleNew(1);
+          ST.TupleSet(t, 0, ST.incref(rel));
+          var r = ST.Call(m, t, ptr(0));
+          if (r.isNull()) { ST.clearExc(); return null; }
+          var lo = ST.TupleGet(r, 0), hi = ST.TupleGet(r, 1);
+          if (lo.isNull() || hi.isNull()) { ST.clearExc(); return null; }
+          var b = { x0: ST.callFloat(lo, 'getX', [], null), y0: ST.callFloat(lo, 'getY', [], null),
+                    z0: ST.callFloat(lo, 'getZ', [], null), x1: ST.callFloat(hi, 'getX', [], null),
+                    y1: ST.callFloat(hi, 'getY', [], null), z1: ST.callFloat(hi, 'getZ', [], null) };
+          ST.clearExc();
+          if (b.x0 === null || b.x1 === null || b.y0 === null || b.y1 === null) return null;
+          return b;
+        } catch (e) { ST.clearExc(); return null; }
+      };
+
       ST.centerOf = function (np, rel) {
         try {
           // getTightBounds() returns None for these nodes (Panda gives None when the subgraph has
@@ -304,6 +326,34 @@ rpc.exports = {
       // 'treasure-<doId>' and the child holding the model is named just 'treasure', so neither
       // says whether it is an ice cream, a jellybean bag or a coin bag. `value` is the only
       // discriminator that works -- see the role table above. Do not retry the node-name route.
+      // obj.<name>() -> int, or null. getWord()/getNumSolids() return Python ints, and callFloat
+      // rejects those (it type-checks against PyFloat_Type), which is why every collide mask came
+      // back None on the first attempt.
+      ST.callInt = function (o, name) {
+        try {
+          var m = ST.attr(o, name);
+          if (m.isNull()) return null;
+          var r = ST.Call(m, ST.TupleNew(0), ptr(0));
+          if (r.isNull()) { ST.clearExc(); return null; }
+          var v = ST.longValue(r);
+          ST.clearExc();
+          return v;
+        } catch (e) { ST.clearExc(); return null; }
+      };
+      // CPython 3.8 PyLongObject: ob_size @+0x10 (sign + digit count), 30-bit digits from +0x18.
+      ST.longValue = function (v) {
+        try {
+          if (!v || v.isNull() || ST.tpname(v) !== 'int') return null;
+          var size = v.add(0x10).readS64();
+          if (size === 0) return 0;
+          var neg = size < 0, n = neg ? -size : size;
+          if (n > 3) return null;
+          var d = v.add(0x18).readU32() & 0x3FFFFFFF;
+          if (n >= 2) d += (v.add(0x1c).readU32() & 0x3FFFFFFF) * 1073741824;
+          if (n >= 3) d += (v.add(0x20).readU32() & 0x3FFFFFFF) * 1152921504606846976;
+          return neg ? -d : d;
+        } catch (e) { return null; }
+      };
       // Small non-negative int attribute (the bag's bean count). Guarded on tp_name so this never
       // reinterprets some other object's bytes as a PyLong; CPython 3.8: ob_size @+0x10, digits
       // (30 bits each) from +0x18.
@@ -385,6 +435,119 @@ rpc.exports = {
         out.push(ent);
       }, 500);
       return { found: out.length, items: out };
+    });
+  },
+
+  // --- collision geometry under render ---------------------------------------------------------
+  // The bot has had no obstacle awareness at all: walls, buildings and fences are scene-graph
+  // COLLISION GEOMETRY, not distributed objects, so they never appear in doId2do. They do appear
+  // under render as CollisionNodes, which is the cheapest route to knowing what is in the way.
+  //
+  // Exploratory: reports how many exist and how many yield usable world-space bounds, because
+  // getTightBounds() returns None for nodes with no drawn geometry (learned from the GUI work)
+  // and collision solids may well be in that category.
+  collision: function (cfg) {
+    return ST.gil(function () {
+      var bi = ST.builtins();
+      if (bi.isNull()) return { err: 'no builtins' };
+      var render = ST.attr(bi, 'render');
+      if (render.isNull()) return { err: 'no render' };
+      var fam = ST.attr(render, 'findAllMatches');
+      var pat = ST.mkstr('**/+CollisionNode');
+      if (fam.isNull() || pat.isNull()) return { err: 'cannot search' };
+      var t = ST.TupleNew(1);
+      ST.TupleSet(t, 0, ST.incref(pat));
+      var col = ST.Call(fam, t, ptr(0));
+      if (col.isNull()) { ST.clearExc(); return { err: 'findAllMatches(+CollisionNode) failed' }; }
+
+      var lim = (cfg && cfg.limit) || 4000;
+      var total = 0, withPos = 0, withRadius = 0, samples = [], tally = {}, out = [];
+      ST.each(col, function (np) {
+        total++;
+        // getTightBounds() is useless here -- it covers DRAWN geometry and collision solids are
+        // not drawn (0 of 958 nodes returned any). The node's world position always works, and a
+        // coarse size comes from the node's own BoundingVolume, which collision solids do define.
+        var x = ST.callFloat(np, 'getX', [render], null);
+        var y = ST.callFloat(np, 'getY', [render], null);
+        var z = ST.callFloat(np, 'getZ', [render], null);
+        if (x === null || y === null) return;
+        withPos++;
+        var rad = null, cx = null, cy = null, cz = null, mask = null, nsolid = null;
+        // A node's INTO collide mask says what it can be collided INTO by. Barriers (walls) and
+        // triggers (event spheres, pickup spheres) carry different bits, and only the barriers
+        // stop a walking toon -- which is why bounding spheres alone predicted nothing.
+        var nodef2 = ST.attr(np, 'node');
+        if (!nodef2.isNull()) {
+          var cn = ST.Call(nodef2, ST.TupleNew(0), ptr(0));
+          if (cn.isNull()) { ST.clearExc(); }
+          else {
+            var gm = ST.attr(cn, 'getIntoCollideMask');
+            if (!gm.isNull()) {
+              var bm = ST.Call(gm, ST.TupleNew(0), ptr(0));
+              if (bm.isNull()) { ST.clearExc(); }
+              else { mask = ST.callInt(bm, 'getWord'); ST.clearExc(); }
+            }
+            nsolid = ST.callInt(cn, 'getNumSolids');
+            ST.clearExc();
+          }
+        }
+        var gb = ST.attr(np, 'getBounds');
+        if (!gb.isNull()) {
+          var bv = ST.Call(gb, ST.TupleNew(0), ptr(0));
+          if (bv.isNull()) { ST.clearExc(); }
+          else {
+            rad = ST.callFloat(bv, 'getRadius', [], null);
+            // A CollisionNode's ORIGIN is not necessarily its solid's centre -- the solid is
+            // defined in the node's local space and may be offset. Take the bounding volume's
+            // centre and carry it as a local offset so the host can see whether it matters.
+            var ctr = ST.attr(bv, 'getCenter');
+            if (!ctr.isNull()) {
+              var c = ST.Call(ctr, ST.TupleNew(0), ptr(0));
+              if (c.isNull()) { ST.clearExc(); }
+              else {
+                cx = ST.callFloat(c, 'getX', [], null);
+                cy = ST.callFloat(c, 'getY', [], null);
+                cz = ST.callFloat(c, 'getZ', [], null);
+              }
+            }
+            ST.clearExc();
+          }
+        }
+        if (rad !== null) withRadius++;
+        var nm = ST.callStr(np, 'getName') || '?';
+        // Keep only things worth steering around. Excluded, and why:
+        //   distAvatarCollNode / NPCToon rays  -- other toons MOVE, so a cached snapshot would be
+        //                                         stale within seconds (NPCToon bodies are kept)
+        //   SC.shadowPlacerRay / GW.cRayNode   -- ground-probe rays, radius 0, not obstacles
+        //   cloudSphere                        -- sky decoration, far above the ground
+        //   treasureSphere                     -- the PICKUPS; avoiding those defeats the point
+        if (cfg && cfg.static_only) {
+          if (nm.indexOf('distAvatarCollNode') === 0 || nm.indexOf('shadowPlacerRay') >= 0 ||
+              nm.indexOf('cloudSphere') === 0 || nm.indexOf('treasureSphere') === 0 ||
+              // GW.* is the local toon's OWN GravityWalker collision (wall sphere, event sphere,
+              // ground ray) and ccLineNode is its chat placer -- all sitting exactly at the toon.
+              // Treating them as obstacles makes the bot permanently blocked by itself.
+              nm.indexOf('GW.') === 0 || nm.indexOf('ccLineNode') === 0 ||
+              rad === null || rad <= 0.05) {
+            return;
+          }
+          if (out.length < ((cfg && cfg.limit_out) || 1200)) {
+            out.push({ name: nm, x: x, y: y, z: z, r: rad, cx: cx, cy: cy, cz: cz,
+                       mask: mask, solids: nsolid });
+          }
+        }
+        // names carry a per-instance id (distAvatarCollNode-112733738); strip it so the tally
+        // shows KINDS of collider rather than one row per object
+        var key = nm.replace(/[-_]?[0-9]{3,}$/, '');
+        if (!tally[key]) tally[key] = { n: 0, rmax: 0 };
+        tally[key].n++;
+        if (rad !== null && rad > tally[key].rmax) tally[key].rmax = rad;
+        if (samples.length < ((cfg && cfg.samples) || 14)) {
+          samples.push({ name: nm, x: x, y: y, z: z, r: rad });
+        }
+      }, lim);
+      return { total: total, with_pos: withPos, with_radius: withRadius,
+               samples: samples, tally: tally, obstacles: out };
     });
   },
 
@@ -663,7 +826,7 @@ def unwrap(res, what):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("mode", choices=["discover", "nodes", "state", "watch", "probe", "classes",
-                                     "buttons", "guitext"])
+                                     "buttons", "guitext", "collision"])
     ap.add_argument("--match", action="append", default=[],
                     help="substring of the pickup class name (repeatable)")
     ap.add_argument("--path", default="base", help="probe: dotted attribute path from builtins")
@@ -688,6 +851,16 @@ def main():
             print("%d nodes under render matching %s\n" % (r["count"], a.pattern))
             for nm, n in sorted(r["names"].items(), key=lambda kv: -kv[1])[:a.top]:
                 print("  %5d  %s" % (n, nm))
+        elif a.mode == "collision":
+            r = unwrap(ex.collision({}), "collision")
+            if r.get("err"):
+                raise SystemExit("worldstate: %s" % r["err"])
+            print("%d CollisionNodes under render; %d gave a world position, %d a radius"
+                  % (r["total"], r["with_pos"], r["with_radius"]))
+            print()
+            print("%-40s %7s %9s" % ("collider kind", "count", "max r"))
+            for k, v in sorted((r.get("tally") or {}).items(), key=lambda kv: -kv[1]["n"])[:30]:
+                print("  %-38s %7d %9.1f" % (k[:38], v["n"], v["rmax"]))
         elif a.mode == "guitext":
             r = unwrap(ex.guitext(), "guitext")
             if r.get("err"):
