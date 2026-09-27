@@ -45,10 +45,24 @@ WHAT IS NOT AVAILABLE
     whether the distance to its target is actually falling and reports `blocked` -- the signal that
     matters anyway, and what lets Jev decide to turn off and try another line.
 
+INPUT: BACKGROUND FOR MOVEMENT, RAW ONLY FOR PANELS
+    Movement goes through winctl 0.3's `background` backend, which posts window messages: it never
+    takes focus and never moves the cursor, so the machine stays usable while the bot plays.
+    Measured against the raw backend on this client and identical -- a 500 ms turn gives -47.4 vs
+    -47.1 degrees, a 700 ms walk 14.6 vs 14.4 units.
+
+    CLICKS are the exception and must use `raw`. Panda3D's MouseWatcher reads the real cursor
+    position from the device rather than the coordinates carried in the posted message, so a
+    background click is delivered but lands wherever the user's pointer happens to be -- which is
+    how three separate attempts at the toon picker ended up in Make-a-Toon. Clicks are only used
+    to dismiss a panel, so the brief focus blip is rare. `--inject` would remove even that, but
+    needs the 64-bit winctl-hook DLL built.
+
 SAFETY
-    Keys are held during a pulse, so every exit path must release them: the `finally`, an atexit
-    hook and the signal handler all call `Keys.release_all`. Stop it with the stop file rather than
-    Ctrl+C -- per AGENTS.md the stop file is the only reliable stop on Windows:
+    A key press is one winctl invocation that holds and releases, so an exception cannot strand a
+    key down. `release_all` additionally taps w/a/s/d, since a tap ends in a key-up regardless of
+    prior state. Stop it with the stop file rather than Ctrl+C -- per AGENTS.md the stop file is
+    the only reliable stop on Windows:
         echo . > %TEMP%\\beanbot-stop
 
 Usage:
