@@ -29,6 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "frida"))
 import worldstate as WS                 # noqa: E402
+sys.path.insert(0, HERE)
+import winctl_cli as W                  # noqa: E402  -- winctl 0.3 CLI, background input
 
 TURN_DURATIONS = [0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.50]
 # 1.8s was dropped: at ~21 units/s that is 38 units, far enough that the toon reliably ran
@@ -78,11 +80,8 @@ def main():
     ap.add_argument("--walk-only", action="store_true")
     a = ap.parse_args()
 
-    from winctl import inputs, windows
-    ws = windows.list_windows(cls="WinGraphicsWindow0")
-    if not ws:
+    if not W.game_window():
         raise SystemExit("calibrate: no game window")
-    hwnd = ws[0]["hwnd"]
 
     session, ex = WS.attach()
     turn_pts, walk_pts = [], []
@@ -99,9 +98,7 @@ def main():
                         p0 = pose(ex)
                         if p0 is None:
                             continue
-                        inputs.key_hold(hwnd, key, True)
-                        time.sleep(dur)
-                        inputs.key_hold(hwnd, key, False)
+                        W.key(key, hold_ms=int(dur * 1000))
                         time.sleep(SETTLE)
                         p1 = pose(ex)
                         if p1 is None:
@@ -121,18 +118,14 @@ def main():
                     p0 = pose(ex)
                     if p0 is None:
                         continue
-                    inputs.key_hold(hwnd, "w", True)
-                    time.sleep(dur)
-                    inputs.key_hold(hwnd, "w", False)
+                    W.key("w", hold_ms=int(dur * 1000))
                     time.sleep(SETTLE)
                     p1 = pose(ex)
                     if p1 is None:
                         continue
                     vals.append(math.hypot(p1["x"] - p0["x"], p1["y"] - p0["y"]))
                     # turn 180 and walk back, so a long run does not march out of the open area
-                    inputs.key_hold(hwnd, "a", True)
-                    time.sleep(1.92)
-                    inputs.key_hold(hwnd, "a", False)
+                    W.key("a", hold_ms=1920)
                     time.sleep(0.2)
                 if vals:
                     walk_pts.append((dur, median(vals)))
@@ -142,7 +135,7 @@ def main():
     finally:
         for k in ("w", "a", "s", "d"):
             try:
-                inputs.key_hold(hwnd, k, False)
+                W.key(k, hold_ms=1)      # a tap ends in a key-up, clearing anything left down
             except Exception:
                 pass
         try:

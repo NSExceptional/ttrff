@@ -76,6 +76,7 @@ rpc.exports = {
       if (F['PyGILState_Ensure'])     ST.GilEnsure  = new NativeFunction(F['PyGILState_Ensure'],     'int',     []);
       if (F['PyGILState_Release'])    ST.GilRelease = new NativeFunction(F['PyGILState_Release'],    'void',    ['int']);
       if (F['PyUnicode_FromString'])  ST.UniFromStr = new NativeFunction(F['PyUnicode_FromString'],  'pointer', ['pointer']);
+      if (F['PyTuple_GetItem'])       ST.TupleGet   = new NativeFunction(F['PyTuple_GetItem'],       'pointer', ['pointer','long']);
       if (!ST.GilEnsure || !ST.GilRelease) { out.notes.push('no GIL symbols -- cannot run safely'); return out; }
       if (!ST.GetIter || !ST.IterNext)     { out.notes.push('no GetIter/IterNext -- iteration disabled'); }
 
@@ -108,6 +109,16 @@ rpc.exports = {
           if (r.isNull()) ST.clearExc();
           return r;
         } catch (e) { ST.clearExc(); return ptr(0); }
+      };
+      // PyTuple_SetItem STEALS a reference to the value. Every call here that passes a shared
+      // object as an argument -- render, aspect2d -- was therefore decrementing that object's
+      // refcount once per call. It survived only because those nodes carry huge refcounts, but at
+      // 2 Hz over a long session it is a genuine use-after-free waiting to happen. Bump the count
+      // before handing the object over; over-incrementing merely leaks, under-incrementing frees
+      // something the game is still using.
+      ST.incref = function (o) {
+        try { if (o && !o.isNull()) o.writeU64(o.readU64() + 1); } catch (e) {}
+        return o;
       };
       ST.mkstr = function (s) {
         try { return ST.UniFromStr ? ST.UniFromStr(Memory.allocUtf8String(s)) : ptr(0); }
@@ -171,7 +182,7 @@ rpc.exports = {
           }
           var t = ST.TupleNew(args ? args.length : 0);
           if (t.isNull()) { ST.clearExc(); return null; }
-          for (var i = 0; args && i < args.length; i++) ST.TupleSet(t, i, args[i]);
+          for (var i = 0; args && i < args.length; i++) ST.TupleSet(t, i, ST.incref(args[i]));
           var r = ST.Call(m, t, ptr(0));
           if (r.isNull()) { ST.clearExc(); return null; }
           var d = ST.fval(r);
@@ -252,6 +263,43 @@ rpc.exports = {
         if (y === null) return null;
         return { x: x, y: y, z: ST.callFloat(src, 'getZ', rargs, null), src: src };
       };
+      // Visual centre and size of a widget, in `rel` space, from getTightBounds().
+      //
+      // A widget's NODE ORIGIN is NOT where it appears. The trampoline dialog's OK button reports
+      // an origin at z=+0.16 while the green button is drawn near z=-0.45 -- clicking the origin
+      // hits the dialog's background and does nothing, which left the bot frozen in front of it.
+      // getTightBounds gives the drawn extent, whose midpoint is what a user would aim at.
+      ST.centerOf = function (np, rel) {
+        try {
+          // getTightBounds() returns None for these nodes (Panda gives None when the subgraph has
+          // no geometry of its own), so the DirectGUI-native route is PGItem.getFrame(): the
+          // widget rect (left, right, bottom, top) in the item's OWN space. Combined with the
+          // node's origin and scale relative to `rel`, that is the drawn centre.
+          var nodef = ST.attr(np, 'node');
+          if (nodef.isNull()) return null;
+          var n = ST.Call(nodef, ST.TupleNew(0), ptr(0));
+          if (n.isNull()) { ST.clearExc(); return null; }
+          var gf = ST.attr(n, 'getFrame');
+          if (gf.isNull()) return null;
+          var f = ST.Call(gf, ST.TupleNew(0), ptr(0));
+          if (f.isNull()) { ST.clearExc(); return null; }
+          // LVecBase4: x=left y=right z=bottom w=top
+          var l = ST.callFloat(f, 'getX', [], null), r2 = ST.callFloat(f, 'getY', [], null);
+          var b = ST.callFloat(f, 'getZ', [], null), t2 = ST.callFloat(f, 'getW', [], null);
+          ST.clearExc();
+          if (l === null || r2 === null || b === null || t2 === null) return null;
+          var ox = ST.callFloat(np, 'getX', [rel], null);
+          var oz = ST.callFloat(np, 'getZ', [rel], null);
+          if (ox === null || oz === null) return null;
+          var sx = ST.callFloat(np, 'getSx', [rel], null);
+          var sz = ST.callFloat(np, 'getSz', [rel], null);
+          if (sx === null) sx = 1.0;
+          if (sz === null) sz = 1.0;
+          return { x: ox + ((l + r2) / 2.0) * sx, z: oz + ((b + t2) / 2.0) * sz,
+                   w: (r2 - l) * sx, h: (t2 - b) * sz };
+        } catch (e) { ST.clearExc(); return null; }
+      };
+
       // NOTE: node names do NOT identify a pickup's kind. A DistributedObject names its own node
       // 'treasure-<doId>' and the child holding the model is named just 'treasure', so neither
       // says whether it is an ice cream, a jellybean bag or a coin bag. `value` is the only
@@ -369,12 +417,13 @@ rpc.exports = {
         // but stashed -- so a list that ignored visibility would be mostly noise.
         var hidden = ST.callBool(np, 'isHidden');
         if (hidden === true) return;
-        var ent = {
-          name: ST.callStr(np, 'getName'),
-          x: ST.callFloat(np, 'getX', [a2d], null),
-          z: ST.callFloat(np, 'getZ', [a2d], null),
-          text: null
-        };
+        var ent = { name: ST.callStr(np, 'getName'), text: null, w: null, h: null };
+        var c = ST.centerOf(np, a2d);
+        if (c) { ent.x = c.x; ent.z = c.z; ent.w = c.w; ent.h = c.h; }
+        else {   // no drawn geometry: fall back to the node origin
+          ent.x = ST.callFloat(np, 'getX', [a2d], null);
+          ent.z = ST.callFloat(np, 'getZ', [a2d], null);
+        }
         // The visible label is a TextNode somewhere beneath the button.
         var tfam = ST.attr(np, 'findAllMatches');
         if (!tfam.isNull()) {
@@ -448,7 +497,7 @@ rpc.exports = {
       var dirf = ST.attr(bi, 'dir');
       if (dirf.isNull()) return { err: 'no builtins.dir' };
       var t = ST.TupleNew(1);
-      ST.TupleSet(t, 0, cur);
+      ST.TupleSet(t, 0, ST.incref(cur));
       var lst = ST.Call(dirf, t, ptr(0));
       if (lst.isNull()) { ST.clearExc(); return { err: 'dir() failed' }; }
       var names = [];
@@ -476,7 +525,7 @@ rpc.exports = {
         if (seen[t]) { seen[t].n++; return; }
         var ent = { n: 1, methods: [] };
         var tu = ST.TupleNew(1);
-        ST.TupleSet(tu, 0, o);
+        ST.TupleSet(tu, 0, ST.incref(o));
         var lst = ST.Call(dirf, tu, ptr(0));
         if (lst.isNull()) { ST.clearExc(); }
         else {

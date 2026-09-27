@@ -71,6 +71,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "frida"))
 import worldstate as WS                 # noqa: E402  -- the read-only memory reader
+sys.path.insert(0, HERE)
+import winctl_cli as W                  # noqa: E402  -- winctl 0.3 CLI, background input
+
+SHOTDIR = os.environ.get("TEMP", "/tmp")
 
 API = "https://classifier.dev/v1/systemone"
 MODEL = "jev-latest"                    # bare 'jev' is rejected: unpriced_model
@@ -197,7 +201,7 @@ def jev_decide(state, timeout):
     return m["choice"], m.get("confidence", 0.0)
 
 
-def screen_buttons(ex, hwnd):
+def screen_buttons(ex):
     """Every visible DirectGUI button as {fx, fy, text, rgb}, read from the client's memory.
 
     This replaced a screen-wide colour hunt, which was the wrong tool. Searching pixels for "a red
@@ -210,18 +214,17 @@ def screen_buttons(ex, hwnd):
     Labels come back for text buttons and are None for the icon-only ones (the close X, the OK
     check), which is why colour is still needed to tell cancel from confirm.
     """
-    from winctl import capture, windows
     r = ex.buttons()
     if not r.get("ok"):
         return []
     bs = (r.get("r") or {}).get("buttons") or []
     if not bs:
         return []
-    w = windows.list_windows(cls="WinGraphicsWindow0")
-    if not w or not w[0].get("clientH"):
+    win = W.game_window()
+    if not win or not win.get("clientH"):
         return []
-    aspect = float(w[0]["clientW"]) / float(w[0]["clientH"])
-    im = capture.capture_printwindow(hwnd).convert("RGB")
+    aspect = float(win["clientW"]) / float(win["clientH"])
+    im = W.shot(os.path.join(SHOTDIR, "buttons.png"))
     iw, ih = im.size
     out = []
     for b in bs:
@@ -248,23 +251,29 @@ def screen_buttons(ex, hwnd):
 
 
 def classify_button(btn):
-    """'cancel' (red X), 'ok' (green/blue check), or None -- from the colour at its own position."""
+    """'cancel' (red X), 'ok' (green/blue check), or None -- from the colour at its own position.
+
+    Thresholds are RELATIVE, not absolute. The trampoline dialog's OK button samples as
+    (7, 94, 31): unmistakably green, but an absolute `g > 120` cut rejected it, while the bluish
+    laff meter at (114, 118, 154) sneaked past as a confirm control. Channel dominance separates
+    a coloured control from grey UI furniture far better than brightness does.
+    """
     r, g, b = btn["rgb"]
     txt = (btn.get("text") or "").strip().lower()
     if txt in ("cancel", "no", "quit", "close", "back"):
         return "cancel"
     if txt in ("ok", "yes", "done", "continue"):
         return "ok"
-    if r > 140 and r > 1.5 * max(g, b, 1):
+    if r > 90 and r > 1.5 * max(g, 1) and r > 1.5 * max(b, 1):
         return "cancel"
-    if g > 120 and g > 1.3 * max(r, b, 1):
+    if g > 55 and g > 1.4 * max(r, 1) and g > 1.4 * max(b, 1):
         return "ok"
-    if b > 120 and b > 1.25 * max(r, g, 1):
+    if b > 100 and b > 1.5 * max(r, 1) and b > 1.5 * max(g, 1):
         return "ok"
     return None
 
 
-def unwedge(ex, hwnd, hud_names=frozenset()):
+def unwedge(ex, hud_names=frozenset()):
     """Clear a UI panel that is swallowing movement keys. True if something was dismissed.
 
     Buttons come from memory, so the only question is WHICH to press. Prefer a cancel/close control
@@ -273,8 +282,7 @@ def unwedge(ex, hwnd, hud_names=frozenset()):
 
     Escape is not tried -- verified against the live token shop, which ignored it completely.
     """
-    from winctl import inputs
-    btns = screen_buttons(ex, hwnd)
+    btns = screen_buttons(ex)
     if not btns:
         return False
     # Ignore the permanent HUD. The chat bubble, gag, laff and book icons are DirectGUI buttons too
@@ -293,52 +301,51 @@ def unwedge(ex, hwnd, hud_names=frozenset()):
         return False
     ranked.sort(key=lambda t: t[0])
     _, btn, kind = ranked[0]
-    inputs.click(hwnd, 0.20, 0.30)       # park: DirectGUI arms on mouse-ENTER
+    # CLICKS MUST USE `raw`. Panda3D's MouseWatcher reads the real cursor position from the
+    # device, so a BACKGROUND click is delivered but lands wherever the user's pointer happens to
+    # be -- which is how three separate attempts at the toon picker ended up in Make-a-Toon. raw
+    # briefly takes the foreground; it is only used here, for dismissing a panel, never to move.
+    W.click(0.20, 0.30, input_mode="raw")       # park: DirectGUI arms on mouse-ENTER
     time.sleep(0.4)
-    inputs.click(hwnd, float(btn["fx"]), float(btn["fy"]))
+    W.click(float(btn["fx"]), float(btn["fy"]), input_mode="raw")
     print("[bot] pressed %s button at %.3f,%.3f (label=%r rgb=%s)"
           % (kind, btn["fx"], btn["fy"], btn.get("text"), btn["rgb"]), flush=True)
     return True
 
 
 class Keys(object):
-    """Owns every held key, so there is exactly one place that can leave one stuck down."""
+    """Owns key presses. One winctl invocation does down-hold-up, so a press cannot be left open.
 
-    def __init__(self, hwnd, dry=False):
-        self.hwnd = hwnd
+    Movement uses the BACKGROUND backend, which posts window messages: no focus stolen, no cursor
+    moved, so the machine stays usable while the bot plays. Measured against the raw backend on
+    this client and identical -- a 500 ms turn gives -47.4 vs -47.1 degrees, a 700 ms walk 14.6 vs
+    14.4 units -- so nothing about the movement model changes by using it.
+    """
+
+    def __init__(self, dry=False):
         self.dry = dry
-        self.held = set()
-        self._inputs = None
-        if not dry:
-            from winctl import inputs
-            self._inputs = inputs
 
     def pulse(self, key, seconds):
-        """Press, hold for `seconds`, release. The release runs even if the sleep is interrupted."""
+        """Press `key` for `seconds`. winctl holds and releases it, so an exception here cannot
+        strand a key down in the game the way a separate down/up pair could."""
         if self.dry:
             time.sleep(min(seconds, 0.05))
             return
         try:
-            self._inputs.key_hold(self.hwnd, key, True)
-            self.held.add(key)
-            time.sleep(seconds)
-        finally:
-            try:
-                self._inputs.key_hold(self.hwnd, key, False)
-            except Exception:
-                pass
-            self.held.discard(key)
+            W.key(key, hold_ms=int(seconds * 1000))
+        except Exception as e:
+            print("[bot] key %s failed: %s" % (key, e), file=sys.stderr)
 
     def release_all(self):
+        """Belt and braces: tap each movement key so any left down by an interrupted pulse is
+        released. A tap ends in a key-up regardless of the prior state."""
         if self.dry:
-            self.held.clear()
             return
-        for k in list(self.held) + ["w", "a", "s", "d"]:
+        for k in ("w", "a", "s", "d"):
             try:
-                self._inputs.key_hold(self.hwnd, k, False)
+                W.key(k, hold_ms=1)
             except Exception:
                 pass
-        self.held.clear()
 
 
 def main():
@@ -375,16 +382,14 @@ def main():
     print("[bot] turn model: %.1f deg/s (+%.1f); stop with:  echo . > %s"
           % (TURN_RATE, TURN_OVERHEAD, a.stopfile), file=sys.stderr)
 
-    hwnd = None
     if not a.dry_run:
-        from winctl import windows
-        ws = windows.list_windows(cls="WinGraphicsWindow0")
-        if not ws:
+        if not W.available():
+            raise SystemExit("beanbot: winctl not found at %s (set WINCTL_EXE)" % W.WINCTL)
+        if not W.game_window():
             raise SystemExit("beanbot: no game window (class WinGraphicsWindow0)")
-        hwnd = ws[0]["hwnd"]
 
     session, ex = WS.attach()
-    keys = Keys(hwnd, dry=a.dry_run)
+    keys = Keys(dry=a.dry_run)
     atexit.register(keys.release_all)
 
     stop = {"now": False}
@@ -447,7 +452,7 @@ def main():
             # screen is permanent furniture.
             if frozen == 0 and not a.dry_run and time.time() - hud_at > 30.0:
                 try:
-                    seen = {b.get("name") for b in screen_buttons(ex, hwnd) if b.get("name")}
+                    seen = {b.get("name") for b in screen_buttons(ex) if b.get("name")}
                     if seen:
                         hud_names = seen
                         hud_at = time.time()
@@ -457,7 +462,7 @@ def main():
                 print("[bot] no movement for %d pulses -- looking for a blocking UI panel" % frozen,
                       flush=True)
                 frozen = 0
-                if not a.dry_run and unwedge(ex, hwnd, hud_names):
+                if not a.dry_run and unwedge(ex, hud_names):
                     # A real panel was in the way and is now gone; give it a clean slate.
                     print("[bot] closed a panel", flush=True)
                     best_dist = None
