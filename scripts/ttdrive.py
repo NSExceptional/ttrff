@@ -50,6 +50,7 @@ except ImportError:
 # ---- constants -------------------------------------------------------------
 ENGINE_CLASS = "WinGraphicsWindow0"          # Panda3D's window class; stabler than the title,
                                              # which the launcher also starts with
+HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER_PROC = "Launcher.exe"
 LAUNCHER_TITLE = "Toontown Rewritten Launcher"
 CRASH_TITLE = "Gadzooks!"                    # the post-crash "log in again?" dialog
@@ -203,6 +204,28 @@ def dialog_buttons(hwnd):
 # The picker is a 3x2 grid of cards; these are their centres as client-area fractions.
 SLOT_GRID = [(0.25, 0.31), (0.50, 0.31), (0.76, 0.31),
              (0.25, 0.73), (0.50, 0.73), (0.76, 0.73)]
+
+
+def _try_pick_toon():
+    """Run scripts/pick_toon.py with the frida-capable python. True if it reported success.
+
+    Kept as a subprocess so this driver stays out-of-process itself: it never imports frida, never
+    attaches, and still works (via the colour fallback) if the injector venv is missing.
+    """
+    py = os.environ.get("TTRFF_INJECTOR_PYTHON",
+                        os.path.join(os.path.dirname(HERE), ".venv-win", "Scripts", "python.exe"))
+    script = os.path.join(HERE, "pick_toon.py")
+    if not (os.path.exists(py) and os.path.exists(script)):
+        return False
+    try:
+        r = subprocess.run([py, script], capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        log("pick_toon failed to run (%r) -- falling back to colour heuristic" % (e,))
+        return False
+    for line in (r.stdout or "").splitlines():
+        if line.strip():
+            log("pick_toon: %s" % line.strip())
+    return r.returncode == 0
 
 
 def find_occupied_slot(hwnd):
@@ -402,6 +425,15 @@ def enter(timeout=DEFAULT_TIMEOUT):
         elif s == "toonselect":
             ew = engine_window()
             if ew:
+                # PREFERRED: let pick_toon.py do it. It finds the slot by NAME in the client's
+                # memory and positions the cursor through Panda's own movePointer, which is the
+                # only approach that has proven reliable -- picking by screen position failed four
+                # times, each time dropping into Make-a-Toon. That needs frida, which this driver
+                # deliberately does not use, so it runs as a subprocess and the colour heuristic
+                # below stays as the out-of-process fallback.
+                if _try_pick_toon():
+                    time.sleep(3.0)
+                    continue
                 slot = find_occupied_slot(ew["hwnd"])
                 if slot is None:
                     # Refuse to guess: a wrong click here enters Make-a-Toon, which is far worse

@@ -326,6 +326,47 @@ rpc.exports = {
       // 'treasure-<doId>' and the child holding the model is named just 'treasure', so neither
       // says whether it is an ice cream, a jellybean bag or a coin bag. `value` is the only
       // discriminator that works -- see the role table above. Do not retry the node-name route.
+      // Build a Python int. There is no PyLong_FromLong in the Windows table, but `int` is a
+      // builtin and PyFloat_FromDouble is available, so int(float) gets there in one call.
+      ST.mkint = function (v) {
+        try {
+          if (!ST.FloatFromDouble) return ptr(0);
+          var bi = ST.builtins();
+          var intf = ST.attr(bi, 'int');
+          if (intf.isNull()) return ptr(0);
+          var f = ST.FloatFromDouble(v);
+          if (f.isNull()) return ptr(0);
+          var t = ST.TupleNew(1);
+          ST.TupleSet(t, 0, f);            // steals the float we just made: correct, do not incref
+          var r = ST.Call(intf, t, ptr(0));
+          if (r.isNull()) { ST.clearExc(); return ptr(0); }
+          return r;
+        } catch (e) { ST.clearExc(); return ptr(0); }
+      };
+      // Put the OS cursor at a pixel inside the game window, using Panda's OWN api. This is the
+      // fix for clicking the wrong place: rather than converting fractions to screen pixels
+      // ourselves -- and getting window size, DPI and Panda's aspect ratio involved -- we hand
+      // Panda window-relative pixels and let it move the pointer. Whatever Panda's MouseWatcher
+      // then reads is by construction the point we asked for.
+      ST.movePointer = function (px, py) {
+        try {
+          var bi = ST.builtins();
+          var base = ST.attr(bi, 'base');
+          if (base.isNull()) return false;
+          var win = ST.attr(base, 'win');
+          if (win.isNull()) return false;
+          var mp = ST.attr(win, 'movePointer');
+          if (mp.isNull()) return false;
+          var a0 = ST.mkint(0), a1 = ST.mkint(px), a2 = ST.mkint(py);
+          if (a0.isNull() || a1.isNull() || a2.isNull()) return false;
+          var t = ST.TupleNew(3);
+          ST.TupleSet(t, 0, a0); ST.TupleSet(t, 1, a1); ST.TupleSet(t, 2, a2);
+          var r = ST.Call(mp, t, ptr(0));
+          if (r.isNull()) { ST.clearExc(); return false; }
+          ST.clearExc();
+          return true;
+        } catch (e) { ST.clearExc(); return false; }
+      };
       // obj.<name>() -> int, or null. getWord()/getNumSolids() return Python ints, and callFloat
       // rejects those (it type-checks against PyFloat_Type), which is why every collide mask came
       // back None on the first attempt.
@@ -548,6 +589,89 @@ rpc.exports = {
       }, lim);
       return { total: total, with_pos: withPos, with_radius: withRadius,
                samples: samples, tally: tally, obstacles: out };
+    });
+  },
+
+  // --- put the pointer somewhere, via Panda ------------------------------------------------------
+  // cfg = {fx, fy} fractions of the render area, or {px, py} raw pixels.
+  point: function (cfg) {
+    return ST.gil(function () {
+      var bi = ST.builtins();
+      var base = ST.attr(bi, 'base');
+      if (base.isNull()) return { err: 'no base' };
+      var win = ST.attr(base, 'win');
+      if (win.isNull()) return { err: 'no base.win' };
+      var w = ST.callInt(win, 'getXSize'), h = ST.callInt(win, 'getYSize');
+      var ar = ST.callFloat(base, 'getAspectRatio', [], null);
+      var px = cfg && cfg.px, py = cfg && cfg.py;
+      if ((px === undefined || px === null) && cfg && cfg.fx !== undefined && w && h) {
+        px = Math.round(cfg.fx * w);
+        py = Math.round(cfg.fy * h);
+      }
+      var ok = null;
+      if (px !== undefined && px !== null) ok = ST.movePointer(px, py);
+      return { w: w, h: h, aspect: ar, px: px, py: py, moved: ok };
+    });
+  },
+
+  // --- DirectGUI widget registry ---------------------------------------------------------------
+  // Clicking a widget by SCREEN COORDINATE is the fragile half of driving this game: it depends on
+  // window size, DPI, the real cursor position (Panda reads the device, not the posted message)
+  // and focus. DirectGUI keeps every widget in a registry keyed by the same `<class>-pg<id>` name
+  // the scene graph reports, so the robust path is to look the widget up and invoke its command
+  // in-process -- no coordinates at all. `direct.gui.DirectGuiBase` is Panda's own module, not
+  // vault-hashed, so it resolves by name.
+  guiregistry: function (key) {
+    return ST.gil(function () {
+      var md = ST.sysmodules();
+      if (md.isNull()) return { err: 'no sys.modules' };
+      var mod = ST.DictGetStr(md, Memory.allocUtf8String('direct.gui.DirectGuiBase'));
+      if (mod.isNull()) {
+        ST.clearExc();
+        // Not under its canonical name: this engine bundles/renames modules, so report the
+        // candidates rather than guessing at another spelling.
+        var keysf = ST.attr(md, 'keys');
+        var cands = [];
+        if (!keysf.isNull()) {
+          var kseq = ST.Call(keysf, ST.TupleNew(0), ptr(0));
+          if (kseq.isNull()) { ST.clearExc(); }
+          else {
+            ST.each(kseq, function (k) {
+              var t = ST.str(k);
+              if (t && cands.length < 60 && (t.indexOf('gui') >= 0 || t.indexOf('Gui') >= 0 ||
+                                             t.indexOf('direct') === 0)) cands.push(t);
+            }, 6000);
+          }
+        }
+        return { err: 'no direct.gui.DirectGuiBase', candidates: cands };
+      }
+      var cls = ST.attr(mod, 'DirectGuiWidget');
+      if (cls.isNull()) return { err: 'no DirectGuiWidget' };
+      var gd = ST.attr(cls, 'guiDict');
+      if (gd.isNull()) return { err: 'no guiDict' };
+
+      if (!key) {
+        var keysf = ST.attr(gd, 'keys');
+        if (keysf.isNull()) return { err: 'guiDict has no .keys' };
+        var kseq = ST.Call(keysf, ST.TupleNew(0), ptr(0));
+        if (kseq.isNull()) { ST.clearExc(); return { err: 'keys() failed' }; }
+        var ks = [];
+        var n = ST.each(kseq, function (k) { if (ks.length < 400) { var t = ST.str(k); if (t) ks.push(t); } }, 2000);
+        return { count: n, keys: ks };
+      }
+
+      var w = ST.DictGetStr(gd, Memory.allocUtf8String(key));
+      if (w.isNull()) { ST.clearExc(); return { err: 'no widget ' + key }; }
+      var dirf = ST.attr(ST.builtins(), 'dir');
+      var attrs = [];
+      if (!dirf.isNull()) {
+        var t2 = ST.TupleNew(1);
+        ST.TupleSet(t2, 0, ST.incref(w));
+        var lst = ST.Call(dirf, t2, ptr(0));
+        if (lst.isNull()) { ST.clearExc(); }
+        else { ST.each(lst, function (o) { var nm = ST.str(o); if (nm && nm.charAt(0) !== '_') attrs.push(nm); }, 600); }
+      }
+      return { cls: ST.tpname(w), attrs: attrs };
     });
   },
 
@@ -826,7 +950,7 @@ def unwrap(res, what):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("mode", choices=["discover", "nodes", "state", "watch", "probe", "classes",
-                                     "buttons", "guitext", "collision"])
+                                     "buttons", "guitext", "collision", "gui"])
     ap.add_argument("--match", action="append", default=[],
                     help="substring of the pickup class name (repeatable)")
     ap.add_argument("--path", default="base", help="probe: dotted attribute path from builtins")
@@ -861,6 +985,24 @@ def main():
             print("%-40s %7s %9s" % ("collider kind", "count", "max r"))
             for k, v in sorted((r.get("tally") or {}).items(), key=lambda kv: -kv[1]["n"])[:30]:
                 print("  %-38s %7d %9.1f" % (k[:38], v["n"], v["rmax"]))
+        elif a.mode == "gui":
+            r = unwrap(ex.guiregistry(a.path if a.path != "base" else None), "gui")
+            if r.get("err"):
+                if r.get("candidates"):
+                    print("%s; candidate modules:" % r["err"])
+                    for c in r["candidates"]:
+                        print("   %s" % c)
+                    return 0
+                raise SystemExit("worldstate: %s" % r["err"])
+            if "keys" in r:
+                print("%d widgets in DirectGUI's registry; first 40:" % r["count"])
+                for k in r["keys"][:40]:
+                    print("   %s" % k)
+            else:
+                print("%s -> %s" % (a.path, r["cls"]))
+                ats = r["attrs"]
+                for i in range(0, len(ats), 4):
+                    print("  " + "".join("%-28s" % x for x in ats[i:i + 4]))
         elif a.mode == "guitext":
             r = unwrap(ex.guitext(), "guitext")
             if r.get("err"):
