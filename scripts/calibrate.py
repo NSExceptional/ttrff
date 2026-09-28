@@ -28,9 +28,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "frida"))
-import worldstate as WS                 # noqa: E402
-sys.path.insert(0, HERE)
-import winctl_cli as W                  # noqa: E402  -- winctl 0.3 CLI, background input
+import worldstate as WS                 # noqa: E402  -- also the in-process key input the bot uses
 
 TURN_DURATIONS = [0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.50]
 # 1.8s was dropped: at ~21 units/s that is 38 units, far enough that the toon reliably ran
@@ -59,6 +57,12 @@ def median(xs):
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
+def hold(ex, key, seconds):
+    """Hold a key IN-PROCESS -- the same path the bot uses, so the fit describes what it gets."""
+    ex.key_hold(key, int(round(seconds * 1000)))
+    time.sleep(seconds + 0.05)
+
+
 def fit(pts):
     """least squares amount = rate*seconds + overhead"""
     n = len(pts)
@@ -80,9 +84,6 @@ def main():
     ap.add_argument("--walk-only", action="store_true")
     a = ap.parse_args()
 
-    if not W.game_window():
-        raise SystemExit("calibrate: no game window")
-
     session, ex = WS.attach()
     turn_pts, walk_pts = [], []
     try:
@@ -98,7 +99,7 @@ def main():
                         p0 = pose(ex)
                         if p0 is None:
                             continue
-                        W.key(key, hold_ms=int(dur * 1000))
+                        hold(ex, key, dur)
                         time.sleep(SETTLE)
                         p1 = pose(ex)
                         if p1 is None:
@@ -118,14 +119,14 @@ def main():
                     p0 = pose(ex)
                     if p0 is None:
                         continue
-                    W.key("w", hold_ms=int(dur * 1000))
+                    hold(ex, "w", dur)
                     time.sleep(SETTLE)
                     p1 = pose(ex)
                     if p1 is None:
                         continue
                     vals.append(math.hypot(p1["x"] - p0["x"], p1["y"] - p0["y"]))
                     # turn 180 and walk back, so a long run does not march out of the open area
-                    W.key("a", hold_ms=1920)
+                    hold(ex, "a", 1.92)
                     time.sleep(0.2)
                 if vals:
                     walk_pts.append((dur, median(vals)))
@@ -133,11 +134,10 @@ def main():
                           % (dur, sum(vals) / len(vals), median(vals),
                              max(vals) - min(vals), len(vals)), flush=True)
     finally:
-        for k in ("w", "a", "s", "d"):
-            try:
-                W.key(k, hold_ms=1)      # a tap ends in a key-up, clearing anything left down
-            except Exception:
-                pass
+        try:
+            ex.keys_release()
+        except Exception:
+            pass
         try:
             session.detach()
         except Exception:

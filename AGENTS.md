@@ -17,7 +17,9 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 | `frida/inject.py`, `diag.py` | older/diagnostic inject paths (`TTRMOD_SCRIPT` overrides) |
 | `tray/ttrff_tray.py` | menu-bar supervisor app; shells out to the injector, never touches internals |
 | `localtest/` | offline tests against a local open-toontown client (`rig.py` is the shared harness) |
-| `scripts/tt-*` | window-driver helpers (winctl + OCR); `tt-lib` is sourced by the others |
+| `frida/worldstate.py` | second frida script on the mod session: reads the world (toon, bags, walls, buttons) and does the bot's in-process input (`keyHold`, `press`) |
+| `scripts/beanbot.py`, `scripts/nav.py` | auto-collect (hosted by the injector, driven from the tray) and its route planner |
+| `scripts/tt-*`, `ttdrive.py`, `enter_game.py`, `winctl_cli.py` | DEV-ONLY window-driver helpers (winctl + OCR); `tt-lib` is sourced by the others |
 | `scripts/tt-mod-stop` / `.cmd` | clean-stop via the stop file — the RELIABLE stop on both platforms (never Ctrl+C) |
 | `capi-symbols*.json`, `offsets.json`, `opcode_map.json` | per-build RE data the injector loads at runtime |
 | `STATUS.md` | the living technical doc — engine internals, per-build addresses, fragility notes |
@@ -39,6 +41,8 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 - **Minimize crashes**: the client phones home to Sentry on crash and the minidump would name `frida-agent` while attached. The trampoline route deliberately uses only `setattr` + native calls (no marshal/exec/eval) to stay low-risk.
 - **Battle round pacing is server-gated** — scaling the mid-battle attack movie was tried and deliberately disabled (feels worse). Don't re-enable it; the intro/outro scaling is the keeper.
 - **The engine's game code is AES-encrypted** (`TTRGame.vlt`) and decrypted to a RAM filesystem at runtime — you can't read game Python statically; capture names live with `TTRMOD_LOGNAMES=1`.
+
+- **winctl is a development tool, never a runtime dependency.** It exists for agents to build and test against the live client. Nothing the tray or injector runs may shell out to it (or to any other external input tool): the auto-collector presses keys on the game window's own input device and presses buttons by queueing their click event, both in-process through `frida/worldstate.py`.
 
 ## Tray app specifics
 

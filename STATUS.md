@@ -464,9 +464,8 @@ The signature probe costs several getattrs, so `roleOf` runs it once per CLASS a
   `tp_name == "int"`.
 
 **Obstacles are not available this way.** Walls, buildings and trees are scene-graph collision
-geometry, not distributed objects, so they never appear in `doId2do`. Anything needing them has to
-walk the scene graph instead; `scripts/beanbot.py` deliberately substitutes a "is the distance
-actually falling" test rather than pretending to know where the walls are.
+geometry, not distributed objects, so they never appear in `doId2do`. They come from walking the
+scene graph instead -- see "Walls are polygons" and "Routes" below.
 
 ### On-screen buttons come from the scene graph, not from pixels
 
@@ -477,13 +476,29 @@ actually falling" test rather than pretending to know where the walls are.
 converting to (0.953, 0.915) against the (0.969, 0.924) that had been tuned by hand months earlier.
 
 Labels come back only for text buttons. Icon-only controls -- including the close X and the OK
-check, i.e. exactly the ones worth pressing -- have none, so colour sampled AT the known button
-position still decides cancel-vs-confirm. That is a completely different proposition from hunting
-a red disc across the whole frame, which was tried first and needed four successive gates (fill,
-size, isolation, white-glyph) and still matched the gag HUD icon, the red toon-picker cards, the
-maroon floor and a single confetti flake. 141 lines of that were deleted for ~50 that read the
-truth. Filter against the permanent HUD (snapshot the button names while the toon is demonstrably
-moving) or the green chat icon reads as a confirm button.
+check, i.e. exactly the ones worth pressing -- have none, but their ART does have a name, and model
+node names are not vault-hashed. PGButton keeps its art in per-state subgraphs that are NOT
+children in the scene graph (`findAllMatches('**')` under the button finds only itself), so read
+`node().getStateDef(0)` and walk that. The HUD reads `BookIcon_CLSD`, `FriendsBox_Closed`,
+`ChtBx_ChtBtn_UP`, `ttr_t_gui_sbk_settingsIcon_up`, `clarabelle`; the Friends List's X is
+`CloseBtn_UP`. `beanbot.classify_button` matches `close(?!d)|cancel|exit|quit` / `okbtn|ok|yes`
+on those names (the `(?!d)` keeps `FriendsBox_Closed` -- a state, not an action -- out), keeps the
+square-only shape gate, and never looks at a pixel. Colour sampled from a screenshot did this job
+before and once picked a red Buy button in the token shop over the washed-out real X.
+
+A red-disc hunt across the whole frame was tried before any of this and needed four successive
+gates (fill, size, isolation, white-glyph) and still matched the gag HUD icon, the red toon-picker
+cards, the maroon floor and a single confetti flake. Filter against the permanent HUD (snapshot the
+button names while the toon is demonstrably moving) or the HUD's own buttons read as a panel's.
+
+**Pressing a button needs no pointer.** A real click ends with PGButton throwing its click event
+(`click-mouse1-pg123`, from `node().getClickEvent(MouseButton.one())`) onto Panda's global event
+queue, and DirectButton runs its command when the event manager dispatches it. worldstate's `press`
+queues exactly that event -- `EventQueue.getGlobalEventQueue().queueEvent(Event(name))` with one
+`EventParameter(0)` standing in for the MouseWatcherParameter -- so the command runs on the game's
+MAIN thread at its next frame, never on the agent thread. Refuse hidden or `getActive() == False`
+buttons. Verified: pressing the Friends button opened the list and pressing its `CloseBtn_UP`
+closed it, with the cursor untouched and the window unfocused.
 
 Text is readable: `NodePath.node().getText()` on a `**/+TextNode` returns real strings. Most
 TextNodes under aspect2d are empty placeholders.
@@ -509,6 +524,11 @@ Three traps, each of which made the signal useless until fixed:
    playground as blocked. Also exclude `GW.*` and `ccLineNode` -- those are the local toon's OWN
    GravityWalker spheres, sitting exactly at the toon, so they make it permanently blocked by
    itself. Note `getWord()` returns a Python int, which a float-typed reader rejects silently.
+
+**Superseded for walls.** Bounding spheres are now used only for no-go TRIGGERS (a trigger is a
+single sphere anyway). Walls come exactly from `wallsBegin`/`wallsChunk` -- polygons, spheres and
+capsules -- because a booth's bounding sphere is far fatter than the booth and closed gaps the toon
+walks through.
 
 **Validated, not assumed.** Walking straight into a picnic table:
 
@@ -548,6 +568,47 @@ Games), `FishingSpotSphere`, `Cannon-*`, `target_trigger`. They need a HARD veto
 stops you, you walk straight through it, so any "trust measured movement over predicted clearance"
 rule -- correct for pessimistic wall spheres -- will always override them.
 
+### Input without leaving the process
+
+Keys go through the game window's own input device: `base.win.getInputDevice(0)` is a
+`GraphicsWindowInputDevice`, whose published `buttonDown` / `buttonUp` (with
+`KeyboardButton.asciiKey('w')`) are exactly what Panda's window proc calls for a real WM_KEYDOWN.
+They take the device's own lock, so calling them from the agent thread is safe, and the data graph
+consumes the event on the main thread at the next frame. The game cannot tell the difference and
+nothing outside the process is involved: no focus change, no cursor movement, no external tool.
+Measured: 0.5s of `a` turns 46.7 deg, 0.7s of `w` walks 14.60 units -- the same numbers the
+out-of-process (winctl) path gave. The agent releases each key on its own timer (`keyHold`), and
+its `dispose` export releases anything still held when the script unloads, so a host dying
+mid-hold cannot leave the toon walking.
+
+Pointer injection does NOT work this way on Windows: `WinGraphicsWindow::get_pointer` re-reads
+`GetCursorPos` every frame while the pointer is in the window, overriding anything set on the
+device -- which is also why a posted click lands at the real cursor. Pressing buttons by event
+(above) avoids the pointer entirely.
+
+### Routes: A* over the real walls (`scripts/nav.py`)
+
+Aiming at the bag and relying on reflexes (whiskers, a wall guard, a timed detour) cannot work when
+the way to a bag starts by walking AWAY from it. The Cartoonival entrance is a ~150-unit corridor
+from the tunnel; with a bag off to one side, every reflex pointed back into the corridor's long
+side wall, and the bot turned into it, bounced off and turned into it again.
+
+`nav.NavGrid` rasterises the zone's wall geometry (polygon edges, plus the spheres and capsules on
+wall-mask nodes -- 96 spheres and 619 capsules in Cartoonival, the trees and booths) into a
+one-unit occupancy grid grown by the toon's radius (1.4), paints the no-go triggers in as blocked,
+and adds a 2-unit NEAR band that is passable but costs 2.5x so routes run down the middle of a
+corridor. Pillow draws it (~10 ms); A* plus string-pulling plans in 0.02-0.15 s for the whole
+~680x760 zone. The bot picks the bag with the shortest ROUTE (a straight line is a lower bound, so
+usually only one or two routes are planned), steers at the furthest route point it can see, and
+measures progress along the route. Only walls spanning the toon's feet-to-head band count, so the
+grid is rebuilt after climbing or dropping 4 units.
+
+Two details that mattered in the first live run: line of sight while FOLLOWING the route is tested
+against a second, thin grid (walls grown by 0.5), because string-pulled corners sit exactly on the
+grown walls and from a unit off the line the next corner looked hidden -- the bot turned 130 degrees
+to shuffle one unit onto the exact corner; and "stuck" counts only WALKING that fails to shorten
+the route, since turning in place to line up with a waypoint makes no progress by design.
+
 ### Swallowed input: a turn that does not turn
 
 A wall stops walking but never stops turning on the spot. So a turn pulse that produces <25% of its
@@ -580,9 +641,12 @@ limit and `collect_times[-1]` thereafter. Verified live: three quick pickups rep
 Holding a key for a set time and reading the pose delta out of memory gives, on this client:
 
 ```
-degrees = 93.6 * seconds + 0.7      (repeat spread < 1 deg, left/right within 1%)
-units   = 21.0 * seconds + 0.1      (fit on holds up to 1.2s)
+degrees = 93.2 * seconds + 0.9      (repeat spread < 2 deg, left/right within 1%)
+units   = 20.6 * seconds + 0.2      (fit on holds up to 1.2s)
 ```
+
+(Measured through the in-process input path. The out-of-process winctl path gave 93.6 / 21.0 --
+within 2%, so nothing about the model changed with the input route.)
 
 Re-derive these when the client changes. Two traps: a walk sample of 1.8s reliably ends against
 scenery and reads LOW (it dragged a naive fit from 21.0 down to 19.6, so the durations are capped

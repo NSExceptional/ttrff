@@ -375,6 +375,51 @@ rpc.exports = {
           return true;
         } catch (e) { ST.clearExc(); return false; }
       };
+      // panda3d.core, straight out of sys.modules (it is always loaded; this is a dict lookup).
+      ST.core = function () {
+        if (ST._core) return ST._core;
+        var md = ST.sysmodules(); if (md.isNull()) return ptr(0);
+        var m = ST.DictGetStr(md, Memory.allocUtf8String('panda3d.core'));
+        if (m.isNull()) { ST.clearExc(); return ptr(0); }
+        ST._core = m; ST.keep.push(m);
+        return m;
+      };
+      // INPUT, IN-PROCESS. A key is pressed on the window's own GraphicsWindowInputDevice -- the
+      // object Panda's window proc feeds from real WM_KEYDOWNs -- so the game cannot tell it from
+      // a keyboard, and nothing outside the process is involved: no focus change, no cursor, no
+      // external tool. Measured identical to a real key: a 0.5s 'a' turns 46.7 deg (model 47.5),
+      // a 0.7s 'w' walks 14.60 units (the out-of-process tool measured 14.6).
+      // button_down/up take the device's own lock, so calling them from this thread is safe; the
+      // event is consumed by the data graph on the game's main thread at its next frame.
+      ST.held = {};
+      ST.key = function (name, down) {
+        try {
+          var core = ST.core(); if (core.isNull()) return false;
+          var hk = ST.mcache['kb.' + name];
+          if (!hk) {
+            var KB = ST.attr(core, 'KeyboardButton'); if (KB.isNull()) return false;
+            hk = ST.callRaw(KB, 'asciiKey', [ST.mkstr(name)]);
+            if (hk.isNull()) return false;
+            ST.mcache['kb.' + name] = hk; ST.keep.push(hk);
+          }
+          var dev = ST.mcache.dev;
+          if (!dev) {
+            var win = ST.attr(ST.attr(ST.builtins(), 'base'), 'win');
+            dev = ST.callRaw(win, 'getInputDevice', [ST.mkint(0)]);
+            if (dev.isNull()) return false;
+            ST.mcache.dev = dev; ST.keep.push(dev);
+          }
+          var r = ST.callRaw(dev, down ? 'buttonDown' : 'buttonUp', [hk]);
+          return !r.isNull();
+        } catch (e) { ST.clearExc(); return false; }
+      };
+      ST.release = function (name) {
+        var h = ST.held[name];
+        if (!h) return;
+        clearTimeout(h);
+        delete ST.held[name];
+        ST.gil(function () { return ST.key(name, false); });
+      };
       // Call a bound method / callable with PyObject args, returning the raw result (or NULL).
       // Args are increfed because PyTuple_SetItem steals a reference.
       ST.callRawFn = function (m, args) {
@@ -450,6 +495,62 @@ rpc.exports = {
     } catch (e) {
       return { ok: false, notes: ['init threw: ' + e] };
     }
+  },
+
+  // --- keys: hold for a duration, released BY THE AGENT --------------------------------------
+  // The release is a timer in here, not a second call from the host, so a host that dies or
+  // stalls mid-hold cannot strand a key down and walk the toon off into the distance. Holding a
+  // key that is already held just re-arms its timer.
+  keyHold: function (name, ms) {
+    if (ST.held[name]) { clearTimeout(ST.held[name]); delete ST.held[name]; }
+    var r = ST.gil(function () { return ST.key(name, true); });
+    if (!r.ok || !r.r) return { ok: false, e: r.e || 'buttonDown failed' };
+    ST.held[name] = setTimeout(function () { ST.release(name); }, Math.max(1, ms | 0));
+    return { ok: true };
+  },
+  // Release everything this script is holding. Never sends an up for a key it did not press, so
+  // it cannot interfere with a player who is steering by hand.
+  keysRelease: function () {
+    var names = Object.keys(ST.held);
+    for (var i = 0; i < names.length; i++) ST.release(names[i]);
+    return { ok: true, released: names };
+  },
+  // Frida calls this right before the script is unloaded: pending timers die with the script, so
+  // anything still held would otherwise stay down.
+  dispose: function () {
+    try { var names = Object.keys(ST ? ST.held : {}); for (var i = 0; i < names.length; i++) ST.release(names[i]); } catch (e) {}
+  },
+
+  // --- press a DirectGUI button, IN-PROCESS ----------------------------------------------------
+  // No pointer at all. A real click ends with PGButton throwing its click event
+  // ('click-mouse1-pg123') onto Panda's global event queue, and DirectButton runs its command when
+  // the game's event manager dispatches it. This queues exactly that event, taking the name from
+  // the button itself (getClickEvent), so it is dispatched on the game's MAIN thread at its next
+  // frame -- the command never runs on this thread. One int parameter stands in for the
+  // MouseWatcherParameter a real click carries; DirectButton.commandFunc ignores it.
+  // Refuses a button that is hidden or inactive, i.e. one a player could not click either.
+  press: function (cfg) {
+    return ST.gil(function () {
+      var core = ST.core(); if (core.isNull()) return { err: 'no panda3d.core' };
+      var a2d = ST.attr(ST.builtins(), 'aspect2d'); if (a2d.isNull()) return { err: 'no aspect2d' };
+      var np = ST.callRaw(a2d, 'find', [ST.mkstr('**/' + cfg.name)]);
+      if (np.isNull() || ST.callBool(np, 'isEmpty') === true) return { err: 'no button ' + cfg.name };
+      if (ST.callBool(np, 'isHidden') === true) return { err: 'hidden' };
+      var n = ST.callRaw(np, 'node', []); if (n.isNull()) return { err: 'no node' };
+      if (ST.callBool(n, 'getActive') === false) return { err: 'inactive' };
+      var one = ST.callRaw(ST.attr(core, 'MouseButton'), 'one', []);
+      var evn = ST.callRaw(n, 'getClickEvent', [one]);
+      var name = ST.str(evn);
+      if (!name) return { err: 'no click event' };
+      var ev = ST.callRawFn(ST.attr(core, 'Event'), [evn]);
+      var par = ST.callRawFn(ST.attr(core, 'EventParameter'), [ST.mkint(0)]);
+      if (ev.isNull() || par.isNull()) return { err: 'cannot build event' };
+      if (ST.callRaw(ev, 'addParameter', [par]).isNull()) return { err: 'addParameter failed' };
+      var q = ST.callRaw(ST.attr(core, 'EventQueue'), 'getGlobalEventQueue', []);
+      if (q.isNull()) return { err: 'no event queue' };
+      if (ST.callRaw(q, 'queueEvent', [ev]).isNull()) return { err: 'queueEvent failed' };
+      return { queued: name };
+    });
   },
 
   // --- tally the classes of every live distributed object -----------------------------------
@@ -601,7 +702,7 @@ rpc.exports = {
       var maxSolids = cfg.max_solids || 128;
       var near = cfg.range !== undefined && cfg.cx !== undefined;
       var rargs = [ST.wall.render];
-      var out = { seg: [], types: {}, polys: 0, walls: 0, far: 0, calls_ms: 0 };
+      var out = { seg: [], round: [], types: {}, polys: 0, walls: 0, far: 0, calls_ms: 0 };
       var i = cfg.start;
       for (; i < cfg.total; i++) {
         if (Date.now() - t0 >= budget) break;
@@ -633,6 +734,26 @@ rpc.exports = {
           if (so.isNull()) continue;
           var tp = ST.tpname(so);
           out.types[tp] = (out.types[tp] || 0) + 1;
+          // ROUND solids (tree trunks, posts) exactly, as a capsule: axis A-B plus radius, with a
+          // sphere as the degenerate A == B. These used to be approximated by the whole node's
+          // bounding sphere, which is far fatter than what it contains.
+          var isSph = tp.indexOf('CollisionSphere') >= 0;          // not CollisionInvSphere
+          if (isSph || tp.indexOf('CollisionCapsule') >= 0 || tp.indexOf('CollisionTube') >= 0) {
+            var pa = ST.callRaw(so, isSph ? 'getCenter' : 'getPointA', []);
+            var pb = isSph ? pa : ST.callRaw(so, 'getPointB', []);
+            var rad0 = ST.callFloat(so, 'getRadius', [], null);
+            if (pa.isNull() || pb.isNull() || rad0 === null) continue;
+            var wa = ST.callRawFn(ST.wall.grp, [np, pa]);
+            var wb = isSph ? wa : ST.callRawFn(ST.wall.grp, [np, pb]);
+            if (wa.isNull() || wb.isNull()) continue;
+            var sc = ST.callFloat(np, 'getSx', rargs, null);
+            var rr = rad0 * (sc ? Math.abs(sc) : 1.0);
+            var ax = ST.callFloat(wa, 'getX', [], null), ay = ST.callFloat(wa, 'getY', [], null), az = ST.callFloat(wa, 'getZ', [], null);
+            var bx = ST.callFloat(wb, 'getX', [], null), by = ST.callFloat(wb, 'getY', [], null), bz = ST.callFloat(wb, 'getZ', [], null);
+            if (ax === null || ay === null || az === null || bx === null || by === null || bz === null) continue;
+            out.round.push(ax, ay, bx, by, Math.min(az, bz) - rr, Math.max(az, bz) + rr, rr);
+            continue;
+          }
           if (tp.indexOf('CollisionPolygon') < 0) continue;
           var npts = ST.callInt(so, 'getNumPoints') || 0;
           if (npts < 2 || npts > 64) continue;
@@ -890,7 +1011,43 @@ rpc.exports = {
         // but stashed -- so a list that ignored visibility would be mostly noise.
         var hidden = ST.callBool(np, 'isHidden');
         if (hidden === true) return;
-        var ent = { name: ST.callStr(np, 'getName'), text: null, w: null, h: null };
+        var ent = { name: ST.callStr(np, 'getName'), text: null, w: null, h: null, geom: [], active: null };
+        // What the button LOOKS like, by name. PGButton keeps its art in per-state subgraphs that
+        // are not children in the scene graph, so this reads state 0 (ready). Model node names are
+        // not vault-hashed and say what a control is -- the HUD reads 'BookIcon_CLSD',
+        // 'FriendsBox_Closed', 'ChtBx_ChtBtn_UP' -- which is how a panel's close button is told
+        // apart from its Buy button without a screenshot.
+        //
+        // The LABEL lives there too, and not always in state 0: the Picnic Games exit button (art
+        // 'CrtAtoon_Btn2_UP', Make-a-Toon's cancel) is blank when idle and reads "Cancel" only in
+        // its rollover/pressed states. So take the first non-empty text from any state.
+        var pn = ST.callRaw(np, 'node', []);
+        if (!pn.isNull()) {
+          ent.active = ST.callBool(pn, 'getActive');
+          var nsd = Math.min(ST.callInt(pn, 'getNumStateDefs') || 0, 4);
+          for (var si = 0; si < nsd; si++) {
+            var sd = ST.callRaw(pn, 'getStateDef', [ST.mkint(si)]);
+            if (sd.isNull()) continue;
+            if (si === 0) {
+              var gs = ST.callRaw(sd, 'findAllMatches', [ST.mkstr('**')]);
+              if (!gs.isNull()) {
+                ST.each(gs, function (g) {
+                  var gn = ST.callStr(g, 'getName');
+                  if (gn && gn.indexOf('state_') !== 0 && ent.geom.length < 12) ent.geom.push(gn);
+                }, 60);
+              }
+            }
+            if (ent.text) continue;
+            var st = ST.callRaw(sd, 'findAllMatches', [ST.mkstr('**/+TextNode')]);
+            if (st.isNull()) continue;
+            ST.each(st, function (tn) {
+              if (ent.text) return;
+              var nd = ST.callRaw(tn, 'node', []);
+              var s0 = nd.isNull() ? null : ST.callStr(nd, 'getText');
+              if (s0 && s0.replace(/\s/g, '').length) ent.text = s0;
+            }, 8);
+          }
+        }
         var c = ST.centerOf(np, a2d);
         if (c) { ent.x = c.x; ent.z = c.z; ent.w = c.w; ent.h = c.h; }
         else {   // no drawn geometry: fall back to the node origin
@@ -921,7 +1078,8 @@ rpc.exports = {
         }
         out.push(ent);
       }, 400);
-      return { buttons: out };
+      var base = ST.attr(bi, 'base');
+      return { buttons: out, aspect: base.isNull() ? null : ST.callFloat(base, 'getAspectRatio', [], null) };
     });
   },
 
@@ -1121,7 +1279,7 @@ def attach(verbose=True):
 
 
 def a2d_to_fraction(x, z, aspect):
-    """aspect2d coords -> client-area fractions, ready for winctl.inputs.click.
+    """aspect2d coords -> client-area fractions (0..1 from the top-left), for display.
 
     Panda's 2-D UI space has the origin at the CENTRE, x spanning [-aspect, +aspect] and z spanning
     [-1, 1] with +z up. Screen fractions run [0, 1] from the top-left, hence the flip on z.
@@ -1135,29 +1293,20 @@ def a2d_to_fraction(x, z, aspect):
     return (0.5 + x / (2.0 * aspect), 0.5 - z / 2.0)
 
 
-def game_aspect(default=16.0 / 9.0):
-    """Client width/height of the live game window, or `default` if winctl is unavailable."""
-    try:
-        from winctl import windows
-        w = windows.list_windows(cls="WinGraphicsWindow0")
-        if w and w[0].get("clientH"):
-            return float(w[0]["clientW"]) / float(w[0]["clientH"])
-    except Exception:
-        pass
-    return default
-
-
 def fetch_walls(ex, cx, cy, rng=150.0, budget_ms=30, pause=0.03, log=None):
-    """Wall segments near (cx, cy), gathered in GIL-releasing chunks. Returns (segs, stats).
+    """Wall geometry near (cx, cy), gathered in GIL-releasing chunks. Returns (segs, rounds, stats).
+
+    segs    polygon edges   (x1, y1, x2, y2, zmin, zmax)
+    rounds  spheres/capsules (x1, y1, x2, y2, zmin, zmax, radius) -- a sphere has A == B
 
     Each chunk holds the GIL for at most `budget_ms`, then this sleeps `pause` so the game runs a
     few frames before the next one. A single all-at-once pass over the scene crashed the client.
     """
     b = ex.walls_begin()
     if not b.get("ok") or (b.get("r") or {}).get("err"):
-        return [], {"err": (b.get("r") or {}).get("err") or b.get("e")}
+        return [], [], {"err": (b.get("r") or {}).get("err") or b.get("e")}
     total = (b.get("r") or {}).get("total") or 0
-    segs, types, worst, chunks, start = [], {}, 0, 0, 0
+    segs, rounds, types, worst, chunks, start = [], [], {}, 0, 0, 0
     while start < total:
         r = ex.walls_chunk({"start": start, "total": total, "budget_ms": budget_ms,
                             "cx": cx, "cy": cy, "range": rng})
@@ -1169,6 +1318,9 @@ def fetch_walls(ex, cx, cy, rng=150.0, budget_ms=30, pause=0.03, log=None):
         seg = c.get("seg") or []
         for i in range(0, len(seg), 6):
             segs.append(tuple(seg[i:i + 6]))
+        rnd = c.get("round") or []
+        for i in range(0, len(rnd), 7):
+            rounds.append(tuple(rnd[i:i + 7]))
         for k, v in (c.get("types") or {}).items():
             types[k] = types.get(k, 0) + v
         worst = max(worst, c.get("ms") or 0)
@@ -1177,7 +1329,7 @@ def fetch_walls(ex, cx, cy, rng=150.0, budget_ms=30, pause=0.03, log=None):
             break
         start = c["next"]
         time.sleep(pause)
-    return segs, {"total": total, "chunks": chunks, "worst_ms": worst, "types": types}
+    return segs, rounds, {"total": total, "chunks": chunks, "worst_ms": worst, "types": types}
 
 
 def unwrap(res, what):
@@ -1192,10 +1344,13 @@ def unwrap(res, what):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("mode", choices=["discover", "nodes", "state", "watch", "probe", "classes",
-                                     "buttons", "guitext", "collision", "gui", "walls"])
+                                     "buttons", "guitext", "collision", "gui", "walls",
+                                     "press", "key"])
     ap.add_argument("--match", action="append", default=[],
                     help="substring of the pickup class name (repeatable)")
-    ap.add_argument("--path", default="base", help="probe: dotted attribute path from builtins")
+    ap.add_argument("--path", default="base", help="probe: dotted attribute path from builtins; "
+                    "press: the button's node name; key: the key")
+    ap.add_argument("--ms", type=int, default=300, help="key: how long to hold it")
     ap.add_argument("--pattern", default="**", help="nodes: scene-graph pattern")
     ap.add_argument("--hz", type=float, default=2.0, help="watch: reads per second")
     ap.add_argument("--top", type=int, default=60, help="discover/nodes: how many rows to print")
@@ -1230,12 +1385,12 @@ def main():
         elif a.mode == "walls":
             me = ((ex.state({}).get("r") or {}).get("me")) or {}
             t0 = time.time()
-            segs, st = fetch_walls(ex, me.get("x", 0.0), me.get("y", 0.0))
+            segs, rounds, st = fetch_walls(ex, me.get("x", 0.0), me.get("y", 0.0))
             if st.get("err"):
                 raise SystemExit("worldstate: %s" % st["err"])
             print("%d collision nodes in %d chunks, %.1fs wall-clock; longest GIL hold %d ms"
                   % (st["total"], st["chunks"], time.time() - t0, st["worst_ms"]))
-            print("%d wall segments near the toon" % len(segs))
+            print("%d wall segments and %d round solids near the toon" % (len(segs), len(rounds)))
             for k, v in sorted(st["types"].items(), key=lambda kv: -kv[1]):
                 print("   %6d  %s" % (v, k))
         elif a.mode == "gui":
@@ -1273,16 +1428,30 @@ def main():
             bs = r["buttons"]
             print("%d visible DirectGUI buttons" % len(bs))
             print()
-            asp = game_aspect()
+            asp = r.get("aspect") or 16.0 / 9.0
             print("aspect %.3f" % asp)
-            print("%-30s %-24s %8s %8s   %s" % ("name", "label", "x", "z", "click at"))
+            print("%-30s %-18s %8s %8s   %-12s %s" % ("name", "label", "x", "z", "screen at", "art"))
             for b in bs:
                 f = a2d_to_fraction(b.get("x"), b.get("z"), asp)
-                print("%-30s %-24s %8s %8s   %s"
-                      % (str(b.get("name"))[:30], str(b.get("text"))[:24],
+                print("%-30s %-18s %8s %8s   %-12s %s%s"
+                      % (str(b.get("name"))[:30], " ".join(str(b.get("text")).split())[:18],
                          "-" if b.get("x") is None else "%.3f" % b["x"],
                          "-" if b.get("z") is None else "%.3f" % b["z"],
-                         "-" if f is None else "%.3f,%.3f" % f))
+                         "-" if f is None else "%.3f,%.3f" % f,
+                         " ".join(b.get("geom") or [])[:60],
+                         "" if b.get("active") is not False else "  (inactive)"))
+        elif a.mode == "press":
+            print(json.dumps(unwrap(ex.press({"name": a.path}), "press")))
+            time.sleep(0.5)                  # let the game dispatch it before we detach
+        elif a.mode == "key":
+            me0 = (unwrap(ex.state({}), "state").get("me")) or {}
+            print(json.dumps(ex.key_hold(a.path, a.ms)))
+            time.sleep(a.ms / 1000.0 + 0.4)
+            me1 = (unwrap(ex.state({}), "state").get("me")) or {}
+            if me0 and me1:
+                print("turned %+.1f deg, moved %.2f units"
+                      % (((me1["h"] - me0["h"] + 180.0) % 360.0) - 180.0,
+                         ((me1["x"] - me0["x"]) ** 2 + (me1["y"] - me0["y"]) ** 2) ** 0.5))
         elif a.mode == "probe":
             r = unwrap(ex.probe(a.path), "probe")
             if r.get("err"):
