@@ -609,6 +609,20 @@ grown walls and from a unit off the line the next corner looked hidden -- the bo
 to shuffle one unit onto the exact corner; and "stuck" counts only WALKING that fails to shorten
 the route, since turning in place to line up with a waypoint makes no progress by design.
 
+### OPEN: reader saw an empty interpreter, hung, and the game fail-fast (2026-09-28)
+
+Auto-collect hosted by the injector, bot idle in a cooldown wait: at ~16:32:2x `state()` returned
+"no builtins" -- `interp->modules` read back empty, which is what a FINALIZING interpreter looks
+like -- and the next reader call never returned (it only failed when the game died:
+"script has been destroyed"). The stop file was then ignored (the injector's shutdown blocks
+unloading the stuck script), a fresh `frida.attach` was refused ("refused to load frida-agent"),
+and at 16:34:36 the game died with 0xc0000409 (fail-fast) while attached. The game's own log has
+nothing after 16:30 and no player was at the keyboard. Unexplained. Suspects: an agent thread taking
+the GIL while the interpreter was tearing down (CPython 3.8 exits such a thread outright, which
+would kill frida's JS thread), or the recovery attach itself. Worth a guard on `_PyRuntime.finalizing`
+before every `PyGILState_Ensure`, and a timeout around the reader's RPCs so a hung script cannot
+also wedge the injector's stop path.
+
 ### Swallowed input: a turn that does not turn
 
 A wall stops walking but never stops turning on the spot. So a turn pulse that produces <25% of its
