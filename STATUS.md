@@ -521,6 +521,25 @@ Three traps, each of which made the signal useless until fixed:
 Before the mask filter the same code reported `clear_ahead = 0.0` while the toon walked freely --
 worse than no signal at all, since it would have declared the bot permanently blocked.
 
+### Cartoonival pickup cooldown (game rule, established by play-testing)
+
+Bags are hard rate limited, and it is NOT a rolling window:
+
+  * the first ~3 pickups are free, and the clock starts at the **first** of them
+  * after that it is **one pickup per ~60s**, re-armed by each success
+  * waiting longer than the cooldown banks nothing -- it stays 1/min indefinitely
+
+A bag touched while limited is not consumed; it only plays a sound and stays put. So the correct
+play, which `beanbot.py` now implements, is to walk to the next bag, STOP a few units short
+(`--standoff`), wait the timer out, and step in as it expires. Flying through during the cooldown
+achieves nothing and previously sent the bot off to another bag to fail there too -- which was most
+of what it did between pickups.
+
+`next_pickup_allowed()` encodes this; the anchor is `collect_times[0]` while exactly at the free
+limit and `collect_times[-1]` thereafter. Verified live: three quick pickups reported "next in 33s"
+(correctly counting from the first, not the third), then a hold at ~6 units, then one per minute --
+6 bags in 280s, close to the ceiling the rule allows.
+
 ### Movement is measured, not guessed — `scripts/calibrate.py`
 
 Holding a key for a set time and reading the pose delta out of memory gives, on this client:

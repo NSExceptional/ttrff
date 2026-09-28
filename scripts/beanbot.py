@@ -11,10 +11,17 @@ WHAT IT CHASES
     at full health walks straight through without collecting -- chasing it looks exactly like a
     navigation failure and wastes the whole run. --include-treasures opts back in.
 
-COLLECTION COOLDOWN
-    Bags are rate limited: past some number in a window, walking through one only plays a sound and
-    the bag stays put. That is temporary, so a bag that fails to collect goes on a SHORT retry
-    timer (--retry-after, 5s) rather than the long blacklist used for genuinely unreachable ones.
+COLLECTION COOLDOWN (measured in-game, not guessed)
+    Bags are hard rate limited, and the rule is not a rolling window:
+
+      * the first ~3 pickups are free, and the clock starts at the FIRST of them
+      * from then on it is ONE pickup per ~60s, timed from the last successful one
+      * waiting longer than the cooldown does not bank credit -- it stays 1/min
+
+    So the bot does what a player does: walk to the next bag, STOP a few units short of it, wait
+    out the timer, and step in exactly when it expires. Flying through a bag while on cooldown
+    achieves nothing (it only plays a sound) and used to send the bot wandering off to another bag
+    to fail there too, which is most of what it did between pickups.
 
 CONTROL LAW: align, then advance
     Every action is a discrete pulse -- press a key, hold it for a MEASURED duration, release.
@@ -186,6 +193,8 @@ MAX_OBSTACLE_R = 15.0       # ignore colliders larger than this: zone-scale volu
 BLOCKED_CLEARANCE = 4.0     # measured: at 1.4 the toon is stopped dead, at 3.1 it creeps,
                             # at 13+ it walks a full 10.5-unit leg
 MOVED_ENOUGH = 1.5          # units of real movement that prove a gap is passable after all
+FREE_PICKUPS = 3            # collected freely before the rate limit engages
+COOLDOWN_S = 60.0           # seconds between pickups once it has
 DETOUR_CLEAR = 20.0         # clearance that counts as a way out
 DETOUR_EXIT = 15.0          # clearance toward the target that ends a detour
 MAX_WHISKER = 60.0          # units; beyond this, nothing is "in the way" for steering purposes
@@ -253,6 +262,21 @@ def clearance(me, obstacles, offset_deg, max_range=MAX_WHISKER, max_dz=10.0):
         if abs(norm180(b - offset_deg)) <= half:
             best = min(best, d - r)
     return best
+
+
+def next_pickup_allowed(collect_times, free=FREE_PICKUPS, cooldown=COOLDOWN_S):
+    """Unix time the next pickup will succeed, given the times of previous ones.
+
+    The rule, from in-game testing: the first `free` pickups are unrestricted and the clock starts
+    at the FIRST of them; after that it is one per `cooldown`, re-armed by each success. It is NOT
+    a rolling window -- once the limit engages, earlier pickups ageing out does not buy a burst,
+    and idling longer than the cooldown banks nothing.
+    """
+    if len(collect_times) < free:
+        return 0.0                         # no restriction yet
+    # While exactly at the free limit the anchor is the FIRST pickup; after that, the latest one.
+    anchor = collect_times[0] if len(collect_times) == free else collect_times[-1]
+    return anchor + cooldown
 
 
 def local_decide(bearing, distance, blocked):
@@ -495,6 +519,7 @@ def run_collector(ex, a, should_stop=None, keys=None):
     hud_at = 0.0              # when that baseline was last refreshed
     closest = 1e9             # closest approach to the committed target, for fly-through detection
     prev_xy = None            # previous tick's position, to measure real movement
+    collect_times = []        # unix time of each successful pickup, for the cooldown model
     detour_until = 0.0        # while in the future, steer along detour_brg, not at the target
     detour_brg = 0.0
     last_pose = None          # (x, y, h) last tick, to notice a UI panel eating input
@@ -603,7 +628,12 @@ def run_collector(ex, a, should_stop=None, keys=None):
                         break
                 if cur is None:
                     picked += 1
-                    print("[bot] COLLECTED -- %d so far" % picked, flush=True)
+                    collect_times.append(time.time())
+                    nxt = next_pickup_allowed(collect_times, a.free_pickups, a.cooldown)
+                    wait_s = max(nxt - time.time(), 0.0)
+                    print("[bot] COLLECTED -- %d so far%s"
+                          % (picked, "" if wait_s <= 0 else "  (next in %.0fs)" % wait_s),
+                          flush=True)
                     committed = None
 
             # Drop targets we have already failed to reach (unreachable ledges, blocked routes).
@@ -662,6 +692,19 @@ def run_collector(ex, a, should_stop=None, keys=None):
             clear_r = clearance(me, obstacles, +45.0)
             clear_t = clearance(me, obstacles, cur["bearing"])
 
+            # COOLDOWN. Walking into a bag while rate limited only plays a sound, so close to a
+            # standoff distance and wait there rather than flying through and wandering off.
+            allowed_at = next_pickup_allowed(collect_times, a.free_pickups, a.cooldown)
+            cooling = time.time() < allowed_at
+            if cooling and cur["distance"] <= a.standoff:
+                left = allowed_at - time.time()
+                if left > 1.0:
+                    print("[bot] in position %.1f units from %s (val=%s) -- waiting %.0fs for the "
+                          "cooldown" % (cur["distance"], cur["kind"], cur["value"], left), flush=True)
+                keys.release_all()
+                time.sleep(min(left, 1.0))
+                continue
+
             # DETOUR. Aiming at the target every tick is what produced the ping-pong: the
             # target pulls toward the wall, the wall guard pushes away, and neither wins.
             # Observed wedged between a booth and a tree with the bag 25 units off at +6
@@ -705,6 +748,7 @@ def run_collector(ex, a, should_stop=None, keys=None):
                 "progress": "blocked" if blocked else "closing",
                 "clear_ahead": round(clear_a, 1),
                 "clear_toward_target": round(clear_t, 1),
+                "seconds_until_pickup_allowed": round(max(allowed_at - time.time(), 0.0), 1),
                 "moved_last_step": round(moved_last, 1),
                 "clear_left": round(clear_l, 1),
                 "clear_right": round(clear_r, 1),
@@ -791,6 +835,9 @@ def run_collector(ex, a, should_stop=None, keys=None):
                 # moving, in which case the sphere model is being pessimistic about a gap.
                 if moved_last < MOVED_ENOUGH:
                     dur = min(dur, walk_for(max(clear_a - 1.0, 1.0)))
+                if cooling:
+                    # stop short of the bag so the approach does not spend the pickup early
+                    dur = min(dur, walk_for(max(cur["distance"] - a.standoff, 0.5)))
             print("[bot] %-17s conf=%.2f via=%-11s | %s d=%.0f brg=%+.0f val=%s | clr L%.0f A%.0f R%.0f T%.0f mv%.1f | %s %.2fs stall=%.1fs"
                   % (act, conf, via, cur["kind"], cur["distance"], cur["bearing"],
                      cur["value"], clear_l, clear_a, clear_r, clear_t, moved_last,
@@ -828,7 +875,13 @@ def build_parser():
     ap.add_argument("--include-treasures", action="store_true",
                     help="also chase the valueless treasures (ice cream); off by default")
     ap.add_argument("--retry-after", type=float, default=5.0,
-                    help="seconds before re-approaching a bag that did not collect (cooldown)")
+                    help="seconds before re-approaching a bag that did not collect")
+    ap.add_argument("--cooldown", type=float, default=COOLDOWN_S,
+                    help="seconds between pickups once the rate limit engages")
+    ap.add_argument("--free-pickups", type=int, default=FREE_PICKUPS,
+                    help="pickups allowed before the rate limit engages")
+    ap.add_argument("--standoff", type=float, default=7.0,
+                    help="units to hold short of a bag while waiting out the cooldown")
     ap.add_argument("--detour-seconds", type=float, default=6.0,
                     help="how long to commit to a detour heading before re-aiming at the target")
     ap.add_argument("--obstacle-refresh", type=float, default=30.0,
