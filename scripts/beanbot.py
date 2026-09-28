@@ -469,64 +469,19 @@ class Keys(object):
                 pass
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--dry-run", action="store_true", help="decide and print; never press a key")
-    ap.add_argument("--local", action="store_true", help="arithmetic only; never call the network")
-    ap.add_argument("--timeout", type=float, default=2.0, help="per-decision network timeout (s)")
-    ap.add_argument("--stall-after", type=float, default=4.0,
-                    help="seconds of no progress before reporting blocked")
-    ap.add_argument("--give-up", type=float, default=45.0,
-                    help="seconds to chase one treasure before blacklisting it")
-    ap.add_argument("--blacklist-for", type=float, default=120.0,
-                    help="seconds an abandoned treasure stays ignored")
-    ap.add_argument("--max-height", type=float, default=12.0,
-                    help="ignore treasures more than this far above/below the toon (another level)")
-    ap.add_argument("--max-backs", type=int, default=3,
-                    help="consecutive reverses before sidestepping instead")
-    ap.add_argument("--touch", type=float, default=3.0,
-                    help="distance counted as having touched a treasure")
-    ap.add_argument("--max-walk-bearing", type=float, default=25.0,
-                    help="never walk forward when the bearing is worse than this; realign instead")
-    ap.add_argument("--include-treasures", action="store_true",
-                    help="also chase the valueless treasures (ice cream); off by default")
-    ap.add_argument("--retry-after", type=float, default=5.0,
-                    help="seconds before re-approaching a bag that did not collect (cooldown)")
-    ap.add_argument("--detour-seconds", type=float, default=6.0,
-                    help="how long to commit to a detour heading before re-aiming at the target")
-    ap.add_argument("--obstacle-refresh", type=float, default=30.0,
-                    help="seconds between re-snapshotting the static collision geometry")
-    ap.add_argument("--frozen-pulses", type=int, default=3,
-                    help="pulses with zero movement before assuming a UI panel is blocking input")
-    ap.add_argument("--stopfile", default=os.path.join(os.environ.get("TEMP", "/tmp"), "beanbot-stop"))
-    ap.add_argument("--max-seconds", type=float, default=0.0, help="stop after N seconds (0 = forever)")
-    a = ap.parse_args()
+def run_collector(ex, a, should_stop=None, keys=None):
+    """Run the collect loop until `should_stop()` or `a.max_seconds`. Returns the count.
 
-    if os.path.exists(a.stopfile):
-        os.remove(a.stopfile)
-    print("[bot] turn model: %.1f deg/s (+%.1f); stop with:  echo . > %s"
-          % (TURN_RATE, TURN_OVERHEAD, a.stopfile), file=sys.stderr)
+    Factored out of main() so the INJECTOR can host it in a thread against its own frida
+    session -- one attach serving both the mods and the bot, rather than two attaches on the
+    same process. `a` is the argparse namespace (or anything carrying the same attributes)
+    and `ex` is the worldstate RPC export object.
 
-    if not a.dry_run:
-        if not W.available():
-            raise SystemExit("beanbot: winctl not found at %s (set WINCTL_EXE)" % W.WINCTL)
-        if not W.game_window():
-            raise SystemExit("beanbot: no game window (class WinGraphicsWindow0)")
-
-    session, ex = WS.attach()
-    keys = Keys(dry=a.dry_run)
-    atexit.register(keys.release_all)
-
-    stop = {"now": False}
-
-    def _sig(_s, _f):
-        stop["now"] = True
-    for s in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(s, _sig)
-        except Exception:
-            pass
-
+    It owns no session and installs nothing, so the caller decides the lifetime: standalone
+    beanbot passes a signal flag, the injector passes its own stop check.
+    """
+    should_stop = should_stop or (lambda: False)
+    keys = keys or Keys()
     t_start = time.time()
     committed = None          # (x, y) of the target being chased, for hysteresis
     t_commit = time.time()    # when we committed to it, for the give-up timer
@@ -547,7 +502,7 @@ def main():
     picked = 0
 
     try:
-        while not stop["now"]:
+        while not should_stop():
             if os.path.exists(a.stopfile):
                 print("[bot] stop file present -- stopping", file=sys.stderr)
                 break
@@ -843,11 +798,93 @@ def main():
             keys.pulse(key, dur)
     finally:
         keys.release_all()
+    return picked
+
+
+def build_parser():
+    """The CLI surface, in one place so every default has a single definition.
+
+    `default_options()` reuses it, which is how the injector ends up with exactly the same
+    defaults as the standalone bot without a second copy of every number.
+    """
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true", help="decide and print; never press a key")
+    ap.add_argument("--local", action="store_true", help="arithmetic only; never call the network")
+    ap.add_argument("--timeout", type=float, default=2.0, help="per-decision network timeout (s)")
+    ap.add_argument("--stall-after", type=float, default=4.0,
+                    help="seconds of no progress before reporting blocked")
+    ap.add_argument("--give-up", type=float, default=45.0,
+                    help="seconds to chase one treasure before blacklisting it")
+    ap.add_argument("--blacklist-for", type=float, default=120.0,
+                    help="seconds an abandoned treasure stays ignored")
+    ap.add_argument("--max-height", type=float, default=12.0,
+                    help="ignore treasures more than this far above/below the toon (another level)")
+    ap.add_argument("--max-backs", type=int, default=3,
+                    help="consecutive reverses before sidestepping instead")
+    ap.add_argument("--touch", type=float, default=3.0,
+                    help="distance counted as having touched a treasure")
+    ap.add_argument("--max-walk-bearing", type=float, default=25.0,
+                    help="never walk forward when the bearing is worse than this; realign instead")
+    ap.add_argument("--include-treasures", action="store_true",
+                    help="also chase the valueless treasures (ice cream); off by default")
+    ap.add_argument("--retry-after", type=float, default=5.0,
+                    help="seconds before re-approaching a bag that did not collect (cooldown)")
+    ap.add_argument("--detour-seconds", type=float, default=6.0,
+                    help="how long to commit to a detour heading before re-aiming at the target")
+    ap.add_argument("--obstacle-refresh", type=float, default=30.0,
+                    help="seconds between re-snapshotting the static collision geometry")
+    ap.add_argument("--frozen-pulses", type=int, default=3,
+                    help="pulses with zero movement before assuming a UI panel is blocking input")
+    ap.add_argument("--stopfile", default=os.path.join(os.environ.get("TEMP", "/tmp"), "beanbot-stop"))
+    ap.add_argument("--max-seconds", type=float, default=0.0, help="stop after N seconds (0 = forever)")
+    return ap
+
+
+def default_options(**overrides):
+    """An options namespace carrying the CLI defaults, optionally overridden."""
+    a = build_parser().parse_args([])
+    for k, v in overrides.items():
+        setattr(a, k, v)
+    return a
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+
+    if os.path.exists(a.stopfile):
+        os.remove(a.stopfile)
+    print("[bot] turn model: %.1f deg/s (+%.1f); stop with:  echo . > %s"
+          % (TURN_RATE, TURN_OVERHEAD, a.stopfile), file=sys.stderr)
+
+    if not a.dry_run:
+        if not W.available():
+            raise SystemExit("beanbot: winctl not found at %s (set WINCTL_EXE)" % W.WINCTL)
+        if not W.game_window():
+            raise SystemExit("beanbot: no game window (class WinGraphicsWindow0)")
+
+    session, ex = WS.attach()
+    keys = Keys(dry=a.dry_run)
+    atexit.register(keys.release_all)
+
+    stop = {"now": False}
+
+    def _sig(_s, _f):
+        stop["now"] = True
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(s, _sig)
+        except Exception:
+            pass
+
+    try:
+        picked = run_collector(ex, a, should_stop=lambda: stop["now"], keys=keys)
+    finally:
         try:
             session.detach()
         except Exception:
             pass
-        print("[bot] stopped; keys released; %d treasures reached" % picked, file=sys.stderr)
+    print("[bot] stopped; keys released; %d treasures reached" % picked, file=sys.stderr)
     return 0
 
 

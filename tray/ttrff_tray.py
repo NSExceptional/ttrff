@@ -599,6 +599,71 @@ def _patch_pystray_win32_hicon():
     _win32mod.Icon._assert_icon_handle = _assert_icon_handle
 
 
+# ---- auto-collect control ---------------------------------------------------------------------
+# The bag collector runs INSIDE the injector, on the frida session already open for the mods, so
+# there is one attach for both. The tray steers it through a file holding a unix DEADLINE (or
+# "inf"): writing a later timestamp extends a run with no restart and no lost progress, and
+# deleting the file stops it. Deliberately the same shape as the stop file used everywhere else.
+#
+# This duplicates three lines from frida/trampoline_inject.py rather than importing it, so the
+# tray keeps depending on nothing from the injector but the path convention (and TTRFF_AUTOCOLLECT_FILE
+# overrides both).
+def autocollect_file():
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.environ.get("TTRFF_AUTOCOLLECT_FILE", os.path.join(base, "ttrff", "autocollect"))
+
+
+def autocollect_remaining():
+    """Seconds of collecting left: None when off, float('inf') when unlimited."""
+    try:
+        txt = open(autocollect_file()).read().strip()
+    except Exception:
+        return None
+    if not txt:
+        return None
+    if txt.lower() in ("inf", "forever"):
+        return float("inf")
+    try:
+        left = float(txt) - time.time()
+    except ValueError:
+        return None
+    return left if left > 0 else None
+
+
+def autocollect_set(seconds):
+    """Collect for `seconds` from now; None stops it. `float('inf')` means no limit."""
+    path = autocollect_file()
+    try:
+        if seconds is None:
+            if os.path.exists(path):
+                os.remove(path)
+            return True
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("inf" if seconds == float("inf") else "%.0f" % (time.time() + seconds))
+        return True
+    except Exception:
+        return False
+
+
+def autocollect_add(seconds):
+    """Extend a run, or start one if it is not running."""
+    left = autocollect_remaining()
+    if left == float("inf"):
+        return True
+    return autocollect_set((left or 0.0) + seconds)
+
+
+def fmt_remaining(left):
+    if left is None:
+        return "off"
+    if left == float("inf"):
+        return "no limit"
+    m, sec = divmod(int(left), 60)
+    h, m = divmod(m, 60)
+    return "%d:%02d:%02d" % (h, m, sec) if h else "%d:%02d" % (m, sec)
+
+
 class TrayApp:
     def __init__(self):
         self.sup = Supervisor(on_change=self._refresh)
@@ -606,7 +671,35 @@ class TrayApp:
 
     # ---- menu model ----
     def _status_line(self):
-        return "ttrff — " + STATUS_TEXT.get(self.sup.status, self.sup.status)
+        base = "ttrff — " + STATUS_TEXT.get(self.sup.status, self.sup.status)
+        left = autocollect_remaining()
+        # The tooltip is the ONLY place a countdown can appear live: pystray re-renders menu text
+        # just once, when the menu is opened. _refresh() already pushes this into icon.title on a
+        # timer, so hovering the tray icon shows a ticking clock.
+        return base if left is None else "%s · collecting %s" % (base, fmt_remaining(left))
+
+    def _collect_line(self):
+        left = autocollect_remaining()
+        return "Auto-collect: off" if left is None else "Auto-collect: %s left" % fmt_remaining(left)
+
+    def _collect_start(self, seconds):
+        def handler(icon, item):
+            autocollect_set(seconds)
+            self._refresh()
+        return handler
+
+    def _collect_add(self, seconds):
+        def handler(icon, item):
+            autocollect_add(seconds)
+            self._refresh()
+        return handler
+
+    def _collect_stop(self, icon, item):
+        autocollect_set(None)
+        self._refresh()
+
+    def _collecting(self):
+        return autocollect_remaining() is not None
 
     def _group_checked(self, group):
         try:
@@ -656,7 +749,24 @@ class TrayApp:
         for key, label in GROUPS:
             items.append(MenuItem(label, self._toggle_group(key),
                                   checked=(lambda item, k=key: self._group_checked(k))))
+        collect = Menu(
+            MenuItem("Start 30 minutes", self._collect_start(30 * 60)),
+            MenuItem("Start 1 hour", self._collect_start(60 * 60)),
+            MenuItem("Start 2 hours", self._collect_start(2 * 60 * 60)),
+            MenuItem("Start with no limit", self._collect_start(float("inf"))),
+            Menu.SEPARATOR,
+            MenuItem("+30 minutes", self._collect_add(30 * 60),
+                     enabled=lambda item: self._collecting()),
+            MenuItem("+1 hour", self._collect_add(60 * 60),
+                     enabled=lambda item: self._collecting()),
+            MenuItem("Stop auto-collect", self._collect_stop,
+                     enabled=lambda item: self._collecting()),
+        )
         items += [
+            Menu.SEPARATOR,
+            # Exact whenever the menu is opened; the live countdown is in the tooltip.
+            MenuItem(lambda item: self._collect_line(), None, enabled=False),
+            MenuItem("Auto-collect", collect),
             Menu.SEPARATOR,
             MenuItem("Re-apply config now", self._reapply),
             MenuItem("Open modset.json…", self._open_config),

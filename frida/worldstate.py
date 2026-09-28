@@ -878,6 +878,42 @@ rpc.exports = {
 """
 
 
+def make_exports(session, verbose=False):
+    """Create the read-only script on an EXISTING session. Returns (exports, script).
+
+    Split out of attach() so the INJECTOR can share its own session rather than opening a second
+    one on the same process: frida allows several scripts per session, so the mods and this
+    read-only reader cost exactly one attach between them. Fewer attaches is the point -- the
+    client uploads a Sentry minidump naming frida-agent if it ever crashes while attached.
+    """
+    syms = TI.load_symbols()
+    need = ["PyObject_Call", "PyObject_GetAttrString", "PyDict_GetItemString", "PyTuple_New",
+            "PyTuple_SetItem", "PyGILState_Ensure", "PyGILState_Release"]
+    missing = [n for n in need if n not in syms]
+    if missing:
+        raise SystemExit("worldstate: per-build table is missing %s -- see STATUS.md"
+                         % ", ".join(missing))
+    script = session.create_script(JS)
+    script.load()
+    ex = script.exports_sync
+    init = ex.init({
+        "image_base": hex(TI.IMAGE_BASE),
+        "syms": {k: {"vmaddr": hex(v["vmaddr"])} for k, v in syms.items()},
+        "tstate_cell": TI.TSTATE_CELL,
+        "interp_off": TI.INTERP_OFF, "modules_off": TI.MODULES_OFF,
+        "float_type": TI.FLOAT_TYPE,
+        "py_true": TRUE_OBJ, "py_false": FALSE_OBJ,
+    })
+    if not init.get("ok"):
+        raise SystemExit("worldstate: init failed: %s" % init.get("notes"))
+    if verbose:
+        print("[ws] read-only script loaded, slide %s" % init.get("slide"), file=sys.stderr)
+    # Returns the script too so the caller can unload this BEFORE reverting and detaching. Leaving
+    # two scripts to be torn down together by detach is an untested interleaving, and the
+    # injector's revert path is the one thing in this repo that must never be disturbed.
+    return ex, script
+
+
 def attach(verbose=True):
     """Attach read-only and return (session, exports). Raises on failure."""
     import frida
@@ -892,22 +928,9 @@ def attach(verbose=True):
     pids = TI.find_engine_pids()
     pid = pids[0]
     session = __import__("frida").get_local_device().attach(pid)
-    script = session.create_script(JS)
-    script.load()
-    ex = script.exports_sync
-    init = ex.init({
-        "image_base": hex(TI.IMAGE_BASE),
-        "syms": {k: {"vmaddr": hex(v["vmaddr"])} for k, v in syms.items()},
-        "tstate_cell": TI.TSTATE_CELL,
-        "interp_off": TI.INTERP_OFF, "modules_off": TI.MODULES_OFF,
-        "float_type": TI.FLOAT_TYPE,
-        "py_true": TRUE_OBJ, "py_false": FALSE_OBJ,
-    })
-    if not init.get("ok"):
-        session.detach()
-        raise SystemExit("worldstate: init failed: %s" % init.get("notes"))
+    ex, _script = make_exports(session, verbose=False)
     if verbose:
-        print("[ws] attached pid %d, slide %s" % (pid, init.get("slide")), file=sys.stderr)
+        print("[ws] attached pid %d" % pid, file=sys.stderr)
     return session, ex
 
 

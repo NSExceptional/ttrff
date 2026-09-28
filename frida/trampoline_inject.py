@@ -30,6 +30,8 @@ import json
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -1770,6 +1772,11 @@ def find_engine_pids():
             raise RuntimeError("no engine process found via tasklist for names: %s"
                                % ",".join(ENGINE_NEEDLES))
         return sorted(set(pids))
+    # Match on the executable NAME/PATH, never the command line. Matching the cmdline meant any
+    # process that merely MENTIONS the engine matched -- a `tasklist | grep TTREngine64`, a script
+    # with the name in its arguments, this repo's own tooling. Worse, callers take pids[0], so a
+    # low-pid shell beat the real game and the injector attached to bash.exe: every symbol then
+    # failed verification and it aborted, which looked like a stale per-build table.
     pids = []
     for p in psutil.process_iter(["name", "exe", "cmdline"]):
         try:
@@ -1777,7 +1784,6 @@ def find_engine_pids():
             hay = " ".join(filter(None, [
                 info.get("name") or "",
                 info.get("exe") or "",
-                " ".join(info.get("cmdline") or []),
             ])).lower()
         except Exception:
             continue
@@ -1811,6 +1817,110 @@ def clear_stopfile(stopfile):
             os.remove(stopfile)
     except Exception:
         pass
+
+
+# ---- auto-collect (bag bot) -------------------------------------------------------------------
+# Runs IN THIS PROCESS, on the session already opened for the mods. frida allows several scripts
+# per session, so the read-only world-state reader costs no extra attach -- which is the point,
+# since the client uploads a Sentry minidump naming frida-agent if it ever crashes while attached.
+#
+# The tray controls it through a file holding a unix DEADLINE (or "inf"). A file rather than a
+# flag because it makes "+30 minutes" a one-line rewrite with no restart and no lost progress,
+# and it matches the stop-file convention used everywhere else here.
+#
+# The whole thing is fenced: it never touches the install/revert path, and every exception is
+# swallowed and retried. The worst case is that collecting stops while the mods keep running.
+def autocollect_file():
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.environ.get("TTRFF_AUTOCOLLECT_FILE", os.path.join(base, "ttrff", "autocollect"))
+
+
+def autocollect_deadline():
+    """Unix timestamp collecting should run until, or None if it should not run."""
+    try:
+        txt = open(autocollect_file()).read().strip()
+    except Exception:
+        return None
+    if not txt:
+        return None
+    if txt.lower() in ("inf", "forever"):
+        return float("inf")
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
+def autocollect_active():
+    dl = autocollect_deadline()
+    return dl is not None and time.time() < dl
+
+
+def start_autocollect(session, stop, log=print):
+    """Start the collector thread. Returns the thread, or None if it could not be set up."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    scripts = os.path.join(os.path.dirname(here), "scripts")
+    for d in (here, scripts):
+        if d not in sys.path:
+            sys.path.insert(0, d)
+    try:
+        import worldstate as WS          # deferred: worldstate imports THIS module
+        import beanbot
+    except Exception as e:
+        log("[autocollect] unavailable (%r) -- mods unaffected" % (e,))
+        return None
+
+    state = {"ex": None, "script": None, "collected": 0}
+
+    def _loop():
+        while not stop["stop"]:
+            try:
+                if not autocollect_active():
+                    time.sleep(2.0)
+                    continue
+                if state["ex"] is None:
+                    state["ex"], state["script"] = WS.make_exports(session)
+                    log("[autocollect] world-state reader loaded on the mod session")
+                dl = autocollect_deadline()
+                log("[autocollect] collecting until %s"
+                    % ("no limit" if dl == float("inf")
+                       else time.strftime("%H:%M:%S", time.localtime(dl))))
+                opts = beanbot.default_options(max_seconds=0, stopfile="")
+                n = beanbot.run_collector(
+                    state["ex"], opts,
+                    should_stop=lambda: stop["stop"] or not autocollect_active())
+                state["collected"] += n or 0
+                log("[autocollect] paused; %d collected this session" % state["collected"])
+            except Exception as e:
+                log("[autocollect] error: %r -- retrying in 10s (mods unaffected)" % (e,))
+                state["ex"] = None
+                time.sleep(10.0)
+
+    def shutdown(timeout=8.0):
+        """Stop collecting and unload the reader BEFORE the mods are reverted.
+
+        Ordering matters: the injector's revert/detach is the one path that must stay exactly as
+        proven, so the extra script is taken down first rather than left for detach to tear down
+        alongside the trampolines.
+        """
+        try:
+            t.join(timeout)
+        except Exception:
+            pass
+        sc = state.get("script")
+        if sc is not None:
+            try:
+                sc.unload()
+                log("[autocollect] reader unloaded")
+            except Exception as e:
+                log("[autocollect] reader unload failed: %r" % (e,))
+            state["script"] = None
+            state["ex"] = None
+
+    t = threading.Thread(target=_loop, name="autocollect", daemon=True)
+    t.start()
+    t.shutdown = shutdown
+    return t
 
 
 def make_stop_state():
@@ -2279,6 +2389,11 @@ def main():
         print("[tramp-live] (stop file: %s)" % stopfile)
     else:
         print("[tramp-live] %s. Polling %gs (or stop early with scripts/tt-mod-stop)..." % (trigger_hint, poll_s))
+    # Auto-collect shares this session; it is a no-op until the tray asks for it.
+    collector = None
+    if os.environ.get("TTRMOD_AUTOCOLLECT", "1") != "0":
+        collector = start_autocollect(session, stop)
+
     try:
         reason = wait_for_stop(box, stop, stopfile, persist, poll_s, fires_fn=ex.fires)
     except KeyboardInterrupt:
@@ -2286,6 +2401,14 @@ def main():
         reason = "Ctrl+C"
         print("\n[tramp-live] Ctrl+C — stopping (unreliable on this runner; prefer scripts/tt-mod-stop). "
               "Reverting and detaching cleanly...")
+    # Take the collector down FIRST, so the revert below runs on a session carrying only the
+    # mod script -- exactly the configuration that path was proven against.
+    if collector is not None and hasattr(collector, "shutdown"):
+        try:
+            collector.shutdown()
+        except Exception as e:
+            print("[tramp-live] autocollect shutdown failed: %r (continuing to revert)" % (e,))
+
     if reason in ("stop-file", "SIGTERM"):
         print("[tramp-live] stop requested via %s — reverting mods and detaching cleanly..." % reason)
     elif reason == "detached":
