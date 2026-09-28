@@ -77,6 +77,11 @@ rpc.exports = {
       if (F['PyGILState_Release'])    ST.GilRelease = new NativeFunction(F['PyGILState_Release'],    'void',    ['int']);
       if (F['PyUnicode_FromString'])  ST.UniFromStr = new NativeFunction(F['PyUnicode_FromString'],  'pointer', ['pointer']);
       if (F['PyTuple_GetItem'])       ST.TupleGet   = new NativeFunction(F['PyTuple_GetItem'],       'pointer', ['pointer','long']);
+      // Needed by mkint() and therefore by every call taking an int argument (getSolid(i),
+      // getPoint(j), movePointer). It was never bound here, so mkint() returned NULL and those
+      // calls received a NULL argument -- which crashed the client twice, and made movePointer
+      // silently fail so every "Panda-placed" click fell back to a focus-stealing raw click.
+      if (F['PyFloat_FromDouble'])    ST.FloatFromDouble = new NativeFunction(F['PyFloat_FromDouble'], 'pointer', ['double']);
       if (!ST.GilEnsure || !ST.GilRelease) { out.notes.push('no GIL symbols -- cannot run safely'); return out; }
       if (!ST.GetIter || !ST.IterNext)     { out.notes.push('no GetIter/IterNext -- iteration disabled'); }
 
@@ -179,6 +184,9 @@ rpc.exports = {
             m = ST.attr(o, name);
             if (m.isNull()) return null;
             if (cacheKey) { ST.mcache[cacheKey] = m; ST.keep.push(m); }
+          }
+          for (var q = 0; args && q < args.length; q++) {
+            if (!args[q] || args[q].isNull()) return null;       // see callRawFn: NULL args crash
           }
           var t = ST.TupleNew(args ? args.length : 0);
           if (t.isNull()) { ST.clearExc(); return null; }
@@ -367,6 +375,29 @@ rpc.exports = {
           return true;
         } catch (e) { ST.clearExc(); return false; }
       };
+      // Call a bound method / callable with PyObject args, returning the raw result (or NULL).
+      // Args are increfed because PyTuple_SetItem steals a reference.
+      ST.callRawFn = function (m, args) {
+        try {
+          if (!m || m.isNull()) return ptr(0);
+          // NEVER hand Python a NULL argument: the callee dereferences it and the whole client
+          // dies natively, with no exception and no traceback. Refuse the call instead.
+          for (var q = 0; args && q < args.length; q++) {
+            if (!args[q] || args[q].isNull()) return ptr(0);
+          }
+          var t = ST.TupleNew(args ? args.length : 0);
+          if (t.isNull()) { ST.clearExc(); return ptr(0); }
+          for (var i = 0; args && i < args.length; i++) ST.TupleSet(t, i, ST.incref(args[i]));
+          var r = ST.Call(m, t, ptr(0));
+          if (r.isNull()) { ST.clearExc(); return ptr(0); }
+          return r;
+        } catch (e) { ST.clearExc(); return ptr(0); }
+      };
+      ST.callRaw = function (o, name, args) {
+        var m = ST.attr(o, name);
+        if (m.isNull()) return ptr(0);
+        return ST.callRawFn(m, args);
+      };
       // obj.<name>() -> int, or null. getWord()/getNumSolids() return Python ints, and callFloat
       // rejects those (it type-checks against PyFloat_Type), which is why every collide mask came
       // back None on the first attempt.
@@ -476,6 +507,161 @@ rpc.exports = {
         out.push(ent);
       }, 500);
       return { found: out.length, items: out };
+    });
+  },
+
+  // --- step-limited probe of the wall-extraction calls -------------------------------------------
+  // The polygon scan crashed the client twice, once even with a 10 ms budget, so it is a specific
+  // call rather than GIL hold time. This runs the pipeline on ONE wall node and stops after
+  // `upto` steps; the host calls upto=1,2,3,... as SEPARATE RPCs, so a crash at step N means
+  // steps < N are proven safe and step N is the culprit -- one crash to find it, not a series.
+  // The node is found with ST.each (proven safe thousands of times), not getPath(i).
+  wallProbe: function (upto) {
+    return ST.gil(function () {
+      var bi = ST.builtins();
+      var render = ST.attr(bi, 'render');
+      var fam = ST.attr(render, 'findAllMatches');
+      var col = ST.callRawFn(fam, [ST.mkstr('**/+CollisionNode')]);
+      if (col.isNull()) return { err: 'findAllMatches failed' };
+      var found = null;
+      ST.each(col, function (np) {
+        if (found) return;
+        var nm = ST.callStr(np, 'getName') || '';
+        if (nm.indexOf('GW.') === 0 || nm.indexOf('distAvatar') === 0 || nm.indexOf('shadowPlacer') >= 0) return;
+        var cn = ST.callRaw(np, 'node', []);
+        if (cn.isNull()) return;
+        var bm = ST.callRaw(cn, 'getIntoCollideMask', []);
+        var mask = bm.isNull() ? null : ST.callInt(bm, 'getWord');
+        if (mask === null || !(mask & 1)) return;
+        if ((ST.callInt(cn, 'getNumSolids') || 0) < 1) return;
+        found = { np: np, cn: cn, name: nm };
+      }, 3000);
+      if (!found) return { err: 'no wall node with solids' };
+      var out = { node: found.name, reached: 0 };
+      // step 1: getSolid(0)
+      var so = ST.callRaw(found.cn, 'getSolid', [ST.mkint(0)]);
+      out.reached = 1; out.solid_ok = !so.isNull(); out.type = so.isNull() ? null : ST.tpname(so);
+      if (upto <= 1 || so.isNull()) return out;
+      // step 2: getNumPoints()
+      out.npts = ST.callInt(so, 'getNumPoints');
+      out.reached = 2;
+      if (upto <= 2) return out;
+      // step 3: getPoint(0)
+      var lp = ST.callRaw(so, 'getPoint', [ST.mkint(0)]);
+      out.reached = 3; out.point_ok = !lp.isNull();
+      if (!lp.isNull()) out.local = [ST.callFloat(lp, 'getX', [], null), ST.callFloat(lp, 'getY', [], null)];
+      if (upto <= 3 || lp.isNull()) return out;
+      // step 4: render.getRelativePoint(np, point)
+      var grp = ST.attr(render, 'getRelativePoint');
+      var wp = ST.callRawFn(grp, [found.np, lp]);
+      out.reached = 4; out.world_ok = !wp.isNull();
+      if (!wp.isNull()) out.world = [ST.callFloat(wp, 'getX', [], null), ST.callFloat(wp, 'getY', [], null)];
+      return out;
+    });
+  },
+
+  // --- wall POLYGONS as world-space 2D segments ------------------------------------------------
+  // The sphere model cannot represent a long wall: a bounding sphere around a tunnel side or the
+  // play-area edge is enormous, so those were filtered out entirely and the bot walked into them.
+  // This reads the actual CollisionPolygon vertices of every wall-mask (0x1) node, moves them into
+  // world space with render.getRelativePoint(node, point) -- the Point3 returned by getPoint() is
+  // passed straight through, so nothing has to be constructed -- and emits each edge as a 2D
+  // segment tagged with the polygon's z-range, so the host keeps only walls at toon height.
+  //
+  // CHUNKED, BY TIME. The first version walked all ~950 collision nodes in ONE call while holding
+  // the GIL, so the game could not run a single frame until it finished -- and it crashed the
+  // client mid-scan. Now wallsBegin() caches the node collection, and each wallsChunk() processes
+  // nodes only until its time budget is spent, then returns a cursor. The host sleeps between
+  // chunks, so the game keeps rendering and servicing its connection throughout.
+  wallsBegin: function () {
+    return ST.gil(function () {
+      var bi = ST.builtins();
+      if (bi.isNull()) return { err: 'no builtins' };
+      var render = ST.attr(bi, 'render');
+      if (render.isNull()) return { err: 'no render' };
+      var fam = ST.attr(render, 'findAllMatches');
+      var pat = ST.mkstr('**/+CollisionNode');
+      if (fam.isNull() || pat.isNull()) return { err: 'cannot search' };
+      var col = ST.callRawFn(fam, [pat]);
+      if (col.isNull()) return { err: 'findAllMatches failed' };
+      var grp = ST.attr(render, 'getRelativePoint');
+      if (grp.isNull()) return { err: 'no getRelativePoint' };
+      ST.keep.push(col); ST.keep.push(grp);
+      ST.wall = { col: col, render: render, grp: grp };
+      return { total: ST.callInt(col, 'getNumPaths') };
+    });
+  },
+
+  // cfg: {start, total, budget_ms, cx, cy, range, max_solids}
+  wallsChunk: function (cfg) {
+    return ST.gil(function () {
+      if (!ST.wall) return { err: 'wallsBegin first' };
+      var t0 = Date.now();
+      var budget = cfg.budget_ms || 30;
+      var maxSolids = cfg.max_solids || 128;
+      var near = cfg.range !== undefined && cfg.cx !== undefined;
+      var rargs = [ST.wall.render];
+      var out = { seg: [], types: {}, polys: 0, walls: 0, far: 0, calls_ms: 0 };
+      var i = cfg.start;
+      for (; i < cfg.total; i++) {
+        if (Date.now() - t0 >= budget) break;
+        var np = ST.callRaw(ST.wall.col, 'getPath', [ST.mkint(i)]);
+        if (np.isNull()) continue;
+        var nm = ST.callStr(np, 'getName') || '';
+        if (nm.indexOf('distAvatarCollNode') === 0 || nm.indexOf('shadowPlacerRay') >= 0 ||
+            nm.indexOf('cloudSphere') === 0 || nm.indexOf('treasureSphere') === 0 ||
+            nm.indexOf('GW.') === 0 || nm.indexOf('ccLineNode') === 0) continue;
+        if (near) {
+          // cull on the bounding sphere BEFORE touching any vertex -- the cheap test first
+          var bv = ST.callRaw(np, 'getBounds', []);
+          var rad = bv.isNull() ? null : ST.callFloat(bv, 'getRadius', [], null);
+          var nx = ST.callFloat(np, 'getX', rargs, null), ny = ST.callFloat(np, 'getY', rargs, null);
+          if (rad !== null && nx !== null && ny !== null) {
+            var dx0 = nx - cfg.cx, dy0 = ny - cfg.cy;
+            if (Math.sqrt(dx0 * dx0 + dy0 * dy0) - rad > cfg.range) { out.far++; continue; }
+          }
+        }
+        var cn = ST.callRaw(np, 'node', []);
+        if (cn.isNull()) continue;
+        var bm = ST.callRaw(cn, 'getIntoCollideMask', []);
+        var mask = bm.isNull() ? null : ST.callInt(bm, 'getWord');
+        if (mask === null || !(mask & 1)) continue;
+        out.walls++;
+        var ns = ST.callInt(cn, 'getNumSolids') || 0;
+        for (var si = 0; si < ns && si < maxSolids; si++) {
+          var so = ST.callRaw(cn, 'getSolid', [ST.mkint(si)]);
+          if (so.isNull()) continue;
+          var tp = ST.tpname(so);
+          out.types[tp] = (out.types[tp] || 0) + 1;
+          if (tp.indexOf('CollisionPolygon') < 0) continue;
+          var npts = ST.callInt(so, 'getNumPoints') || 0;
+          if (npts < 2 || npts > 64) continue;
+          var P = [];
+          for (var j = 0; j < npts; j++) {
+            var lp = ST.callRaw(so, 'getPoint', [ST.mkint(j)]);
+            if (lp.isNull()) { P = null; break; }
+            var wp = ST.callRawFn(ST.wall.grp, [np, lp]);
+            if (wp.isNull()) { P = null; break; }
+            var x = ST.callFloat(wp, 'getX', [], null), y = ST.callFloat(wp, 'getY', [], null);
+            var z = ST.callFloat(wp, 'getZ', [], null);
+            if (x === null || y === null || z === null) { P = null; break; }
+            P.push([x, y, z]);
+          }
+          if (!P) continue;
+          out.polys++;
+          var zmin = 1e9, zmax = -1e9;
+          for (var k = 0; k < P.length; k++) { if (P[k][2] < zmin) zmin = P[k][2]; if (P[k][2] > zmax) zmax = P[k][2]; }
+          for (var k2 = 0; k2 < P.length; k2++) {
+            var a = P[k2], bb = P[(k2 + 1) % P.length];
+            var ex = bb[0] - a[0], ey = bb[1] - a[1];
+            if (ex * ex + ey * ey < 0.01) continue;      // vertical edge: no footprint
+            out.seg.push(a[0], a[1], bb[0], bb[1], zmin, zmax);
+          }
+        }
+      }
+      out.next = i;
+      out.ms = Date.now() - t0;
+      return out;
     });
   },
 
@@ -961,6 +1147,39 @@ def game_aspect(default=16.0 / 9.0):
     return default
 
 
+def fetch_walls(ex, cx, cy, rng=150.0, budget_ms=30, pause=0.03, log=None):
+    """Wall segments near (cx, cy), gathered in GIL-releasing chunks. Returns (segs, stats).
+
+    Each chunk holds the GIL for at most `budget_ms`, then this sleeps `pause` so the game runs a
+    few frames before the next one. A single all-at-once pass over the scene crashed the client.
+    """
+    b = ex.walls_begin()
+    if not b.get("ok") or (b.get("r") or {}).get("err"):
+        return [], {"err": (b.get("r") or {}).get("err") or b.get("e")}
+    total = (b.get("r") or {}).get("total") or 0
+    segs, types, worst, chunks, start = [], {}, 0, 0, 0
+    while start < total:
+        r = ex.walls_chunk({"start": start, "total": total, "budget_ms": budget_ms,
+                            "cx": cx, "cy": cy, "range": rng})
+        if not r.get("ok"):
+            break
+        c = r.get("r") or {}
+        if c.get("err"):
+            break
+        seg = c.get("seg") or []
+        for i in range(0, len(seg), 6):
+            segs.append(tuple(seg[i:i + 6]))
+        for k, v in (c.get("types") or {}).items():
+            types[k] = types.get(k, 0) + v
+        worst = max(worst, c.get("ms") or 0)
+        chunks += 1
+        if c.get("next", start) <= start:     # no progress: bail rather than spin
+            break
+        start = c["next"]
+        time.sleep(pause)
+    return segs, {"total": total, "chunks": chunks, "worst_ms": worst, "types": types}
+
+
 def unwrap(res, what):
     """frida gives back {ok, r} / {ok:false, e}; flatten it or die with the reason."""
     if not isinstance(res, dict):
@@ -973,7 +1192,7 @@ def unwrap(res, what):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("mode", choices=["discover", "nodes", "state", "watch", "probe", "classes",
-                                     "buttons", "guitext", "collision", "gui"])
+                                     "buttons", "guitext", "collision", "gui", "walls"])
     ap.add_argument("--match", action="append", default=[],
                     help="substring of the pickup class name (repeatable)")
     ap.add_argument("--path", default="base", help="probe: dotted attribute path from builtins")
@@ -1008,6 +1227,17 @@ def main():
             print("%-40s %7s %9s" % ("collider kind", "count", "max r"))
             for k, v in sorted((r.get("tally") or {}).items(), key=lambda kv: -kv[1]["n"])[:30]:
                 print("  %-38s %7d %9.1f" % (k[:38], v["n"], v["rmax"]))
+        elif a.mode == "walls":
+            me = ((ex.state({}).get("r") or {}).get("me")) or {}
+            t0 = time.time()
+            segs, st = fetch_walls(ex, me.get("x", 0.0), me.get("y", 0.0))
+            if st.get("err"):
+                raise SystemExit("worldstate: %s" % st["err"])
+            print("%d collision nodes in %d chunks, %.1fs wall-clock; longest GIL hold %d ms"
+                  % (st["total"], st["chunks"], time.time() - t0, st["worst_ms"]))
+            print("%d wall segments near the toon" % len(segs))
+            for k, v in sorted(st["types"].items(), key=lambda kv: -kv[1]):
+                print("   %6d  %s" % (v, k))
         elif a.mode == "gui":
             r = unwrap(ex.guiregistry(a.path if a.path != "base" else None), "gui")
             if r.get("err"):
