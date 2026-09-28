@@ -185,6 +185,9 @@ MAX_OBSTACLE_R = 15.0       # ignore colliders larger than this: zone-scale volu
                             # things you steer around
 BLOCKED_CLEARANCE = 4.0     # measured: at 1.4 the toon is stopped dead, at 3.1 it creeps,
                             # at 13+ it walks a full 10.5-unit leg
+MOVED_ENOUGH = 1.5          # units of real movement that prove a gap is passable after all
+DETOUR_CLEAR = 20.0         # clearance that counts as a way out
+DETOUR_EXIT = 15.0          # clearance toward the target that ends a detour
 MAX_WHISKER = 60.0          # units; beyond this, nothing is "in the way" for steering purposes
 
 
@@ -459,6 +462,8 @@ def main():
                     help="also chase the valueless treasures (ice cream); off by default")
     ap.add_argument("--retry-after", type=float, default=5.0,
                     help="seconds before re-approaching a bag that did not collect (cooldown)")
+    ap.add_argument("--detour-seconds", type=float, default=6.0,
+                    help="how long to commit to a detour heading before re-aiming at the target")
     ap.add_argument("--obstacle-refresh", type=float, default=30.0,
                     help="seconds between re-snapshotting the static collision geometry")
     ap.add_argument("--frozen-pulses", type=int, default=3,
@@ -504,6 +509,9 @@ def main():
     hud_names = set()         # DirectGUI buttons present while moving freely = the permanent HUD
     hud_at = 0.0              # when that baseline was last refreshed
     closest = 1e9             # closest approach to the committed target, for fly-through detection
+    prev_xy = None            # previous tick's position, to measure real movement
+    detour_until = 0.0        # while in the future, steer along detour_brg, not at the target
+    detour_brg = 0.0
     last_pose = None          # (x, y, h) last tick, to notice a UI panel eating input
     frozen = 0                # consecutive pulses with no movement at all
     picked = 0
@@ -544,6 +552,9 @@ def main():
             # at -106. Heading alone is not enough to detect it, since a turn leaves position
             # unchanged by design; it is the pair being frozen that means input is going nowhere.
             # Escape does NOT close these panels (verified against the live shop); the red X does.
+            moved_last = (math.hypot(me["x"] - prev_xy[0], me["y"] - prev_xy[1])
+                          if prev_xy else 0.0)
+            prev_xy = (me["x"], me["y"])
             pose_now = (round(me["x"], 1), round(me["y"], 1), round(me["h"], 1))
             frozen = frozen + 1 if pose_now == last_pose else 0
             last_pose = pose_now
@@ -664,6 +675,40 @@ def main():
             clear_a = clearance(me, obstacles, 0.0)
             clear_l = clearance(me, obstacles, -45.0)
             clear_r = clearance(me, obstacles, +45.0)
+            clear_t = clearance(me, obstacles, cur["bearing"])
+
+            # DETOUR. Aiming at the target every tick is what produced the ping-pong: the
+            # target pulls toward the wall, the wall guard pushes away, and neither wins.
+            # Observed wedged between a booth and a tree with the bag 25 units off at +6
+            # degrees and 0.7 clearance across the entire front arc. The fix is ordinary
+            # wall-following: COMMIT to an open heading for a few seconds and ignore the
+            # target while doing it, rather than re-deciding from scratch every tick.
+            if now < detour_until:
+                if clear_t > DETOUR_EXIT:
+                    detour_until = 0.0
+                    print("[bot] detour done -- line to target is clear", flush=True)
+            elif clear_t < BLOCKED_CLEARANCE and stalled > a.stall_after * 0.5:
+                best = None
+                for off in (45.0, -45.0, 90.0, -90.0, 135.0, -135.0):
+                    c = clearance(me, obstacles, off)
+                    if c > DETOUR_CLEAR and (best is None or abs(off) < abs(best[0])):
+                        best = (off, c)
+                if best:
+                    # Store the detour as an ABSOLUTE world heading, not a relative offset. Holding
+                    # it relative meant re-applying "45 degrees right" every tick: the toon turned,
+                    # the offset stayed 45, and it spun a full circle without ever walking
+                    # (observed: +29 +58 +88 +117 +148 +178 -152, mv0.0 throughout). Panda heading
+                    # increases to the LEFT while these bearings are positive to the RIGHT, hence
+                    # the subtraction.
+                    detour_brg = me["h"] - best[0]
+                    detour_until = now + a.detour_seconds
+                    print("[bot] blocked toward target (clr %.1f) -- detouring %+.0f deg for %.0fs"
+                          % (clear_t, best[0], a.detour_seconds), flush=True)
+
+            # Relative bearing to the detour heading: it shrinks to 0 as the toon comes round to
+            # face it, so the controller stops turning and starts walking -- which is the whole
+            # point of committing to a heading.
+            steer_brg = (norm180(me["h"] - detour_brg) if now < detour_until else cur["bearing"])
 
             payload = {
                 "target": {"bearing": cur["bearing"], "distance": cur["distance"],
@@ -674,12 +719,14 @@ def main():
                 "seconds_without_progress": round(stalled, 1),
                 "progress": "blocked" if blocked else "closing",
                 "clear_ahead": round(clear_a, 1),
+                "clear_toward_target": round(clear_t, 1),
+                "moved_last_step": round(moved_last, 1),
                 "clear_left": round(clear_l, 1),
                 "clear_right": round(clear_r, 1),
             }
 
             if a.local:
-                act, conf = local_decide(cur["bearing"], cur["distance"], blocked)
+                act, conf = local_decide(steer_brg, cur["distance"], blocked)
                 via = "local"
             else:
                 try:
@@ -687,10 +734,10 @@ def main():
                     via = "jev"
                 except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                         KeyError, ValueError) as e:
-                    act, conf = local_decide(cur["bearing"], cur["distance"], blocked)
+                    act, conf = local_decide(steer_brg, cur["distance"], blocked)
                     via = "local(%s)" % type(e).__name__
             if act not in ACTIONS:
-                act, conf = local_decide(cur["bearing"], cur["distance"], blocked)
+                act, conf = local_decide(steer_brg, cur["distance"], blocked)
                 via = "local(bad)"
 
             # Reversing is an ESCAPE, not a state. Backing up always increases the distance, so the
@@ -707,43 +754,47 @@ def main():
                 last_progress = time.time()
                 continue
 
+            # A detour overrides the model entirely: Jev is still aiming at the target and has
+            # no idea we are deliberately walking around something.
+            if now < detour_until:
+                act, conf = local_decide(steer_brg, 999.0, False)
+                via += "+detour"
             key, dur = ACTIONS[act]
-            # GUARD RAIL: never take a long blind walk while misaligned. Jev was observed choosing
-            # forward_far at bearings of -96 and -144 degrees -- a 4 second run in almost the
-            # opposite direction, the single worst outcome available. Offering a long leg is only
-            # safe if a wrong pick degrades gracefully, so alignment decides how far we may commit.
-            # WALL GUARD, the counterpart of the alignment guard. Measured: at clear_ahead 1.4
-            # the toon is stopped dead, at 3.1 it barely creeps, at 13+ it walks a full leg. A
-            # forward action into a small clearance is therefore wasted time -- turn toward the
-            # side with more room instead. This is the capability the bot simply lacked: it
-            # could previously only discover a wall by failing to move for several seconds.
-            # Reversing is rarely the best answer when a side is plainly open. Observed live at
-            # clear L36 A3 R3: it backed up, crept forward, backed up again, and only escaped via
-            # the blind sidestep -- while 36 units of clearance sat to its left the whole time.
+
+            # Reversing is rarely the answer when a side is plainly open. Observed at
+            # clr L36 A3 R3: it backed up, crept forward, backed up again, and only escaped
+            # via the blind sidestep, with 36 units of room to its left the whole time.
             if key == "s":
                 side = max(clear_l, clear_r)
                 if side > 10.0 and side > 2.0 * clear_a:
                     act = "turn_left" if clear_l >= clear_r else "turn_right"
                     conf, via = 1.0, via + "+open"
                     key, dur = ACTIONS[act]
-            if key == "w" and clear_a < BLOCKED_CLEARANCE:
+
+            # WALL GUARD -- but only when the toon is ALSO failing to move. Obstacles are
+            # modelled as their BOUNDING SPHERES, which are far fatter than a flat booth wall,
+            # so a gap the toon comfortably fits through can read as 0.7 clearance. Measured
+            # movement is ground truth and predicted clearance is only a hint: if clearance
+            # says blocked while the toon is visibly moving, keep going.
+            if key == "w" and clear_a < BLOCKED_CLEARANCE and moved_last < MOVED_ENOUGH:
                 act = "turn_left" if clear_l >= clear_r else "turn_right"
                 conf, via = 1.0, via + "+wall"
                 key, dur = ACTIONS[act]
-            elif key == "w" and abs(cur["bearing"]) > a.max_walk_bearing:
-                act, conf = local_decide(cur["bearing"], cur["distance"], blocked)
+            # ALIGNMENT GUARD: never take a long blind walk while badly misaligned. Jev was
+            # seen choosing forward_far at -96 and -144 degrees -- a 4 second run in nearly the
+            # opposite direction, the worst outcome available.
+            elif key == "w" and abs(steer_brg) > a.max_walk_bearing:
+                act, conf = local_decide(steer_brg, cur["distance"], blocked)
                 via += "+align"
                 key, dur = ACTIONS[act]
-            elif key == "w" and abs(cur["bearing"]) > 8.0:
+            elif key == "w" and abs(steer_brg) > 8.0:
                 dur = min(dur, ACTIONS["forward"][1])      # slightly off: medium leg at most
-            elif key in ("a", "d") and abs(cur["bearing"]) <= 8.0 and not blocked:
-                # SYMMETRIC COUNTERPART of the align guard: when already facing the target, a turn
-                # can only take us off it. This is exactly where Jev is weakest -- the smoke test
-                # measured 0.39-0.50 confidence inside the forward band against 0.99 on
-                # unambiguous turns -- and it was seen picking turn_left at +8 degrees, swinging
-                # back out to +36. The toon then spun on the spot at a fixed distance of 183
-                # forever, because it never once committed to walking.
-                act, conf = local_decide(cur["bearing"], cur["distance"], blocked)
+            # SYMMETRIC COUNTERPART: when already facing the target, a turn can only take us
+            # off it. This is where Jev is weakest -- 0.39-0.50 confidence inside the forward
+            # band against 0.99 on unambiguous turns -- and it picked turn_left at +8 degrees,
+            # swinging back out to +36 and spinning on the spot at a fixed distance of 183.
+            elif key in ("a", "d") and abs(steer_brg) <= 8.0 and not blocked:
+                act, conf = local_decide(steer_brg, cur["distance"], blocked)
                 via += "+lock"
                 key, dur = ACTIONS[act]
             # Never walk past the target: clamp a forward leg to the ground it actually has to
@@ -751,11 +802,14 @@ def main():
             # 20 units, it simply becomes a 1s walk instead of a 4s run into the scenery beyond.
             if key == "w":
                 dur = min(dur, walk_for(max(cur["distance"] - a.touch * 0.5, 1.0)))
-                # and never walk further than the measured free space ahead
-                dur = min(dur, walk_for(max(clear_a - 1.0, 1.0)))
-            print("[bot] %-17s conf=%.2f via=%-11s | %s d=%.0f brg=%+.0f val=%s | clr L%.0f A%.0f R%.0f | %s %.2fs stall=%.1fs"
+                # Never walk further than the free space ahead -- unless we are demonstrably
+                # moving, in which case the sphere model is being pessimistic about a gap.
+                if moved_last < MOVED_ENOUGH:
+                    dur = min(dur, walk_for(max(clear_a - 1.0, 1.0)))
+            print("[bot] %-17s conf=%.2f via=%-11s | %s d=%.0f brg=%+.0f val=%s | clr L%.0f A%.0f R%.0f T%.0f mv%.1f | %s %.2fs stall=%.1fs"
                   % (act, conf, via, cur["kind"], cur["distance"], cur["bearing"],
-                     cur["value"], clear_l, clear_a, clear_r, key, dur, stalled), flush=True)
+                     cur["value"], clear_l, clear_a, clear_r, clear_t, moved_last,
+                     key, dur, stalled), flush=True)
             keys.pulse(key, dur)
     finally:
         keys.release_all()

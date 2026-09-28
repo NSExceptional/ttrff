@@ -206,25 +206,25 @@ SLOT_GRID = [(0.25, 0.31), (0.50, 0.31), (0.76, 0.31),
              (0.25, 0.73), (0.50, 0.73), (0.76, 0.73)]
 
 
-def _try_pick_toon():
-    """Run scripts/pick_toon.py with the frida-capable python. True if it reported success.
+def _try_enter_game():
+    """Run scripts/enter_game.py with the frida-capable python. True if it reported success.
 
     Kept as a subprocess so this driver stays out-of-process itself: it never imports frida, never
     attaches, and still works (via the colour fallback) if the injector venv is missing.
     """
     py = os.environ.get("TTRFF_INJECTOR_PYTHON",
                         os.path.join(os.path.dirname(HERE), ".venv-win", "Scripts", "python.exe"))
-    script = os.path.join(HERE, "pick_toon.py")
+    script = os.path.join(HERE, "enter_game.py")
     if not (os.path.exists(py) and os.path.exists(script)):
         return False
     try:
         r = subprocess.run([py, script], capture_output=True, text=True, timeout=120)
     except Exception as e:
-        log("pick_toon failed to run (%r) -- falling back to colour heuristic" % (e,))
+        log("enter_game failed to run (%r) -- falling back to colour heuristic" % (e,))
         return False
     for line in (r.stdout or "").splitlines():
         if line.strip():
-            log("pick_toon: %s" % line.strip())
+            log("enter_game: %s" % line.strip())
     return r.returncode == 0
 
 
@@ -425,13 +425,13 @@ def enter(timeout=DEFAULT_TIMEOUT):
         elif s == "toonselect":
             ew = engine_window()
             if ew:
-                # PREFERRED: let pick_toon.py do it. It finds the slot by NAME in the client's
+                # PREFERRED: let enter_game.py do it. It finds the slot by NAME in the client's
                 # memory and positions the cursor through Panda's own movePointer, which is the
                 # only approach that has proven reliable -- picking by screen position failed four
                 # times, each time dropping into Make-a-Toon. That needs frida, which this driver
                 # deliberately does not use, so it runs as a subprocess and the colour heuristic
                 # below stays as the out-of-process fallback.
-                if _try_pick_toon():
+                if _try_enter_game():
                     time.sleep(3.0)
                     continue
                 slot = find_occupied_slot(ew["hwnd"])
