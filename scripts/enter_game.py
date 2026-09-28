@@ -123,7 +123,8 @@ def step(ex, verbose=True):
     if state == "ingame":
         return state
     if state == "picker":
-        click_at(ex, 0.30, 0.25, settle=0.3)        # park elsewhere: DirectGUI arms on ENTER
+        ex.point({"fx": 0.50, "fy": 0.50})          # park WITHOUT clicking: DirectGUI arms on ENTER
+        time.sleep(0.3)
         if not click_at(ex, detail["fx"], detail["fy"]):
             W.click(detail["fx"], detail["fy"], input_mode="raw")
         time.sleep(3.0)

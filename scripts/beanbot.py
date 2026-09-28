@@ -195,8 +195,22 @@ BLOCKED_CLEARANCE = 4.0     # measured: at 1.4 the toon is stopped dead, at 3.1 
 MOVED_ENOUGH = 1.5          # units of real movement that prove a gap is passable after all
 FREE_PICKUPS = 3            # collected freely before the rate limit engages
 COOLDOWN_S = 60.0           # seconds between pickups once it has
+TRAVEL_SLACK = 4.0          # seconds of margin for turning when timing the departure
 DETOUR_CLEAR = 20.0         # clearance that counts as a way out
 DETOUR_EXIT = 15.0          # clearance toward the target that ends a detour
+# TRIGGERS the toon must never walk into, matched by NAME because their collide masks vary and
+# at least the tunnel's is not a wall mask -- which is how the bot walked straight into
+# tunnel_trigger_oz on a detour and ended up in another zone. Each maps to a safety margin added
+# to the trigger's own radius. Inventory from Cartoonival: a zone-exit tunnel, the trampoline
+# minigame, the picnic-table seats that start Picnic Games, fishing spots, and the cannons.
+NO_GO = (
+    ("tunnel_trigger", 8.0),
+    ("TrampolineTrigger", 4.0),
+    ("picnicTable_sphere", 2.0),
+    ("FishingSpotSphere", 3.0),
+    ("Cannon-", 3.0),
+    ("target_trigger", 2.0),
+)
 MAX_WHISKER = 60.0          # units; beyond this, nothing is "in the way" for steering purposes
 
 
@@ -222,6 +236,14 @@ def fetch_obstacles(ex):
             m = o.get("mask")
             if o.get("r") is None or m is None:
                 continue
+            name = o.get("name") or ""
+            margin = next((mg for pat, mg in NO_GO if pat in name), None)
+            if margin is not None:
+                out.append({"x": o["x"] + (o.get("cx") or 0.0),
+                            "y": o["y"] + (o.get("cy") or 0.0),
+                            "z": o["z"] + (o.get("cz") or 0.0),
+                            "r": o["r"] + margin, "name": name, "nogo": True})
+                continue
             # BARRIERS ONLY. Panda's standard bits: 0x1 wall, 0x2 floor, 0x4 camera. Without
             # this the floor itself counted as an obstacle. Also drop the sky-dome tree
             # colliders, whose bounding radius reaches 124 units and would report the whole
@@ -240,7 +262,58 @@ def fetch_obstacles(ex):
         return []
 
 
-def clearance(me, obstacles, offset_deg, max_range=MAX_WHISKER, max_dz=10.0):
+BODY_RADIUS = 1.2           # the toon's own half-width: a wall this close along the ray is contact
+WALL_ZBAND = (-1.0, 4.0)    # a wall matters if it spans any of [feet-1, feet+4]
+
+
+def seg_clearance(me, walls, offset_deg, max_range=MAX_WHISKER):
+    """Distance along a whisker to the nearest wall SEGMENT, else max_range.
+
+    Spheres cannot represent a long wall -- a tunnel side's bounding sphere is enormous, so those
+    were dropped and the bot walked straight into them. These segments are the real wall polygons'
+    edges, read from the scene graph, so a whisker hits the actual surface. Walls entirely below
+    the feet (curbs) or above the head (awnings) are ignored via each polygon's z-range.
+    """
+    ang = math.radians(me["h"] - offset_deg)       # bearings are positive-right; Panda H is CCW
+    dx, dy = -math.sin(ang), math.cos(ang)
+    mx, my = me["x"], me["y"]
+    z0, z1 = me["z"] + WALL_ZBAND[0], me["z"] + WALL_ZBAND[1]
+    best = max_range
+    for (x1, y1, x2, y2, zmin, zmax) in walls:
+        if zmax < z0 or zmin > z1:
+            continue
+        ex, ey = x2 - x1, y2 - y1
+        den = dx * ey - dy * ex
+        if abs(den) < 1e-9:
+            continue                                # parallel to the ray
+        wx, wy = x1 - mx, y1 - my
+        t = (wx * ey - wy * ex) / den               # distance along the ray
+        u = (wx * dy - wy * dx) / den               # position along the segment, 0..1
+        if t >= 0.0 and 0.0 <= u <= 1.0 and t < best:
+            best = t
+    return max(best - BODY_RADIUS, 0.0)
+
+
+def nogo_clearance(me, obstacles, offset_deg, max_range=MAX_WHISKER):
+    """Free distance along a whisker before entering a TRIGGER (tunnel, minigame, seat)."""
+    return sphere_clearance(me, [o for o in obstacles if o.get("nogo")], offset_deg, max_range)
+
+
+def in_nogo(pt, obstacles):
+    """True if a point lies inside any trigger's no-go radius."""
+    for o in obstacles:
+        if o.get("nogo") and math.hypot(pt["x"] - o["x"], pt["y"] - o["y"]) < o["r"]:
+            return True
+    return False
+
+
+def clearance(me, obstacles, walls, offset_deg, max_range=MAX_WHISKER, max_dz=10.0):
+    """Free distance along a whisker: the nearer of round obstacles and wall segments."""
+    return min(sphere_clearance(me, obstacles, offset_deg, max_range, max_dz),
+               seg_clearance(me, walls or [], offset_deg, max_range))
+
+
+def sphere_clearance(me, obstacles, offset_deg, max_range=MAX_WHISKER, max_dz=10.0):
     """Distance to the nearest obstacle blocking a ray at (facing + offset), else max_range.
 
     An obstacle of radius r at distance d subtends asin(r/d); it blocks the ray when the ray's
@@ -314,6 +387,37 @@ def jev_decide(state, timeout):
         out = json.loads(r.read())
     m = (out.get("answers") or out)["move"]
     return m["choice"], m.get("confidence", 0.0)
+
+
+def button_list(ex):
+    """[{name, fx, fy}] of visible DirectGUI buttons. Memory only -- no screenshot.
+
+    The HUD baseline used to be built from screen_buttons(), which also captures the window; any
+    exception there was swallowed, leaving the baseline EMPTY, and with an empty baseline every
+    HUD button looks new. The bot then "dismissed" the Friends List and Shticker Book buttons and
+    pressed a button inside what they opened nine times running. Names and positions come from
+    the scene graph alone, so building the baseline cannot fail for a capture reason.
+    """
+    r = ex.buttons()
+    if not r.get("ok"):
+        return []
+    win = W.game_window()
+    if not win or not win.get("clientH"):
+        return []
+    aspect = float(win["clientW"]) / float(win["clientH"])
+    out = []
+    for b in (r.get("r") or {}).get("buttons") or []:
+        if b.get("x") is None or b.get("z") is None:
+            continue
+        out.append({"name": b.get("name") or "",
+                    "fx": 0.5 + b["x"] / (2.0 * aspect), "fy": 0.5 - b["z"] / 2.0})
+    return out
+
+
+def _pos_key(b):
+    """Coarse screen position. HUD buttons keep their POSITION even when the game rebuilds them
+    under a new pg id, so position is the identity that survives; the name is only a hint."""
+    return (round(b["fx"], 2), round(b["fy"], 2))
 
 
 def screen_buttons(ex):
@@ -402,36 +506,45 @@ def classify_button(btn):
     return None
 
 
-def _point_click(ex, fx, fy, settle=0.3):
-    """Put the cursor there via Panda, then click. False if the pointer could not be placed."""
+def _point(ex, fx, fy):
+    """Move the pointer via Panda WITHOUT clicking. Parking used to CLICK at (0.20, 0.30), which
+    lands on whatever happens to be there -- another toon, a friends-list row."""
     try:
         r = ex.point({"fx": float(fx), "fy": float(fy)})
-        if not r.get("ok") or not (r.get("r") or {}).get("moved"):
-            return False
-        time.sleep(settle)
-        W.click(fx, fy, input_mode="background")
-        return True
+        return bool(r.get("ok") and (r.get("r") or {}).get("moved"))
     except Exception:
         return False
 
 
-def unwedge(ex, hud_names=frozenset()):
-    """Clear a UI panel that is swallowing movement keys. True if something was dismissed.
-
-    Buttons come from memory, so the only question is WHICH to press. Prefer a cancel/close control
-    over a confirm one: on the title screen's "Are you ready to leave Toontown?" the red X is the
-    safe answer and OK quits the game outright.
-
-    Escape is not tried -- verified against the live token shop, which ignored it completely.
-    """
-    btns = screen_buttons(ex)
-    if not btns:
+def _point_click(ex, fx, fy, settle=0.3):
+    """Put the cursor there via Panda, then click in the background. False if it could not."""
+    if not _point(ex, fx, fy):
         return False
-    # Ignore the permanent HUD. The chat bubble, gag, laff and book icons are DirectGUI buttons too
-    # and the green chat icon classifies as a confirm control, so without this the bot would press
-    # it, achieve nothing, and report that it had cleared a panel -- which also suppresses the wall
-    # recovery. A panel's buttons are by definition the ones that were not there a moment ago.
-    fresh = [b for b in btns if b.get("name") not in hud_names]
+    time.sleep(settle)                  # let DirectGUI register the mouse-ENTER
+    W.click(fx, fy, input_mode="background")
+    return True
+
+
+def unwedge(ex, hud, duds):
+    """Dismiss a panel that is swallowing movement. True ONLY if a click demonstrably did something.
+
+    Hard rules, each from an observed failure:
+      * No baseline, no click. Without knowing what the permanent HUD is, every button looks new.
+      * A HUD button is never a candidate -- matched by name OR screen position, since the game
+        can rebuild its HUD under new ids.
+      * No new buttons means no panel: the toon is stuck on a WALL, and clicking anything is wrong.
+        (Being unable to move triggers this check, and a wall does that just as well as a panel.)
+      * Verify. A click that leaves the same buttons on screen achieved nothing; that button goes on
+        a dud list and is not pressed again. The previous version reported "closed a panel" after
+        every click and pressed the same button nine times in a row.
+    """
+    if not hud["names"] and not hud["pos"]:
+        return False
+    btns = screen_buttons(ex)
+    now = time.time()
+    fresh = [b for b in btns
+             if b.get("name") not in hud["names"] and _pos_key(b) not in hud["pos"]
+             and duds["until"].get(_pos_key(b), 0) < now]
     if not fresh:
         return False
     ranked = []
@@ -443,19 +556,41 @@ def unwedge(ex, hud_names=frozenset()):
         return False
     ranked.sort(key=lambda t: t[0])
     _, btn, kind = ranked[0]
-    # Panda places the cursor, we only press. base.win.movePointer() takes window-relative pixels,
-    # so the pointer ends up exactly where the engine thinks it is -- no screen mapping, DPI or
-    # aspect arithmetic to get wrong. Panda's MouseWatcher reads the real cursor rather than the
-    # posted message's coordinates (../winctl/bugs.md #1), so a BACKGROUND click then lands on the
-    # right widget without taking focus. `raw` remains only as a fallback.
-    if not _point_click(ex, 0.20, 0.30):        # park: DirectGUI arms on mouse-ENTER
-        W.click(0.20, 0.30, input_mode="raw")
-    time.sleep(0.4)
+    target = (btn["name"], _pos_key(btn))
+
+    _point(ex, 0.50, 0.50)               # park WITHOUT clicking, for a fresh mouse-ENTER
+    time.sleep(0.3)
     if not _point_click(ex, float(btn["fx"]), float(btn["fy"])):
         W.click(float(btn["fx"]), float(btn["fy"]), input_mode="raw")
-    print("[bot] pressed %s button at %.3f,%.3f (label=%r rgb=%s)"
-          % (kind, btn["fx"], btn["fy"], btn.get("text"), btn["rgb"]), flush=True)
-    return True
+
+    # SUCCESS = THE BUTTON WE PRESSED WENT AWAY. A close control disappears with its panel; a
+    # page-turn arrow or a "Play" button does not, so this cannot mistake navigating a panel for
+    # dismissing it. Poll rather than wait a fixed time: panels animate shut, and a fixed 0.8s
+    # check once judged the Picnic Games X -- the right button -- a dud, blacklisted it, and left
+    # the toon stuck behind the panel for the rest of the run.
+    deadline = time.time() + 2.5
+    while time.time() < deadline:
+        time.sleep(0.25)
+        if target not in {(b["name"], _pos_key(b)) for b in button_list(ex)}:
+            duds["tries"].pop(target[1], None)
+            print("[bot] pressed %s at %.3f,%.3f -- panel closed" % (kind, btn["fx"], btn["fy"]),
+                  flush=True)
+            return True
+
+    # Not gone. A press during a panel's opening animation can be ignored, so allow a few tries
+    # before writing the button off -- but only ever re-press the SAME button: after a panel
+    # closes a different one can appear in that exact spot (the Shticker Book sits where the
+    # Picnic Games X was), and pressing that opens the book.
+    n = duds["tries"].get(target[1], 0) + 1
+    duds["tries"][target[1]] = n
+    if n >= 3:
+        duds["until"][target[1]] = time.time() + 120.0
+        print("[bot] pressed %s at %.3f,%.3f %d times with no effect -- leaving it alone"
+              % (kind, btn["fx"], btn["fy"], n), flush=True)
+    else:
+        print("[bot] pressed %s at %.3f,%.3f, no effect yet (try %d of 3)"
+              % (kind, btn["fx"], btn["fy"], n), flush=True)
+    return False
 
 
 class Keys(object):
@@ -514,12 +649,23 @@ def run_collector(ex, a, should_stop=None, keys=None):
     blacklist = []            # [(x, y, ignore_until)] -- treasures we could not reach
     backs = 0                 # consecutive reverses, to break the back-forever spiral
     obstacles = []            # static wall colliders, snapshotted (they do not move)
+    walls = []                # wall polygon edges for the whole zone, one fetch per zone
+    walls_at = 0.0            # when they were fetched
+    walls_xy = None           # toon position at the last tick, to spot a zone change
+    zone_changed_at = 0.0     # when we last jumped zones, to back out of a wrong one
+    backouts = 0              # attempts to walk back out, so a genuine move is not fought forever
     obs_at = 0.0              # when that snapshot was taken
-    hud_names = set()         # DirectGUI buttons present while moving freely = the permanent HUD
+    hud = {"names": set(), "pos": set()}   # buttons present while moving freely = the permanent HUD
     hud_at = 0.0              # when that baseline was last refreshed
+    duds = {"tries": {}, "until": {}}   # per screen position: presses without effect, and a
+                                        # time before which that button is left alone
     closest = 1e9             # closest approach to the committed target, for fly-through detection
     prev_xy = None            # previous tick's position, to measure real movement
     collect_times = []        # unix time of each successful pickup, for the cooldown model
+    committed_dist = None     # distance to the committed bag last tick, to tell ours from theirs
+    last_act = None           # (key, seconds, heading before) of the previous pulse
+    dead_turns = 0            # consecutive turn pulses that did not turn
+    wait_said = 0.0           # last time the 'waiting' line was printed, to keep the log readable
     detour_until = 0.0        # while in the future, steer along detour_brg, not at the target
     detour_brg = 0.0
     last_pose = None          # (x, y, h) last tick, to notice a UI panel eating input
@@ -554,6 +700,25 @@ def run_collector(ex, a, should_stop=None, keys=None):
             if time.time() - obs_at > a.obstacle_refresh:
                 obstacles = fetch_obstacles(ex)
                 obs_at = time.time()
+
+            # Wall polygons: the whole zone is ~700 segments and 0.2s to read, so fetch it ONCE per
+            # zone rather than repeatedly -- each read leaks a few thousand small objects (no
+            # Py_DecRef in the Windows table). A jump of more than ~200 units between ticks is a
+            # teleport or tunnel, i.e. a new zone; the timed refresh is only insurance.
+            jumped = walls_xy is not None and math.hypot(me["x"] - walls_xy[0],
+                                                         me["y"] - walls_xy[1]) > 200.0
+            walls_xy = (me["x"], me["y"])
+            if jumped:
+                zone_changed_at = time.time()
+            if not walls or jumped or time.time() - walls_at > a.wall_refresh:
+                try:
+                    walls, _wst = WS.fetch_walls(ex, me["x"], me["y"], rng=5000.0)
+                    walls_at = time.time()
+                    print("[bot] %d wall segments in this zone%s"
+                          % (len(walls), " (zone change)" if jumped else ""), file=sys.stderr)
+                except Exception as e:
+                    print("[bot] wall fetch failed: %r -- spheres only" % (e,), file=sys.stderr)
+                    walls_at = time.time()
                 print("[bot] %d wall colliders" % len(obstacles), file=sys.stderr)
 
             # WEDGED: a DirectGUI panel (the Cartoonival token shop, the cattlelog) swallows WASD
@@ -571,19 +736,40 @@ def run_collector(ex, a, should_stop=None, keys=None):
             # Refresh the HUD baseline only while the toon is demonstrably moving, because that is
             # the one moment we know nothing is blocking input and therefore that every button on
             # screen is permanent furniture.
-            if frozen == 0 and not a.dry_run and time.time() - hud_at > 30.0:
+            # Only while the toon has demonstrably MOVED this tick. Keying this off `frozen == 0`
+            # broke when frozen was redefined as "not dead-turning", which is also true while
+            # seated at a picnic table: the baseline was re-taken with the Picnic Games panel up,
+            # its X became "permanent HUD", and the bot never pressed it again.
+            if moved_last >= MOVED_ENOUGH and not a.dry_run and time.time() - hud_at > 30.0:
                 try:
-                    seen = {b.get("name") for b in screen_buttons(ex) if b.get("name")}
+                    seen = button_list(ex)
                     if seen:
-                        hud_names = seen
+                        first = not hud["pos"]
+                        hud = {"names": {b["name"] for b in seen if b["name"]},
+                               "pos": {_pos_key(b) for b in seen}}
                         hud_at = time.time()
-                except Exception:
-                    pass
+                        if first:
+                            print("[bot] HUD baseline: %d buttons" % len(seen), file=sys.stderr)
+                except Exception as e:
+                    print("[bot] HUD baseline failed: %r" % (e,), file=sys.stderr)
+            # SWALLOWED INPUT is recognised by a TURN that did not turn. A wall stops walking but
+            # never stops turning on the spot, so this can only mean a panel (or a seated
+            # minigame) is eating the keys. The earlier test -- "pose unchanged for N ticks" -- had
+            # two failures: a wall satisfies it, which sent the bot hunting for buttons and it
+            # clicked the Friends List and Shticker Book; and a 1-degree idle jitter defeats it,
+            # which left the toon pressing turn_left eight times at an unmoving +2 degrees.
+            if last_act is not None and last_act[0] in ("a", "d"):
+                expect = TURN_RATE * last_act[1] + TURN_OVERHEAD
+                got = abs(norm180(me["h"] - last_act[2]))
+                dead_turns = dead_turns + 1 if got < 0.25 * expect else 0
+            last_act = None
+            frozen = a.frozen_pulses if dead_turns >= 2 else 0
             if frozen >= a.frozen_pulses:
-                print("[bot] no movement for %d pulses -- looking for a blocking UI panel" % frozen,
-                      flush=True)
+                dead_turns = 0
+                print("[bot] turns are not turning -- a panel is eating input; looking for its "
+                      "close button", flush=True)
                 frozen = 0
-                if not a.dry_run and unwedge(ex, hud_names):
+                if not a.dry_run and unwedge(ex, hud, duds):
                     # A real panel was in the way and is now gone; give it a clean slate.
                     print("[bot] closed a panel", flush=True)
                     best_dist = None
@@ -605,8 +791,22 @@ def run_collector(ex, a, should_stop=None, keys=None):
                 b, d, dz = bearing_to(me, t)
                 if abs(dz) > a.max_height:
                     continue              # another level: walking its ground position never touches it
+                if in_nogo(t, obstacles):
+                    continue              # sitting in a trigger: fetching it would start a minigame
                 tg.append({"bearing": round(b, 1), "distance": round(d, 1), "dz": round(dz, 1),
                            "kind": t["kind"], "value": t.get("value"), "x": t["x"], "y": t["y"]})
+            if not tg and time.time() - zone_changed_at < 20.0 and backouts < 2:
+                # We just changed zones and there is nothing to collect here: the bot walked into
+                # a tunnel. Arriving leaves the toon facing away from the tunnel it came through,
+                # so walking BACKWARDS a few steps re-enters it and returns us.
+                backouts += 1
+                print("[bot] left the bag zone (no bags here) -- walking back out, try %d"
+                      % backouts, flush=True)
+                keys.pulse("s", 1.5)
+                time.sleep(3.0)
+                continue
+            if tg:
+                backouts = 0
             if not tg:
                 print("[bot] no reachable treasures in this zone -- waiting", file=sys.stderr)
                 time.sleep(2.0)
@@ -627,13 +827,22 @@ def run_collector(ex, a, should_stop=None, keys=None):
                         cur = t
                         break
                 if cur is None:
-                    picked += 1
-                    collect_times.append(time.time())
-                    nxt = next_pickup_allowed(collect_times, a.free_pickups, a.cooldown)
-                    wait_s = max(nxt - time.time(), 0.0)
-                    print("[bot] COLLECTED -- %d so far%s"
-                          % (picked, "" if wait_s <= 0 else "  (next in %.0fs)" % wait_s),
-                          flush=True)
+                    # The bag vanished -- but vanishing is ALSO what happens when another player
+                    # takes it. Crediting those as ours was wrong twice over: the tally lied, and
+                    # the fake timestamp re-armed the cooldown, so the bot stood waiting a full
+                    # extra minute for a pickup it never made. Only a bag that vanished while we
+                    # were within reach is ours.
+                    if committed_dist is not None and committed_dist <= a.touch * 4.0:
+                        picked += 1
+                        collect_times.append(time.time())
+                        nxt = next_pickup_allowed(collect_times, a.free_pickups, a.cooldown)
+                        wait_s = max(nxt - time.time(), 0.0)
+                        print("[bot] COLLECTED -- %d so far%s"
+                              % (picked, "" if wait_s <= 0 else "  (next in %.0fs)" % wait_s),
+                              flush=True)
+                    else:
+                        print("[bot] bag %.0f units away was taken by someone else"
+                              % (committed_dist or -1), flush=True)
                     committed = None
 
             # Drop targets we have already failed to reach (unreachable ledges, blocked routes).
@@ -673,6 +882,8 @@ def run_collector(ex, a, should_stop=None, keys=None):
                 committed = None
                 continue
 
+            committed_dist = cur["distance"]
+
             # Give up on one we cannot get to, so a bag on a ledge cannot trap the bot forever.
             if now - t_commit > a.give_up:
                 print("[bot] giving up on %s at d=%.0f after %.0fs -- blacklisting for %.0fs"
@@ -687,23 +898,45 @@ def run_collector(ex, a, should_stop=None, keys=None):
             stalled = time.time() - last_progress
             blocked = stalled >= a.stall_after
 
-            clear_a = clearance(me, obstacles, 0.0)
-            clear_l = clearance(me, obstacles, -45.0)
-            clear_r = clearance(me, obstacles, +45.0)
-            clear_t = clearance(me, obstacles, cur["bearing"])
+            clear_a = clearance(me, obstacles, walls, 0.0)
+            clear_l = clearance(me, obstacles, walls, -45.0)
+            clear_r = clearance(me, obstacles, walls, +45.0)
+            clear_t = clearance(me, obstacles, walls, cur["bearing"])
 
-            # COOLDOWN. Walking into a bag while rate limited only plays a sound, so close to a
-            # standoff distance and wait there rather than flying through and wandering off.
+            # COOLDOWN. Walking into a bag while rate limited only plays a sound, so the bot waits.
+            #
+            # It waits IN PLACE, and only sets off when there is just enough time left to arrive
+            # as the timer expires. The first version walked to the next bag immediately after the
+            # third pickup -- with 30-60s to kill that is a long wander for nothing, and it was
+            # seen running straight into a wall instead of simply waiting.
+            #
+            # Standing still on purpose must not look like being stuck, so every stuck detector is
+            # reset while waiting: the give-up timer (45s) is SHORTER than the cooldown (60s), and
+            # it used to fire mid-wait, abandon the very bag being waited for, and head elsewhere.
             allowed_at = next_pickup_allowed(collect_times, a.free_pickups, a.cooldown)
-            cooling = time.time() < allowed_at
-            if cooling and cur["distance"] <= a.standoff:
-                left = allowed_at - time.time()
-                if left > 1.0:
-                    print("[bot] in position %.1f units from %s (val=%s) -- waiting %.0fs for the "
-                          "cooldown" % (cur["distance"], cur["kind"], cur["value"], left), flush=True)
-                keys.release_all()
-                time.sleep(min(left, 1.0))
-                continue
+            left = allowed_at - time.time()
+            cooling = left > 0
+            if cooling:
+                travel = cur["distance"] / WALK_SPEED + TRAVEL_SLACK
+                in_position = cur["distance"] <= a.standoff
+                if in_position or left > travel:
+                    last_progress = time.time()
+                    t_commit = time.time()
+                    best_dist = None
+                    frozen = 0
+                    backs = 0
+                    detour_until = 0.0
+                    keys.release_all()
+                    if time.time() - wait_said > 10.0:
+                        where = ("in position %.1f units from" % cur["distance"] if in_position
+                                 else "%.0f units from" % cur["distance"])
+                        print("[bot] cooldown %.0fs left -- waiting %s %s (val=%s)%s"
+                              % (left, where, cur["kind"], cur["value"],
+                                 "" if in_position else ", leaving in %.0fs" % (left - travel)),
+                              flush=True)
+                        wait_said = time.time()
+                    time.sleep(min(max(left - (0 if in_position else travel), 0.2), 1.0))
+                    continue
 
             # DETOUR. Aiming at the target every tick is what produced the ping-pong: the
             # target pulls toward the wall, the wall guard pushes away, and neither wins.
@@ -718,7 +951,7 @@ def run_collector(ex, a, should_stop=None, keys=None):
             elif clear_t < BLOCKED_CLEARANCE and stalled > a.stall_after * 0.5:
                 best = None
                 for off in (45.0, -45.0, 90.0, -90.0, 135.0, -135.0):
-                    c = clearance(me, obstacles, off)
+                    c = min(clearance(me, obstacles, walls, off), nogo_clearance(me, obstacles, off))
                     if c > DETOUR_CLEAR and (best is None or abs(off) < abs(best[0])):
                         best = (off, c)
                 if best:
@@ -786,7 +1019,11 @@ def run_collector(ex, a, should_stop=None, keys=None):
             # A detour overrides the model entirely: Jev is still aiming at the target and has
             # no idea we are deliberately walking around something.
             if now < detour_until:
-                act, conf = local_decide(steer_brg, 999.0, False)
+                # A detour walks BLIND along whatever looked open -- and an open tunnel mouth looks
+                # exactly like open ground. It used to decide with distance=999, i.e. forward_far,
+                # a 90-unit leg, which is how it carried the toon down a tunnel into another zone.
+                # Short legs re-check the world every ~25 units instead.
+                act, conf = local_decide(steer_brg, 30.0, False)
                 via += "+detour"
             key, dur = ACTIONS[act]
 
@@ -829,6 +1066,19 @@ def run_collector(ex, a, should_stop=None, keys=None):
             # Never walk past the target: clamp a forward leg to the ground it actually has to
             # cover. This is what makes the long leg safe to offer -- if Jev picks forward_far at
             # 20 units, it simply becomes a 1s walk instead of a 4s run into the scenery beyond.
+            # HARD NO-GO VETO. Unlike a wall, a trigger never stops you -- you walk straight
+            # through it -- so the "trust measured movement over predicted clearance" rule, right
+            # for pessimistic wall spheres, always overrode these. The bot kept walking into the
+            # picnic seats and the trampoline. This check ignores movement entirely.
+            if key == "w":
+                ng = nogo_clearance(me, obstacles, 0.0)
+                if ng < 3.0:
+                    act = "turn_left" if nogo_clearance(me, obstacles, -45.0) >= \
+                        nogo_clearance(me, obstacles, 45.0) else "turn_right"
+                    conf, via = 1.0, via + "+nogo"
+                    key, dur = ACTIONS[act]
+                else:
+                    dur = min(dur, walk_for(max(ng - 2.0, 0.5)))
             if key == "w":
                 dur = min(dur, walk_for(max(cur["distance"] - a.touch * 0.5, 1.0)))
                 # Never walk further than the free space ahead -- unless we are demonstrably
@@ -842,6 +1092,7 @@ def run_collector(ex, a, should_stop=None, keys=None):
                   % (act, conf, via, cur["kind"], cur["distance"], cur["bearing"],
                      cur["value"], clear_l, clear_a, clear_r, clear_t, moved_last,
                      key, dur, stalled), flush=True)
+            last_act = (key, dur, me["h"])
             keys.pulse(key, dur)
     finally:
         keys.release_all()
@@ -884,6 +1135,8 @@ def build_parser():
                     help="units to hold short of a bag while waiting out the cooldown")
     ap.add_argument("--detour-seconds", type=float, default=6.0,
                     help="how long to commit to a detour heading before re-aiming at the target")
+    ap.add_argument("--wall-refresh", type=float, default=300.0,
+                    help="seconds between wall-polygon refreshes (a zone change refetches at once)")
     ap.add_argument("--obstacle-refresh", type=float, default=30.0,
                     help="seconds between re-snapshotting the static collision geometry")
     ap.add_argument("--frozen-pulses", type=int, default=3,

@@ -521,6 +521,41 @@ Three traps, each of which made the signal useless until fixed:
 Before the mask filter the same code reported `clear_ahead = 0.0` while the toon walked freely --
 worse than no signal at all, since it would have declared the bot permanently blocked.
 
+### Never pass NULL into an argument tuple -- it kills the client with no traceback
+
+`PyTuple_SetItem(t, i, NULL)` is accepted, and the callee then dereferences the NULL natively. The
+whole client dies: no Python exception, no traceback, just a truncated log. `worldstate.py`'s
+`mkint()` builds ints via `int(float)` and needs `PyFloat_FromDouble` -- which was never bound in
+that script, so `mkint()` always returned NULL. Every call taking an int argument (`getPath(i)`,
+`getSolid(i)`, `getPoint(j)`, `movePointer`) crashed the client or silently failed. It crashed the
+game twice before being found, and it also meant `movePointer` had NEVER worked: every
+"Panda-placed" click had silently fallen back to a focus-stealing raw click, while the docs claimed
+otherwise. `callRawFn`/`callFloat` now refuse a NULL argument outright. If the client dies during a
+read-only call, check for this first -- a long GIL hold was the first (wrong) suspicion.
+
+### Walls are polygons; triggers are not walls
+
+Long walls, tunnel sides and the play-area edge are `CollisionPolygon`s inside wall-mask (`0x1`)
+nodes. Their bounding spheres are huge, so the sphere model dropped them and the bot walked into
+them. `wallsBegin`/`wallsChunk` read each polygon's vertices and move them to world space with
+`render.getRelativePoint(node, point)` -- the `Point3` from `getPoint()` passes straight through, so
+nothing is constructed. The whole Cartoonival zone is ~720 segments in 0.2s, fetched once per zone
+in <=30 ms GIL-releasing chunks. Validated: a whisker reading 5.0 units walked 4.8 into the wall.
+
+TRIGGERS are matched by NAME, because their masks vary and the tunnel's is not a wall mask:
+`tunnel_trigger_*` (zone exit), `TrampolineTrigger`, `picnicTable_sphere_*` (seats that start Picnic
+Games), `FishingSpotSphere`, `Cannon-*`, `target_trigger`. They need a HARD veto: a trigger never
+stops you, you walk straight through it, so any "trust measured movement over predicted clearance"
+rule -- correct for pessimistic wall spheres -- will always override them.
+
+### Swallowed input: a turn that does not turn
+
+A wall stops walking but never stops turning on the spot. So a turn pulse that produces <25% of its
+expected rotation can only mean a panel (or a seated minigame) is eating the keys. Pose-equality
+("no movement for N ticks") was wrong both ways: a wall satisfies it, which sent the bot hunting
+for buttons -- it clicked the Friends List and the Shticker Book, and teleported out of the zone
+from inside the book -- while a 1-degree idle jitter defeats it.
+
 ### Cartoonival pickup cooldown (game rule, established by play-testing)
 
 Bags are hard rate limited, and it is NOT a rolling window:
