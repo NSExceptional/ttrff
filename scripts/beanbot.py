@@ -337,31 +337,58 @@ def screen_buttons(ex):
         if not n:
             continue
         out.append({"fx": fx, "fy": fy, "text": b.get("text"), "name": b.get("name"),
+                    "w": b.get("w"), "h": b.get("h"),
                     "rgb": (rs // n, gs // n, bs_ // n)})
     return out
 
 
 def classify_button(btn):
-    """'cancel' (red X), 'ok' (green/blue check), or None -- from the colour at its own position.
+    """'cancel', 'ok', or None -- what pressing this widget would do.
 
-    Thresholds are RELATIVE, not absolute. The trampoline dialog's OK button samples as
-    (7, 94, 31): unmistakably green, but an absolute `g > 120` cut rejected it, while the bluish
-    laff meter at (114, 118, 154) sneaked past as a confirm control. Channel dominance separates
-    a coloured control from grey UI furniture far better than brightness does.
+    SHAPE IS THE SAFETY GATE. Close and confirm controls in this game are round/square; action
+    buttons are wider than they are tall. In the Cartoonival token shop the "Buy" buttons are
+    0.09x0.06 and one of them samples (204, 81, 81) -- redder than the actual close X, which is
+    0.15x0.15 and samples a washed-out (209, 162, 157). A colour-only rule therefore picked a Buy
+    button, which would spend the player's tokens rather than close the panel. Anything clearly
+    rectangular is refused outright: leaving a panel open is recoverable, buying something is not.
+
+    Colour thresholds are RELATIVE. The trampoline dialog's OK samples (7, 94, 31) -- plainly
+    green but dim -- while the bluish laff meter at (114, 118, 154) is bright and not a control at
+    all, so channel dominance separates them far better than brightness.
     """
-    r, g, b = btn["rgb"]
     txt = (btn.get("text") or "").strip().lower()
     if txt in ("cancel", "no", "quit", "close", "back"):
         return "cancel"
     if txt in ("ok", "yes", "done", "continue"):
         return "ok"
-    if r > 90 and r > 1.5 * max(g, 1) and r > 1.5 * max(b, 1):
+
+    w, h = btn.get("w"), btn.get("h")
+    if not w or not h or max(w, h) <= 0:
+        return None
+    if abs(w - h) / max(w, h) > 0.25:
+        return None                       # rectangular: an action button, never press it blind
+
+    r, g, b = btn["rgb"]
+    if r > 120 and r > g and r > b:
         return "cancel"
     if g > 55 and g > 1.4 * max(r, 1) and g > 1.4 * max(b, 1):
         return "ok"
     if b > 100 and b > 1.5 * max(r, 1) and b > 1.5 * max(g, 1):
         return "ok"
     return None
+
+
+def _point_click(ex, fx, fy, settle=0.3):
+    """Put the cursor there via Panda, then click. False if the pointer could not be placed."""
+    try:
+        r = ex.point({"fx": float(fx), "fy": float(fy)})
+        if not r.get("ok") or not (r.get("r") or {}).get("moved"):
+            return False
+        time.sleep(settle)
+        W.click(fx, fy, input_mode="background")
+        return True
+    except Exception:
+        return False
 
 
 def unwedge(ex, hud_names=frozenset()):
@@ -392,13 +419,16 @@ def unwedge(ex, hud_names=frozenset()):
         return False
     ranked.sort(key=lambda t: t[0])
     _, btn, kind = ranked[0]
-    # CLICKS MUST USE `raw`. Panda3D's MouseWatcher reads the real cursor position from the
-    # device, so a BACKGROUND click is delivered but lands wherever the user's pointer happens to
-    # be -- which is how three separate attempts at the toon picker ended up in Make-a-Toon. raw
-    # briefly takes the foreground; it is only used here, for dismissing a panel, never to move.
-    W.click(0.20, 0.30, input_mode="raw")       # park: DirectGUI arms on mouse-ENTER
+    # Panda places the cursor, we only press. base.win.movePointer() takes window-relative pixels,
+    # so the pointer ends up exactly where the engine thinks it is -- no screen mapping, DPI or
+    # aspect arithmetic to get wrong. Panda's MouseWatcher reads the real cursor rather than the
+    # posted message's coordinates (../winctl/bugs.md #1), so a BACKGROUND click then lands on the
+    # right widget without taking focus. `raw` remains only as a fallback.
+    if not _point_click(ex, 0.20, 0.30):        # park: DirectGUI arms on mouse-ENTER
+        W.click(0.20, 0.30, input_mode="raw")
     time.sleep(0.4)
-    W.click(float(btn["fx"]), float(btn["fy"]), input_mode="raw")
+    if not _point_click(ex, float(btn["fx"]), float(btn["fy"])):
+        W.click(float(btn["fx"]), float(btn["fy"]), input_mode="raw")
     print("[bot] pressed %s button at %.3f,%.3f (label=%r rgb=%s)"
           % (kind, btn["fx"], btn["fy"], btn.get("text"), btn["rgb"]), flush=True)
     return True
