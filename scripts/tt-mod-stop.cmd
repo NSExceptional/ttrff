@@ -34,10 +34,14 @@ type nul > "%STOPFILE%"
 rem Wait until no python host is running trampoline_inject.py (up to TIMEOUT_TICKS * TICK secs).
 rem Detection via PowerShell Get-CimInstance (wmic is removed on Windows 11 24H2+); the Windows
 rem injector runs as the SAME user (no sudo), so a plain same-user process query sees it.
+rem NO double quotes inside the -Command string: an escaped \" there toggles cmd's own quoting,
+rem which left the pipe outside the quotes -- cmd split the command, PowerShell never ran, the
+rem loop saw nothing running, reported a clean exit at once and DELETED the stop file before the
+rem injector could read it. Names match python*, since the Store interpreter is pythonw3.10.exe.
 set /a "WAITED=0"
 :waitloop
 set "RUNNING="
-for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe'\" | Where-Object { $_.CommandLine -like '*trampoline_inject.py*' }).Count" 2^>nul`) do (
+for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and $_.CommandLine -like '*trampoline_inject.py*' }).Count" 2^>nul`) do (
     if %%p GTR 0 if not defined RUNNING set "RUNNING=1"
 )
 if not defined RUNNING goto done
