@@ -919,6 +919,18 @@ def run_collector(ex, a, should_stop=None, keys=None):
             allowed_at = next_pickup_allowed(collect_times, a.free_pickups, a.cooldown)
             left = allowed_at - time.time()
             cooling = left > 0
+            # ON TOP OF THE BAG. A pickup fires when the toon ENTERS the bag's sphere, so standing
+            # inside it achieves nothing -- and the bearing to a point under the toon's feet flips
+            # +-180 degrees with every tiny shift, so the bot swung left and right on the spot.
+            # Seen live after waiting out a cooldown where the next bag sat where the last one was.
+            # Step out; the next approach walks back in and fires the pickup.
+            if final_leg and cur["distance"] < a.touch and not a.dry_run and                     (cooling or cur["distance"] < a.touch * 0.5):
+                print("[bot] standing on the %s (d=%.1f) -- stepping out to walk back in"
+                      % (cur["kind"], cur["distance"]), flush=True)
+                last_act = None
+                keys.pulse("s", 0.4)
+                continue
+
             if cooling:
                 travel = route_left / WALK_SPEED + TRAVEL_SLACK
                 in_position = cur["distance"] <= a.standoff
