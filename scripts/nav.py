@@ -52,6 +52,23 @@ def in_band(zmin, zmax, z, band=ZBAND):
     return not (zmax < z + band[0] or zmin > z + band[1])
 
 
+def round_radius(rd, z, band=ZBAND):
+    """The radius a round solid actually presents at the toon's height, or None if it misses.
+
+    A sphere or capsule is NOT a vertical cylinder of its full radius: at a height dz away from its
+    axis it is only sqrt(r^2 - dz^2) wide. Treating a big sphere centred below the feet as full
+    width put the toon "inside" it -- every whisker read 0, the wall guard vetoed every step, and
+    the bot wiggled on the spot until the toon fell asleep and the game logged it out.
+    """
+    x1, y1, x2, y2, zmin, zmax, r = rd
+    a0, a1 = zmin + r, zmax - r                 # the axis' own height range
+    b0, b1 = z + band[0], z + band[1]
+    dz = max(a0 - b1, b0 - a1, 0.0)
+    if dz >= r:
+        return None
+    return math.sqrt(r * r - dz * dz)
+
+
 class Route(object):
     """A planned path: world points from the start to the goal, and how far along it we are."""
 
@@ -77,7 +94,11 @@ class NavGrid(object):
                  margin=40.0, include=()):
         self.z, self.cell, self.radius = z, cell, radius
         walls = [s for s in segs if in_band(s[4], s[5], z, band)]
-        rnd = [r for r in rounds if in_band(r[4], r[5], z, band)]
+        rnd = []
+        for r in rounds:
+            re_ = round_radius(r, z, band)
+            if re_ is not None:
+                rnd.append(r[:6] + (re_,))
         xs, ys = [], []
         for s in walls:
             xs += (s[0], s[2])
@@ -324,9 +345,11 @@ def _ray_circle(mx, my, dx, dy, cx, cy, r):
     return t if t >= 0.0 else None
 
 
-def round_hit(mx, my, dx, dy, rd):
-    """Distance along a ray to a capsule (x1, y1, x2, y2, zmin, zmax, r), or None."""
-    x1, y1, x2, y2, _, _, r = rd
+def round_hit(mx, my, dx, dy, rd, r=None):
+    """Distance along a ray to a capsule (x1, y1, x2, y2, zmin, zmax, r), or None. `r` overrides
+    the stored radius (pass round_radius() for the cross-section at the toon's height)."""
+    x1, y1, x2, y2, _, _, r0 = rd
+    r = r0 if r is None else r
     best = None
     for t in (_ray_circle(mx, my, dx, dy, x1, y1, r), _ray_circle(mx, my, dx, dy, x2, y2, r)):
         if t is not None and (best is None or t < best):

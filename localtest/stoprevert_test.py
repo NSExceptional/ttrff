@@ -65,11 +65,15 @@ class FakeAgent:
 
     TRAMP = "TRAMPOLINE"
 
-    def __init__(self, box, rev, mode="live", fail_methods=()):
+    def __init__(self, box, rev, mode="live", fail_methods=(), inflight=()):
         self.box = box
         self.rev = rev
         self.mode = mode
         self.fail = set(fail_methods)
+        # successive answers to inflight() -- threads still inside a wrapper -- then 0 for good
+        self.inflight_seq = list(inflight)
+        self.inflight_reads = 0
+        self.detach_seen_inflight = None
         self.installed = []           # mirrors ST.installed (via record_install == ST.recordInstall)
         self.class_table = {}         # (cls, method) -> current handler
         self.revert_calls = 0
@@ -86,6 +90,10 @@ class FakeAgent:
 
     def appliedBy(self):
         return {}
+
+    def inflight(self):
+        self.inflight_reads += 1
+        return self.inflight_seq.pop(0) if self.inflight_seq else 0
 
     def scaledInfo(self):
         return {}
@@ -117,11 +125,15 @@ class FakeAgent:
 
 
 class FakeSession:
-    def __init__(self):
+    def __init__(self, agent=None):
         self.detach_calls = 0
+        self.agent = agent
+        self.inflight_left = None     # in-flight answers still queued when detach happened
 
     def detach(self):
         self.detach_calls += 1
+        if self.agent is not None:
+            self.inflight_left = len(self.agent.inflight_seq)
 
 
 def counting_alive(true_for):
@@ -166,6 +178,36 @@ def case_revert_restores_all():
     check("NONE remain installed after revert", after == [], "remaining=%s" % after)
     check("all revert rc == 0", box.get("revert_ok") is True and all(x == 0 for x in box.get("revert_rc", [1])))
     check("session.detach() called exactly once", sess.detach_calls == 1, "calls=%d" % sess.detach_calls)
+
+
+def case_detach_waits_for_inflight():
+    """(8) A call still inside a wrapper when the revert lands must finish BEFORE the detach: the
+    game's main thread returning into a torn-down agent froze the game on "quit mods"."""
+    box = {}
+    rev = threading.Event()
+    ag = FakeAgent(box, rev, mode="live", inflight=[1, 1, 2, 1, 0, 1, 0, 0])
+    ag.install("MetaInterval", "start")
+    sess = FakeSession(ag)
+    ok = ti.revert_and_detach(ag, sess, box, rev, "start", alive_check=lambda: True,
+                              confirm_timeout=0.5, log=lambda *a: None)
+    check("in-flight: revert confirmed and detached", ok is True and sess.detach_calls == 1)
+    check("in-flight: detach only after every queued in-flight reading was consumed",
+          sess.inflight_left == 0, "readings left at detach=%s" % sess.inflight_left)
+    check("in-flight: needs TWO zero readings in a row (a lone 0 between calls is not drained)",
+          ag.inflight_reads >= 8, "reads=%d" % ag.inflight_reads)
+
+
+def case_inflight_game_gone_no_detach():
+    """(9) If the game disappears while calls are still in flight, give up without detaching."""
+    box = {}
+    rev = threading.Event()
+    ag = FakeAgent(box, rev, mode="live", inflight=[1] * 1000)
+    ag.install("MetaInterval", "start")
+    sess = FakeSession(ag)
+    ok = ti.revert_and_detach(ag, sess, box, rev, "start", alive_check=counting_alive(6),
+                              confirm_timeout=0.5, log=lambda *a: None)
+    check("in-flight + game gone: returned False, never detached", ok is False and sess.detach_calls == 0,
+          "ok=%r detach=%d" % (ok, sess.detach_calls))
 
 
 def case_no_confirm_no_detach():
@@ -320,6 +362,8 @@ def case_request_stop_idempotent():
 def main():
     cases = [
         ("revert restores ALL installed wraps (none remain)", case_revert_restores_all),
+        ("detach waits for calls in flight", case_detach_waits_for_inflight),
+        ("calls in flight + game gone: no detach", case_inflight_game_gone_no_detach),
         ("stop file triggers graceful stop", case_stopfile_triggers_stop),
         ("full stop-file flow consumes the file", case_full_stopfile_flow_consumes_file),
         ("SIGTERM triggers graceful stop", case_sigterm_triggers_stop),

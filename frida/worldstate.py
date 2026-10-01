@@ -175,15 +175,20 @@ rpc.exports = {
           return o.add(0x10).readDouble();
         } catch (e) { return null; }
       };
-      // obj.<name>(...args) -> float, or null. `cacheKey` reuses the bound method across ticks.
+      // obj.<name>(...args) -> float, or null. `cacheKey` reuses the bound method across ticks --
+      // but ONLY for the same object. A bound method carries its object, so a cache keyed by name
+      // alone kept reading the OLD toon after a "got sleepy" logout and re-login: its heading never
+      // changed, and the bot turned on the spot forever trying to line up. The cached entry
+      // remembers which object it was bound to, and a different object refetches.
       ST.callFloat = function (o, name, args, cacheKey) {
         try {
           var m = ptr(0);
-          if (cacheKey && ST.mcache[cacheKey]) m = ST.mcache[cacheKey];
+          var c = cacheKey ? ST.mcache[cacheKey] : null;
+          if (c && c.obj.equals(o)) m = c.m;
           else {
             m = ST.attr(o, name);
             if (m.isNull()) return null;
-            if (cacheKey) { ST.mcache[cacheKey] = m; ST.keep.push(m); }
+            if (cacheKey) { ST.mcache[cacheKey] = { obj: o, m: m }; ST.keep.push(m); }
           }
           for (var q = 0; args && q < args.length; q++) {
             if (!args[q] || args[q].isNull()) return null;       // see callRawFn: NULL args crash
@@ -395,20 +400,19 @@ rpc.exports = {
       ST.key = function (name, down) {
         try {
           var core = ST.core(); if (core.isNull()) return false;
-          var hk = ST.mcache['kb.' + name];
+          // Button handles are process-wide constants, so caching them is safe. The input device
+          // is NOT cached: it belongs to the current window, which the game can replace.
+          ST.kbh = ST.kbh || {};
+          var hk = ST.kbh[name];
           if (!hk) {
             var KB = ST.attr(core, 'KeyboardButton'); if (KB.isNull()) return false;
             hk = ST.callRaw(KB, 'asciiKey', [ST.mkstr(name)]);
             if (hk.isNull()) return false;
-            ST.mcache['kb.' + name] = hk; ST.keep.push(hk);
+            ST.kbh[name] = hk; ST.keep.push(hk);
           }
-          var dev = ST.mcache.dev;
-          if (!dev) {
-            var win = ST.attr(ST.attr(ST.builtins(), 'base'), 'win');
-            dev = ST.callRaw(win, 'getInputDevice', [ST.mkint(0)]);
-            if (dev.isNull()) return false;
-            ST.mcache.dev = dev; ST.keep.push(dev);
-          }
+          var win = ST.attr(ST.attr(ST.builtins(), 'base'), 'win');
+          var dev = ST.callRaw(win, 'getInputDevice', [ST.mkint(0)]);
+          if (dev.isNull()) return false;
           var r = ST.callRaw(dev, down ? 'buttonDown' : 'buttonUp', [hk]);
           return !r.isNull();
         } catch (e) { ST.clearExc(); return false; }
@@ -1204,7 +1208,9 @@ rpc.exports = {
           if (out.me) return;
           var p = ST.posOf(o, rargs, 'me');
           if (!p) return;
-          out.me = { cls: ST.tpname(o), x: p.x, y: p.y, z: p.z,
+          // `ref` identifies THIS toon object: a logout and re-login creates a new one, which the
+          // host uses to drop everything it learned about the previous session.
+          out.me = { cls: ST.tpname(o), ref: o.toString(), x: p.x, y: p.y, z: p.z,
                      h: ST.callFloat(o, 'getH', rargs, 'me.h') };
         } else if (role === 'bag' || role === 'treasure') {
           if (out.targets.length >= lim) return;

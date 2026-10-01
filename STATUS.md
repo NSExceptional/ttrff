@@ -454,7 +454,12 @@ and never a `vlt*` hash (hashes are per-build and change under you):
 | plain treasure | `treasure`, no `value` | `vltb3cf91ab` |
 
 The signature probe costs several getattrs, so `roleOf` runs it once per CLASS and caches by
-`tp_name`; steady-state ticks are pure pointer reads. Two more details that cost time to find:
+`tp_name`; steady-state ticks are pure pointer reads. Cache classes and button handles, never
+OBJECTS: a "got sleepy" logout and re-login creates a NEW LocalToon, and a bound `getH` cached by
+name kept reading the old one -- the heading never changed and auto-collect turned on the spot until
+the game was restarted. Cached bound methods now remember their object, `state()` reports a `ref`
+for the toon object, and the bot starts fresh (HUD baseline, route, target) when it changes. Two
+more details that cost time to find:
 
 - A treasure is **not** a NodePath, it HAS one (`.nodePath`). Calling `getX` on the object itself
   silently yields nothing, so `posOf` falls through to `.nodePath` rather than dropping the object.
@@ -603,25 +608,59 @@ usually only one or two routes are planned), steers at the furthest route point 
 measures progress along the route. Only walls spanning the toon's feet-to-head band count, so the
 grid is rebuilt after climbing or dropping 4 units.
 
+Spheres and capsules are NOT vertical cylinders: at a height dz from the axis a solid of radius r
+is only sqrt(r^2 - dz^2) wide (`nav.round_radius`). 30 of the 230 in-band solids in Cartoonival are
+narrower at toon height than their radius -- a radius-20 sphere is 12.3 wide there -- and treating
+them as full width put the toon "inside" one: every whisker read 0, the wall guard vetoed every
+step, and the bot wiggled in place until the toon fell asleep and was logged out. The wall guard now
+also stands down when no side is more open than ahead, and lets a step through after 3 vetoes.
+
 Two details that mattered in the first live run: line of sight while FOLLOWING the route is tested
 against a second, thin grid (walls grown by 0.5), because string-pulled corners sit exactly on the
 grown walls and from a unit off the line the next corner looked hidden -- the bot turned 130 degrees
 to shuffle one unit onto the exact corner; and "stuck" counts only WALKING that fails to shorten
 the route, since turning in place to line up with a waypoint makes no progress by design.
 
-### OPEN: reader saw an empty interpreter, hung, and the game fail-fast (2026-09-28)
+### Hangs and crashes AFTER a detach: wrappers outlived the agent (fixed 2026-10-01)
 
-Auto-collect hosted by the injector, bot idle in a cooldown wait: at ~16:32:2x `state()` returned
-"no builtins" -- `interp->modules` read back empty, which is what a FINALIZING interpreter looks
-like -- and the next reader call never returned (it only failed when the game died:
-"script has been destroyed"). The stop file was then ignored (the injector's shutdown blocks
-unloading the stuck script), a fresh `frida.attach` was refused ("refused to load frida-agent"),
-and at 16:34:36 the game died with 0xc0000409 (fail-fast) while attached. The game's own log has
-nothing after 16:30 and no player was at the keyboard. Unexplained. Suspects: an agent thread taking
-the GIL while the interpreter was tearing down (CPython 3.8 exits such a thread outright, which
-would kill frida's JS thread), or the recovery attach itself. Worth a guard on `_PyRuntime.finalizing`
-before every `PyGILState_Ensure`, and a timeout around the reader's RPCs so a hung script cannot
-also wedge the injector's stop path.
+Every game hang on record (Windows "Application Hang" events) and the 2026-09-28 16:34 fail-fast came
+2-5 minutes after a revert-and-detach IN THE SAME GAME PROCESS -- usually a stop followed by the tray
+relaunching the injector:
+
+| detach (log) | failure |
+|---|---|
+| 09-28 ~16:28 stop + relaunch | 16:32 reader reads an empty interpreter ("no builtins") and hangs; 16:34 fail-fast |
+| 09-29 ~19:56 stop + relaunch | 19:58 hang (mods only -- auto-collect never started) |
+| 09-30 ~02:49 stop + relaunch | 02:52 hang, mid-collect |
+| 10-01 12:47 stop ("quit mods") | hang until killed at 12:52 |
+
+Each mod is a Python method whose machine code (a NativeCallback) and PyMethodDef live in AGENT
+memory. Revert restores the originals on their classes, but that cannot reach (a) a call already in
+flight -- the main thread inside a wrapped `MetaInterval.start`, parked on the GIL the revert was
+holding, returns into agent code being torn down -- or (b) a LINGERING REFERENCE: anything that
+captured the wrapped method while it was live (a `Func(ival.start)` in a Sequence, an event
+handler) calls the wrapper later, after the agent is gone, and executes freed memory -- or, once a
+new agent has been injected, whatever now occupies it. Proven offline (`localtest/persiststub_test.py
+--control`): a CPython process that calls such a captured reference after detach DIES.
+
+Fix, in two parts:
+
+- **Persistent stubs** (`frida/persist_stub.py`, Windows x64). Each wrapper's PyMethodDef and entry
+  point live in a VirtualAlloc'd page that is never freed. Six instructions: while live they
+  tail-jump into the NativeCallback; revert zeroes one pointer first, after which they tail-call
+  `PyObject_Call(orig, args, kwargs)` directly -- the call the wrapper would have made, minus the mod.
+  Only jumps, so CET shadow stacks (enforced here -- see the crash dump below) and unwinding are
+  untouched. The offline test passes 5/5: the captured reference keeps answering after the agent is
+  unloaded, with no wrong result. The install report carries `persistent_stubs: N`.
+- **Drain before detach.** Every wrapper counts threads inside it (`inflight` RPC); after a confirmed
+  revert the host waits for two consecutive zero readings before `session.detach()`, staying attached
+  (the safe state) while anything is still inside. `localtest/stoprevert_test.py` covers it.
+
+Crash-dump note (09-28 16:34, cdb on `%LOCALAPPDATA%\CrashDumps\TTREngine64.exe.29456.dmp`): the
+fail-fast was `STATUS_SET_CONTEXT_DENIED` (0xC000060A, fast-fail code 0x30) raised while dispatching an
+exception on the main thread -- an exception handler tried to resume at a context the CET shadow
+stack refused. Any agent code that recovers from a fault by rewriting the thread context (frida's
+exceptor does, for faulting Memory reads) turns a recoverable fault into a fail-fast on this client.
 
 ### Swallowed input: a turn that does not turn
 

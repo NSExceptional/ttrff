@@ -269,9 +269,10 @@ def round_clearance(me, rounds, offset_deg, max_range=MAX_WHISKER):
     dx, dy = _ray(me, offset_deg)
     best = max_range
     for rd in rounds:
-        if not nav.in_band(rd[4], rd[5], me["z"]):
+        r = nav.round_radius(rd, me["z"])
+        if r is None:
             continue
-        t = nav.round_hit(me["x"], me["y"], dx, dy, rd)
+        t = nav.round_hit(me["x"], me["y"], dx, dy, rd, r)
         if t is not None and t < best:
             best = t
     return max(best - BODY_RADIUS, 0.0)
@@ -619,6 +620,8 @@ def run_collector(ex, a, should_stop=None, keys=None):
     wait_said = 0.0           # last time the 'waiting' line was printed, to keep the log readable
     frozen = 0
     picked = 0
+    toon_ref = None           # identity of the toon object, to notice a logout and re-login
+    guard_streak = 0          # consecutive wall-guard vetoes without moving
 
     try:
         while not should_stop():
@@ -642,6 +645,21 @@ def run_collector(ex, a, should_stop=None, keys=None):
 
             me = st["me"]
             now = time.time()
+
+            # A NEW TOON OBJECT means the player logged out ("got sleepy") and back in. Everything
+            # learned about the previous session is wrong now: the HUD was rebuilt under new names
+            # (the old baseline made the new HUD look like a strange panel), the route and target
+            # belong to a toon that no longer exists, and the arrival is not a trip through a
+            # tunnel -- treating it as one walked the freshly logged-in toon backwards.
+            if toon_ref is not None and me.get("ref") and me.get("ref") != toon_ref:
+                print("[bot] logged back in (new toon object) -- starting fresh", flush=True)
+                hud, hud_at = {"names": set(), "pos": set()}, 0.0
+                duds = {"tries": {}, "until": {}}
+                committed, route, grid = None, None, None
+                walls, walls_xy, nogo_at = [], None, 0.0
+                blacklist, best_dist, closest = [], None, 1e9
+                prev_xy, last_act, dead_turns, backs, guard_streak = None, None, 0, 0, 0
+            toon_ref = me.get("ref") or toon_ref
 
             # A jump of more than ~200 units between ticks is a teleport or tunnel, i.e. a new
             # zone: everything static is re-read AT ONCE. (Triggers used to wait for a 30s timer,
@@ -975,11 +993,20 @@ def run_collector(ex, a, should_stop=None, keys=None):
 
             # WALL GUARD -- a reflex for what the map does not know: only when a wall is nearer
             # than the waypoint (the route says the line is clear) AND the toon is failing to move.
+            # Two conditions keep it from trapping the toon, both from a live failure where every
+            # whisker read 0 and it vetoed every step for minutes: a side must actually be MORE
+            # open than ahead (if nothing is, turning cannot help and the map is the thing that is
+            # wrong), and after a few vetoes in a row with no movement, one step goes through as a
+            # probe -- if the toon really is boxed in, the stall check takes over from there.
+            if moved_last >= MOVED_ENOUGH:
+                guard_streak = 0
             if (key == "w" and clear_a < BLOCKED_CLEARANCE and clear_a < wp_dist - 0.5
-                    and moved_last < MOVED_ENOUGH):
+                    and moved_last < MOVED_ENOUGH and max(clear_l, clear_r) > clear_a + 1.0
+                    and guard_streak < 3):
                 act = "turn_left" if clear_l >= clear_r else "turn_right"
                 conf, via = 1.0, via + "+wall"
                 key, dur = ACTIONS[act]
+                guard_streak += 1
             # ALIGNMENT GUARD: never take a long blind walk while badly misaligned. Jev was
             # seen choosing forward_far at -96 and -144 degrees.
             elif key == "w" and abs(steer_brg) > a.max_walk_bearing:

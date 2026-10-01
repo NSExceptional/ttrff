@@ -12,6 +12,7 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 |---|---|
 | `modset.json` | the mod table: `{match, factor, group}` rows; first match wins (order specific → broad) |
 | `frida/trampoline_inject.py` | the resident injector (modset mode) — the core |
+| `frida/persist_stub.py` | the wrapper entry point that outlives the agent (Windows x64): revert flips it to call the original, so nothing ever calls into a detached agent |
 | `frida/run-injector.sh` | signed wrapper for the scoped sudoers NOPASSWD rule; resolves repo root from its own location, so it works from dev checkout or Homebrew Cellar |
 | `frida/ttr-frida-runner` | bundled, signed frida runner (macOS dep — `frida` is NOT pip-installed here) |
 | `frida/inject.py`, `diag.py` | older/diagnostic inject paths (`TTRMOD_SCRIPT` overrides) |
@@ -42,6 +43,7 @@ Cosmetic-only animation-speed mods for the owner's **own** Toontown Rewritten cl
 - **Battle round pacing is server-gated** — scaling the mid-battle attack movie was tried and deliberately disabled (feels worse). Don't re-enable it; the intro/outro scaling is the keeper.
 - **The engine's game code is AES-encrypted** (`TTRGame.vlt`) and decrypted to a RAM filesystem at runtime — you can't read game Python statically; capture names live with `TTRMOD_LOGNAMES=1`.
 
+- **A wrapper can be called after its agent is gone.** Revert restores the class attribute, but references captured while the mod was live (`Func(ival.start)`) and calls already in flight still reach the wrapper. Every wrapper must be built through `ST.wrapToMethod` (persistent stub + in-flight count), and the host must drain in-flight calls before `session.detach()`. Skipping either brought back hangs 2-5 minutes after a stop -- see STATUS.md "Hangs and crashes AFTER a detach".
 - **winctl is a development tool, never a runtime dependency.** It exists for agents to build and test against the live client. Nothing the tray or injector runs may shell out to it (or to any other external input tool): the auto-collector presses keys on the game window's own input device and presses buttons by queueing their click event, both in-process through `frida/worldstate.py`.
 
 ## Tray app specifics

@@ -36,6 +36,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 IMAGE_BASE = 0x100000000
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import persist_stub  # noqa: E402  -- wrapper entry points that outlive the agent (Windows x64)
 
 # Host platform (the AGENT runs inside the target and is per-build; this only gates HOST plumbing).
 IS_WINDOWS = sys.platform.startswith("win")
@@ -280,6 +283,7 @@ rpc.exports = {
         slide: slide,
         hook:       rt(p.hook_va),   // _PyEval_EvalFrameDefault: install on main thread, GIL held
         Call:       new NativeFunction(F['PyObject_Call'],          'pointer', ['pointer','pointer','pointer']),
+        pyCallAddr: F['PyObject_Call'],
         GetAttrStr: new NativeFunction(F['PyObject_GetAttrString'], 'pointer', ['pointer','pointer']),
         SetAttrStr: new NativeFunction(F['PyObject_SetAttrString'], 'int',     ['pointer','pointer','pointer']),
         CFuncNewEx: new NativeFunction(F['PyCFunction_NewEx'],      'pointer', ['pointer','pointer','pointer']),
@@ -417,6 +421,39 @@ rpc.exports = {
       // install site (the MetaInterval.start wrap-after, each context wrap-around like tunnelOut, and
       // the legacy single install) funnels through this; revert enumerates ST.installed to restore ALL.
       ST.recordInstall = function(cls, mn, orig){ try { ST.installed.push({cls:cls, mn:mn, orig:orig}); } catch(e){} };
+
+      // EVERY WRAPPER IS BUILT HERE: NativeCallback `fn` around Python callable `orig` -> a bound-
+      // capable method object. Two things make detaching safe (see frida/persist_stub.py):
+      //   * the IN-FLIGHT count -- how many threads are inside one of our wrappers right now. The
+      //     host waits for it to reach 0 after the revert before it detaches, so no call returns
+      //     into agent code that is being torn down;
+      //   * on Windows x64 the method's entry point is a PERSISTENT STUB in memory that outlives the
+      //     agent. Revert flips it to call the original directly, so a reference captured while
+      //     the mod was live (a Func(ival.start) in some Sequence) never reaches freed memory.
+      //     Proven offline: without it, calling such a reference after detach killed the process.
+      ST.inflight = 0;
+      ST.stubs = [];
+      ST.valloc = ttrmodVirtualAlloc();
+      ST.wrapToMethod = function(fn, orig, label){
+        var cb = new NativeCallback(function (self, args, kwargs) {
+          ST.inflight++;
+          try { return fn(self, args, kwargs); }
+          finally { ST.inflight--; }
+        }, 'pointer', ['pointer','pointer','pointer']);
+        ST.keep.push(cb);
+        var mdef = null;
+        var stub = ttrmodMakeStub(ST.valloc, cb, orig, ST.pyCallAddr, label);
+        if (stub){ ST.stubs.push(stub); mdef = stub.mdef; }
+        else {
+          var mname = Memory.allocUtf8String(label); ST.keep.push(mname);
+          mdef = Memory.alloc(32); ST.keep.push(mdef);
+          mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
+        }
+        var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
+        ST.keep.push(cfunc);
+        var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
+        ST.keep.push(im); return im;
+      };
 
       // ---- milestone-2: manual PyFloat builder + generic wrap-after (payload.py port) ----
       // PREFERRED: a real out-of-line PyFloat_FromDouble. It exists on the Windows build; on the
@@ -894,7 +931,7 @@ rpc.exports = {
       // it did not raise) discover the just-started interval and setPlayRate it; return the original
       // result. args = (inst, *call_args); inst = ob_item[0] @ tuple+0x18 (ob_size @ +0x10).
       ST.makeWrapAfter = function(orig, spec, factorVal, label){
-        var cb = new NativeCallback(function (self, args, kwargs) {
+        return ST.wrapToMethod(function (self, args, kwargs) {
           try { ST.fires = (ST.fires||0) + 1; if (ST.fires<=8) send({t:'fired', n:ST.fires, method:label}); } catch(e){}
           var result = ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original, exactly once
           if (result.isNull()){ return result; }              // original raised -> propagate untouched
@@ -969,15 +1006,7 @@ rpc.exports = {
           } catch(e){ ST.clearExc(); }
           ST.clearExc();                                       // nothing of OURS pending on return
           return result;                                       // pass the original result through
-        }, 'pointer', ['pointer','pointer','pointer']);
-        ST.keep.push(cb);
-        var mname = Memory.allocUtf8String('ttrmod_wrapafter'); ST.keep.push(mname);
-        var mdef = Memory.alloc(32); ST.keep.push(mdef);
-        mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
-        var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
-        ST.keep.push(cfunc);
-        var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
-        ST.keep.push(im); return im;
+        }, orig, 'ttrmod_wrapafter');
       };
       // WRAP-AROUND context wrapper (METH_VARARGS|KEYWORDS=0x3): for a configured context method
       // (e.g. LocalToon.tunnelOut) SET the global ST.ctx BEFORE calling the original and RESTORE the
@@ -988,7 +1017,7 @@ rpc.exports = {
       // original result is passed straight through (NULL => it raised => propagate untouched, exc
       // left intact -- we NEVER clear a genuine exception from the original).
       ST.makeCtxWrap = function(orig, group, factorVal, label){
-        var cb = new NativeCallback(function (self, args, kwargs) {
+        return ST.wrapToMethod(function (self, args, kwargs) {
           try { ST.ctxFires = (ST.ctxFires||0) + 1; if (ST.ctxFires<=8) send({t:'fired', n:ST.ctxFires, method:label, ctx:group}); } catch(e){}
           var prev = ST.ctx;                                   // save (nesting/reentrancy safe)
           ST.ctx = { group: group, factor: factorVal, label: label };
@@ -999,15 +1028,7 @@ rpc.exports = {
             ST.ctx = prev;                                     // restore ALWAYS (finally == cleared-on-raise)
           }
           return result;                                       // pass the original result through
-        }, 'pointer', ['pointer','pointer','pointer']);
-        ST.keep.push(cb);
-        var mname = Memory.allocUtf8String('ttrmod_ctxwrap'); ST.keep.push(mname);
-        var mdef = Memory.alloc(32); ST.keep.push(mdef);
-        mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
-        var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
-        ST.keep.push(cfunc);
-        var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
-        ST.keep.push(im); return im;
+        }, orig, 'ttrmod_ctxwrap');
       };
 
       // ---- BATTLETRACE helpers (READ-ONLY) ----
@@ -1068,7 +1089,7 @@ rpc.exports = {
       //                 sendUpdate is the fixed DC field name, so the name is visible here regardless.
       //   null       -- plain timestamp under `label` (legacy: a readable d_*Done, if ever un-hashed).
       ST.makeTraceWrap = function(orig, label, kind){
-        var cb = new NativeCallback(function (self, args, kwargs) {
+        return ST.wrapToMethod(function (self, args, kwargs) {
           try {
             var arg1 = null;
             if (kind && ST.AsUTF8){
@@ -1096,15 +1117,7 @@ rpc.exports = {
             }
           } catch(e){ ST.clearExc(); }
           return ST.Call(orig, args, kwargs.isNull()?ptr(0):kwargs);   // original once; result passed through UNTOUCHED
-        }, 'pointer', ['pointer','pointer','pointer']);
-        ST.keep.push(cb);
-        var mname = Memory.allocUtf8String('ttrmod_bt'); ST.keep.push(mname);
-        var mdef = Memory.alloc(32); ST.keep.push(mdef);
-        mdef.writePointer(mname); mdef.add(8).writePointer(cb); mdef.add(16).writeU32(0x3); mdef.add(24).writePointer(ptr(0));
-        var cfunc = ST.CFuncNewEx(mdef, ptr(0), ptr(0)); if (cfunc.isNull()) return ptr(0);
-        ST.keep.push(cfunc);
-        var im = ST.Call(ST.imType, ST.pack1(cfunc), ptr(0)); if (im.isNull()) return ptr(0);
-        ST.keep.push(im); return im;
+        }, orig, 'ttrmod_bt');
       };
 
       // ===================== SHARED with localtest/findcls_test.py (verbatim) =====================
@@ -1613,6 +1626,7 @@ rpc.exports = {
                       targets: targets.map(function(t){ return {module:t.module, attr:t.attr, class_name:t.class_name, all_direct:t.all_direct}; }),
                       methods: m.methods, attr: m.spec.attr, factor: m.factor,
                       wired: wired, ctx_wired: ctxWired, ltiris: ltInfo, battletrace: btInfo,
+                      persistent_stubs: (ST.stubs||[]).length,
                       note:'wrap-after live; walk into a street tunnel to see it fire + speed the walk'});
             } catch(e){ ST.fin({ok:false, stage:'mod1 ex', e:String(e)}); }
             return;
@@ -1671,6 +1685,8 @@ rpc.exports = {
   },
   // report fire count on demand (host polls after the user triggers the target)
   fires: function () { return ST ? (ST.fires||0) : -1; },
+  // threads currently inside one of our wrappers; the host waits for 0 before detaching
+  inflight: function () { return ST ? (ST.inflight||0) : 0; },
   // per-method count of intervals actually setPlayRate'd (identifies which hashed method is a
   // transition-starter and confirms the interval attr resolved). {} until something lands.
   appliedBy: function () { return (ST && ST.appliedBy) ? ST.appliedBy : {}; },
@@ -1692,6 +1708,9 @@ rpc.exports = {
       ST.revertOnce = function () {
           if (ST.reverted) return; ST.reverted = true;  // one-shot, GIL held (see ST.bootstrap)
           try {
+            // Stubs first: from this store on, every call -- including references captured while the
+            // mods were live -- goes straight to the original and never enters the agent again.
+            for (var si=0; si<(ST.stubs||[]).length; si++){ try { ttrmodBypassStub(ST.stubs[si]); } catch(e){} }
             var rcs = [], allOk = true;
             for (var i=0;i<items.length;i++){
               var rc = ST.SetAttrStr(items[i].cls, items[i].mn, items[i].orig);
@@ -1985,6 +2004,40 @@ def wait_for_stop(box, stop, stopfile, persist, poll_s, fires_fn=None, log=print
         last = f
 
 
+def wait_for_drain(ex, box, alive_check, settle=0.3, poll=0.05, warn_after=5.0, log=print):
+    """After a confirmed revert, wait until no thread is still inside one of our wrappers.
+
+    Revert stops NEW calls entering the agent, but the game's main thread can be part-way through
+    one -- inside a wrapped MetaInterval.start, waiting on the GIL our revert was holding. Detaching
+    then tears the agent down underneath it, and its return lands in freed memory: the game froze on
+    "quit mods". The agent counts threads inside its wrappers; this waits for two consecutive zero
+    readings (`settle` first, so a call that read the old entry point just before the revert has
+    time to register). A count that never drains means a wrapped call never returned -- the game is
+    stuck anyway -- so this keeps waiting, attached, exactly like an unconfirmed revert does.
+    Returns False only if the game or session went away meanwhile.
+    """
+    time.sleep(settle)
+    t0, zeros, warned = time.time(), 0, False
+    while True:
+        if box.get("detached") or not alive_check():
+            return False
+        try:
+            n = ex.inflight() or 0
+        except Exception:
+            return True               # agent without the counter: nothing to wait on
+        if n <= 0:
+            zeros += 1
+            if zeros >= 2:
+                return True
+        else:
+            zeros = 0
+            if not warned and time.time() - t0 > warn_after:
+                log("[tramp-live] %d call(s) still inside a wrapper after %.0fs - staying attached "
+                    "until they return" % (n, warn_after))
+                warned = True
+        time.sleep(poll)
+
+
 def revert_and_detach(ex, session, box, rev, target_label, alive_check=None,
                       confirm_timeout=8.0, log=print):
     """Revert ALL installed wraps, then detach ONLY once the revert is CONFIRMED (the agent's
@@ -2008,7 +2061,10 @@ def revert_and_detach(ex, session, box, rev, target_label, alive_check=None,
     while True:
         if rev.wait(confirm_timeout):
             if box.get("revert_ok"):
-                log("[tramp-live] reverted OK - all originals restored; detaching")
+                if not wait_for_drain(ex, box, alive_check, log=log):
+                    log("[tramp-live] game gone/detached while draining - trampolines moot; stopping")
+                    return False
+                log("[tramp-live] reverted OK - all originals restored, no call in flight; detaching")
                 try:
                     session.detach()
                 except Exception:
@@ -2310,7 +2366,7 @@ def main():
         elif m.get("type") == "error": print("[agent-err]", m.get("description") or m)
     def on_det(reason, *a): box["detached"] = reason; done.set()
     session.on("detached", on_det)
-    sc = session.create_script(AGENT); sc.on("message", on_msg); sc.load()
+    sc = session.create_script(persist_stub.STUB_JS + AGENT); sc.on("message", on_msg); sc.load()
     ex = sc.exports_sync
     # stash hook addr into ST via init, then set ST.hook (agent reads it in rpcHook)
     init = ex.init({"image_base": hex(IMAGE_BASE), "hook_va": hook_va, "mode": mode,
